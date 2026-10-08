@@ -1,6 +1,8 @@
 # 上下文两层寄存（host RAM + NVMe）
 
 **状态**：设计中，未实现。这是 active work 的设计与实施计划，不是已交付能力。
+**先例**：T1 是本条线上游的既有能力（被 `7028d96a` 删除），T2 在同源 3090 线上已实现；
+见 §2。实施计划因此以"取回/移植"为第一选项，而非重写。
 
 本文修订 [Paged KV Context Store](paged-kv-cache.md) §1.1 —— 那里把 `swap、KV offload`
 列为 non-goal；本设计把它变成一条有明确契约的能力。范围只覆盖 **retained（空闲）上下文的
@@ -37,7 +39,85 @@ A 被**丢弃**，回来时全额重算。A+B = 21,898 > 16,384，池子装不�
 
 ---
 
-## 2. 为什么可行（承重事实）
+## 2. 先例：这两层在别处已经存在
+
+本设计**不是从零发明**。查证结果：T1（host RAM 层）是本条线上游的既有能力，被双卡移植提交
+删掉了；T2（NVMe 层）在同源的 3090 线上已经实现。
+
+### 2.1 T1 是上游能力，被我们删掉了
+
+`upstream/master`（`geoffwatts/ninfer-v100`，merge-base = `b37d0dd3`，是我们 master 的祖先）
+保留完整的 host RAM 层，并且它本身同步自根仓库 `Neroued/ninfer`：
+
+| 能力 | 上游文件 |
+|---|---|
+| pinned host KV arena | `src/core/host_kv_arena.{h,cpp}` |
+| 权限/容量/召回规划 | `src/runtime/engine/resource_manager.h`、`engine_core.h` |
+| extent store / 压力规划 | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h`、`pressure_planner.h` |
+| 契约文档 | `docs/maintainer/resource-scheduling-and-context-cache.md` |
+| 端到端测试 | `tests/test_resource_manager.cpp` |
+
+上游 CLI 已暴露 `--device-state-slots N --host-state-slots N --host-kv-mib N`
+（`src/serve/serve_options.cpp:76,219`），README 记载默认 *"one Device checkpoint slot,
+eight pinned Host State slots, and 8 GiB of pinned Host KV"*。即 T1 的设计、实现、CLI、
+测试、文档在上游是齐的。
+
+删除发生在 `7028d96a` "feat: add dual V100 NVLink inference"（1011 files，
++107,985 / −196,967），同一提交还删掉了 `apps/perplexity/`、`bench/context_cost/`、
+`bench/fixtures/ttft/`。
+
+**fork 普查**：`geoffwatts/ninfer-v100` 的 31 个 fork 里 30 个仍原样保留
+`src/core/host_kv_arena.{h,cpp}` 与 `resource-scheduling-and-context-cache.md`；
+**只有 `plus1998/NInfer-V100-Duo`（我们）这一支删掉了**。V100 线上没有别人重做过，
+因为不需要——上游就有。
+
+V100 线上唯一在推进缓存准入的是 `mylordmonkeyman/ninfer-v100`（`host_kv_arena.cpp` 有改动），
+方向是 active cache admission / batched decode cache hit，不是 tier 寄存。
+
+### 2.2 T2 在同源 3090 线上已实现
+
+根仓库 `Neroued/ninfer` 本身**没有**磁盘层，它由 `Don-Chad/ninfer-3090` 这条线下方的
+`iamwavecut/ninfer-all` 加上：
+
+| 提交 | 作者 | 内容 |
+|---|---|---|
+| `f39133e1` (2026-09-24) | Valeriy Selitskiy | `feat(core): add a disk page store and bridge for an L3 KV tier` |
+| `546ed9a6` (2026-09-24) | Valeriy Selitskiy | `feat(disk-tier): restore pages through DirectStorage on Windows` |
+
+文件：`src/core/disk_kv_store.{h,cpp}` + `src/core/disk_kv_bridge.{h,cpp}`，同一支还有
+`src/runtime/engine/context_cache/{hybrid_resource_manager,materialization_planner}.h`。
+`disk_kv_bridge.h` 注释原文：
+
+> Engine-facing facade over the disk (L3) page stores: one store per KV family, a bounded queue
+> of spill jobs drained by writer threads, and synchronous reads for restores. … the engine
+> keeps a rolling 128-bit digest per token frontier … the same content in two sessions dedupes
+> to one page. … A miss of any kind (never spilled, evicted, corrupt) makes the engine recompute.
+
+`disk_kv_store.h` 是 4 KiB slot + 48 B 头（magic / identity / CRC-32 / LRU 戳）加原子替换
+`.idx` 的 LRU 页存储，**自包含、不依赖 CUDA 和引擎类型**。同源的 Windows 分发
+`BenGamliel/NInferEZ-Engine`、`ahnafnafee/ninfer-3080` 带同样四个文件。
+
+**但它单独用不足以覆盖本问题。** 同族第三方评估 `1314521gjy/ninfer-fusion-kvmem`
+（非 fork 的独立仓库，2026-09-30 决策评估）实测这条 `--disk-kv-*` 路线：`cache 0 (0.0%)`、
+**全量重填**，且 `restore_chain` 要求 `page_count ≤ mapped_pages`——磁盘层单独用不打破
+"池 ≥ 前缀"。该评估的结论是结构上只有"KV 权威副本放 tier、设备只保有界工作集、按差量搬运"
+成立。
+
+### 2.3 对本计划的影响
+
+- **T1 是恢复，不是设计。** 优先评估从 `upstream/master` 取回那套子系统，而不是照下面的
+  设计重写。规模在 4 万行量级（`engine_core.h` + `resource_manager.h` +
+  `pressure_planner.h` + `host_kv_arena.*` + `host_kv_extent_store.h` + serve/CLI 接线），
+  且 `src/targets/qwen3_6/impl/runtime/` 在两支间已经不同步。
+- **T2 有参考实现可读**：`iamwavecut/ninfer-all` 的 `disk_kv_*`，尤其 slot 头格式、digest
+  身份、miss-as-recompute 语义；但它的恢复路径依赖 Windows DirectStorage，Linux/NVMe 上
+  要换成自己的后端。
+- §4 的位置语义（搬迁而非预留、image 必须含 GDN state、TP2 barrier）与上述两份实现不冲突，
+  可作为把两条线已有能力接到本机 TP2 双卡上的落点。
+
+---
+
+## 3. 为什么可行（承重事实）
 
 这四点决定了实现的形状，逐条都在当前代码里可验证。
 
@@ -68,9 +148,9 @@ A 被**丢弃**，回来时全额重算。A+B = 21,898 > 16,384，池子装不�
 
 ---
 
-## 3. 设计
+## 4. 设计
 
-### 3.1 层级
+### 4.1 层级
 
 | 层 | 载体 | 粒度 | 用途 |
 |---|---|---|---|
@@ -78,12 +158,12 @@ A 被**丢弃**，回来时全额重算。A+B = 21,898 > 16,384，池子装不�
 | T1 | pinned host RAM | page slot | 一级寄存 |
 | T2 | NVMe 文件 | page extent | 二级寄存，T1 压力下逐出 |
 
-### 3.2 搬迁，不是预留
+### 4.2 搬迁，不是预留
 
 明确否掉"device page 继续为 owner 占着、只把字节搬到别处"：那样一字节显存都不释放。
 采用 **释放 device page → 搬运整个 tier image → 恢复时重新分配页并重映射**。
 
-### 3.3 tier image 的内容
+### 4.3 tier image 的内容
 
 一个被寄存的 checkpoint 必须是**完整可恢复状态**，不能只搬 KV：
 
@@ -97,7 +177,7 @@ A 被**丢弃**，回来时全额重算。A+B = 21,898 > 16,384，池子装不�
 
 后三类不是 per-token 的，体量小；KV 是主体。
 
-### 3.4 代价模型
+### 4.4 代价模型
 
 每层：`restore_ns(tier) = bytes / 可达带宽(tier) + fixed_latency`。
 
@@ -112,31 +192,31 @@ prefill ≈ 1,140 tok/s）：
 
 把这三个值一起喂进 `ContextPortfolioValue` 的 fold，让既有的 threshold 逻辑自己选。
 
-### 3.5 分层准入与逐出
+### 4.5 分层准入与逐出
 
 - T1 按 portfolio value 做 LRU；T1 有压力时把价值最低的 image **下沉**到 T2。
 - T2 按 LRU 逐出；逐出 = 删除 extent，下次需要时退回 rebuild。
 - **只寄存 retained/空闲 checkpoint，绝不寄存 active request 的页。**
 
-### 3.6 拷贝效率
+### 4.6 拷贝效率
 
 按**合并后的页区间**搬，不要逐页搬：把物理上相邻的页合并成单个 `cudaMemcpyAsync`。
 整上下文搬迁应该收敛成少数几段大传输。单页 64 × 16,896 = **1.03 MiB**，已经到了逐页搬会
 明显浪费带宽的尺度。
 
-### 3.7 TP2
+### 4.7 TP2
 
 两个 rank 各搬自己那片（每设备 2 个 KV head）。**必须有一个跨设备 barrier**：两边都搬完，
 才允许把释放出来的页交给别的 allocation。block table row 是 per-rank 的，各自本地重写。
 
-### 3.8 异步位置
+### 4.8 异步位置
 
 - **park**：在关键路径之外（请求出完最后一个 token 之后）。
 - **restore**：在 claim 路径上，必须与 admission/排队**交叠**，不能串行地挡在 prefill 前面。
 
 ---
 
-## 4. Non-goals
+## 5. Non-goals
 
 - **预取**。恢复就是按需触发。
 - **在 live request 内部按页换入换出**。decode 每步扫过整个上下文
@@ -147,11 +227,16 @@ prefill ≈ 1,140 tok/s）：
 
 ---
 
-## 5. 实施计划
+## 6. 实施计划
 
-### P0 — 核心原语 + 精确性（不动调度）
+### P0 — 先做取回评估，再决定是否重写
 
-- T1 store：pinned slot 分配器，slot 粒度 = page。
+- 对照 `upstream/master` 清点被 `7028d96a` 删除的 T1 子系统在本树的缺口：`host_kv_arena.*`、
+  `resource_manager.h`、`engine_core.h`、`pressure_planner.h`、`host_kv_extent_store.h`，
+  以及 serve/CLI 接线（`--device-state-slots`、`--host-state-slots`、`--host-kv-mib`）。
+  产出：可取回 / 需改写 / 缺失三类清单，以及 `src/targets/qwen3_6/impl/runtime/` 的差异面。
+- 若取回代价可控，P1 及以后改为适配取回实现；否则按下面从零路径执行。
+- 从零路径：T1 store（pinned slot 分配器，slot 粒度 = page）。
 - `park(image)`：KV 区间的合并 D2H + GDN/MTP state + 元数据。
 - `restore(image)`：预留页 → H2D → 重写 `page_ids_` → `publish_mapping()`。
 - **测试（这一阶段的门）**：park → 丢掉 → restore 之后
@@ -170,6 +255,9 @@ prefill ≈ 1,140 tok/s）：
 
 - 文件后端 store；T1→T2 下沉；T2 LRU。
 - 失败处理：读失败或校验不符 = **miss**（退回 rebuild），永远不是正确性事件。
+- 参考实现：`iamwavecut/ninfer-all` 的 `disk_kv_store.{h,cpp}`（slot 头 + CRC + 原子 `.idx`，
+  自包含无 CUDA）与 `disk_kv_bridge.{h,cpp}`（spill 队列 + digest 身份）。其恢复走 Windows
+  DirectStorage，Linux 侧需自建后端，但存储格式与 miss 语义可直接沿用。
 
 ### P3 — 准入与文档
 
@@ -181,7 +269,7 @@ prefill ≈ 1,140 tok/s）：
 
 ---
 
-## 6. 验证
+## 7. 验证
 
 | 主张 | 证据 |
 |---|---|
@@ -193,7 +281,7 @@ prefill ≈ 1,140 tok/s）：
 
 ---
 
-## 7. 风险
+## 8. 风险
 
 - **瓶颈是 PCIe Gen3 x4（~3 GB/s），不是 NVMe。** 200k 上下文 ≈ 1.1 GB/设备 →
   单向 ~370 ms。比 re-prefill 快约 200×，但不再是零。
@@ -203,7 +291,7 @@ prefill ≈ 1,140 tok/s）：
 
 ---
 
-## 8. 待定
+## 9. 待定
 
 - 共享 prefix 的 checkpoint 是否允许被**另一个** session claim（`explicit_shared_credit`），
   还是只允许 owner？
@@ -213,7 +301,7 @@ prefill ≈ 1,140 tok/s）：
 
 ---
 
-## 9. 本机实测参考
+## 10. 本机实测参考
 
 - 每设备文本 KV：16,896 B/token（16 层 full attention × 2 KV head × 256 head_dim ×
   1 B × 2 平面 + FP16 group-64 scale）。
