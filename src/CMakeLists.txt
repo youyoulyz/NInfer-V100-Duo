@@ -25,6 +25,7 @@ add_library(ninfer_core STATIC
   core/host_kv_arena.cpp
   core/host_kv_offload.cpp
   core/linear_attention_state.cpp
+  core/host_linear_state.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
