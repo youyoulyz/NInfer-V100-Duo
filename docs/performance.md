@@ -220,7 +220,17 @@ capacity. This single-request production-profile check supports feasibility, **n
 long-context performance average. Both requests returned the same first token (ID 864); this
 is not a general numerical or quality qualification. The **previous** 200K capacity can only
 be restored by passing `--max-context 200000 --prefill-chunk 1024` together. A proposed 2,048
-chunk at that capacity is discarded because the memory contract does not permit it. A larger
+chunk at that capacity is discarded because the memory contract does not permit it.
+
+The single-request ceiling at that chunk was then measured on the launcher's own profile
+(`--tp 2 --kv-capacity N --max-context N --kv-dtype int8 --spec mtp --draft-tokens 3`). The
+available runtime budget is 5,370,736,128 B after weights, a 200,000-token pool leaves 153 MiB
+free, and 203,776 tokens (3,184 pages of 64) is the largest capacity that loads -- 69 MiB free,
+while 204,032 is rejected at 5,375,519,488 B of reservation. Both ends are qualified by a cold
+completion rather than by startup alone: a 199,004-token request prefilled in 306.3 s (649.6
+tok/s) and a 203,684-token request in 318.5 s (639.6 tok/s), each decoding 8 tokens at 49.9-75.8
+tok/s. This is one artifact, one chunk size and one machine; the ceiling moves with
+`--prefill-chunk`, the speculative window and the artifact. A larger
 chunk is also discarded
 as an *exactly 1,024-token* optimization because it provides no measurable benefit at that
 boundary; a real 1,298-token Pi request instead benefits by avoiding a second chunk.

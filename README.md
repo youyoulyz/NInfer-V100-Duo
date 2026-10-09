@@ -196,15 +196,20 @@ tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
   --max-concurrency 1 --kv-capacity 200000
 ```
 
-This is the **largest observed NVFP4 startup ceiling**, not the everyday
-speed recommendation. It trades away the faster 4,096-token prefill chunk
-and concurrency to reach 200K, and the rebuilt-server startup left only
-**153 MiB free on the primary GPU**. Treat it as a near-OOM experimental
-capacity setting, not a reliably qualified 200K-occupied completion; reduce
-`--max-context` if more memory margin is needed. NVFP4 cannot serve a native
-262,144-token request on these 16 GB cards. GSQ-RCO *can* retain its native
-262K per-request ceiling with three slots, so no single-slot GSQ profile is
-recommended by default.
+This is the everyday single-request long-context option: it trades away the
+faster 4,096-token prefill chunk and concurrency, and leaves **153 MiB free on
+the primary GPU**. It is qualified by a cold completion -- a 199,004-token
+request prefilled in 306.3 s (649.6 tok/s) and decoded 8 tokens without an
+allocation failure. The startup ceiling itself is **203,776 tokens**
+(3,184 pages of 64) at `--prefill-chunk 1024`, which leaves 69 MiB free;
+204,032 does not load (5,375,519,488 B of reservation against 5,370,736,128 B
+available after weights), and a 203,684-token cold request completes in
+318.5 s of prefill (639.6 tok/s). Anything above that is a near-OOM
+experiment: reduce `--max-context` when the workload wants margin. NVFP4 cannot
+serve a native 262,144-token request on these 16 GB cards (that reservation
+needs 6.32 GiB after weights, and 5.00 GiB remains). GSQ-RCO *can* retain its
+native 262K per-request ceiling with three slots, so no single-slot GSQ
+profile is recommended by default.
 
 The concurrent profiles were selected from existing startup/short-request
 evidence; no matched mixed-workload A/B has established a universal fastest
