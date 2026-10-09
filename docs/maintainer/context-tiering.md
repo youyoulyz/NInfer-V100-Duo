@@ -797,11 +797,34 @@ ctest --test-dir build-v100-test -R 'context_cost|context_store|state_image' --o
 - 参考实现：`iamwavecut/ninfer-all` 的 `disk_kv_store.{h,cpp}`（4 KiB slot + 48 B 头
   = magic/identity/CRC-32/LRU 戳，原子替换 `.idx`，自包含无 CUDA）与
   `disk_kv_bridge.{h,cpp}`（有界 spill 队列 + writer 线程 + digest 身份 + miss-as-recompute）。
-- 恢复后端在 Linux/NVMe 上自建（上游走 Windows DirectStorage）。
 - 读失败或校验不符 = **miss**（退回 rebuild），永远不是正确性事件。
 - 注意 §2.2 的第三方实测：磁盘层单独用**不打破"池 ≥ 前缀"**，它只能作为 T1 的下沉层。
 
 门：注入损坏的 NVMe 页 → 必须表现为 miss 而不是错误结果。
+
+#### 已落地（本轮实测）：L3 页存储整层照抄
+
+`src/core/disk_kv_{store,bridge}.{h,cpp}` + `direct_storage_reader.{h,cpp}` 与
+`tests/test_disk_kv_{store,bridge}.cpp` 取自 `iamwavecut/ninfer-all` 的 `a9155e0b`，
+**逐字节未改**（含测试），已在 `build-v100-test` 编过、两条测试全绿。
+
+**修正本文原先的判断**：不需要"在 Linux 上自建恢复后端"。`disk_kv_store.cpp` 的 POSIX 分支
+本来就在（`open` / `ftruncate` 稀疏文件 / `mmap` / `pwrite` / `pread`），DirectStorage 只在
+`_WIN32 && NINFER_DIRECTSTORAGE` 下编译，非 Windows 的 `open()` 直接抛异常且
+`available_in_build()` 为 false，bridge 只在 `options.direct_storage` 为真时调用它 —— 所以
+Linux 上留 `false` 即可，代码零改动。
+
+**还缺什么**（这两块才是 P6 的活）：
+
+1. **身份层**。上游 key 是 `DiskKVIdentity{lo,hi,tag,frontier}`，`{lo,hi}` 取自
+   `sequence.prefix_digests`（block 链：`lookup_hash(b) = xxh3_64(lookup_hash(b-1) || tokens
+   || extra)`，命中还要精确比 tokens），`tag = capture_identity_tag()` 区分引擎配置。
+   本树 `ResidentPrefixIdentity` 是逐 token 的精确记录（token types / positions / vision
+   items），**不是**内容哈希；`PreparedPromptData` 也没有 `block_hashes`。要新写。
+2. **引擎接线**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是它们
+   `ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
+   `LogicalKVPageHandle`、snapshot 模型、`context_cache.disk_kv_path`）。本树落点是
+   `ProgramImplCore::park_lane/restore_lane` + 三块 host arena。
 
 ### 7.9 P7 — 文档与 CLI
 
