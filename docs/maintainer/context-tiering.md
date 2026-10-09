@@ -814,17 +814,30 @@ ctest --test-dir build-v100-test -R 'context_cost|context_store|state_image' --o
 `available_in_build()` 为 false，bridge 只在 `options.direct_storage` 为真时调用它 —— 所以
 Linux 上留 `false` 即可，代码零改动。
 
-**还缺什么**（这两块才是 P6 的活）：
+**还缺什么**（P6 只剩引擎接线这一块）：
 
-1. **身份层**。上游 key 是 `DiskKVIdentity{lo,hi,tag,frontier}`，`{lo,hi}` 取自
-   `sequence.prefix_digests`（block 链：`lookup_hash(b) = xxh3_64(lookup_hash(b-1) || tokens
-   || extra)`，命中还要精确比 tokens），`tag = capture_identity_tag()` 区分引擎配置。
-   本树 `ResidentPrefixIdentity` 是逐 token 的精确记录（token types / positions / vision
-   items），**不是**内容哈希；`PreparedPromptData` 也没有 `block_hashes`。要新写。
-2. **引擎接线**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是它们
-   `ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
-   `LogicalKVPageHandle`、snapshot 模型、`context_cache.disk_kv_path`）。本树落点是
-   `ProgramImplCore::park_lane/restore_lane` + 三块 host arena。
+**身份层已落地（本轮）**。上游 key 是 `DiskKVIdentity{lo,hi,tag,frontier}`，其中
+`{lo,hi} = prefix_digests.at(frontier)`：**每个 token frontier 一条滚动的 128-bit 内容摘要**
+（上游 `ProgramImpl::disk_identity`，`tag = capture_identity_tag()`）。**修正本计划原先的
+误判**：上游另有一条 64-token 分块链 `runtime::prefix_cache::block_hash`
+（`h(b) = xxh3_64(h(b-1) || tokens || extra)`，命中还要精确比 tokens），那是 Hybrid 常驻
+索引的判据，**不是**磁盘 key，这一步用不到。本树已落：
+
+- `src/targets/qwen3_6/impl/runtime/prefix_digests.{h,cpp}`：`PrefixDigests`，与上游
+  `PrefixShortlistDigests` 同算术、同域分隔、同顺序（rewrite checkpoint 在它关闭的
+  frontier 折入，Vision item 在最后一个 span 末尾折入），只吃 `PreparedPromptData`。
+- `.../impl/runtime/identity_tag.h`：`identity_tag(backend, head, storage)`。
+- `.../impl/runtime/identity.h`：`make_identity(digests, tag, frontier) -> DiskKVIdentity`，
+  复用 core 已抄的 `DiskKVIdentity`，不做平行类型。
+- 测试 `test_runtime_mechanisms.cpp::test_prefix_digests`（前缀纯度、Vision/rewrite 折入点、
+  `append_generated` ↔ 重建、`truncate`、`restore`、越界拒绝，外加独立 Python 转写出的
+  wire-format golden）。它仍是**短名单**：真正复用判据是逐 token 的 `ResidentPrefixIdentity`，
+  摘要碰撞只退化为一次比较，绝不产生假命中。
+
+**引擎接线（P6 剩余）**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是它们
+`ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
+`LogicalKVPageHandle`、snapshot 模型、`context_cache.disk_kv_path`）。本树落点是
+`ProgramImplCore::park_lane/restore_lane` + 三块 host arena。
 
 ### 7.9 P7 — 文档与 CLI
 
