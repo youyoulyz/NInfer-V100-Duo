@@ -123,6 +123,9 @@ ninfer_add_test(ninfer_host_kv_arena_test
 ninfer_add_test(ninfer_context_tier_probe_test
   SOURCES test_context_tier_probe.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_host_kv_offload_test
+  SOURCES test_host_kv_offload.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)
