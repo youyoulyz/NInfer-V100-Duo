@@ -201,6 +201,14 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Pinned host RAM budget for the host lane tier. Zero (the default) disables it, and eviction
+    // then discards a retained prefix exactly as before. When positive, an evicted retained lane is
+    // mirrored into host RAM -- Main Text KV and MTP KV for every rank, the GDN linear-attention
+    // slots, the hidden rows, and the prefix metadata -- and its device KV pages are released; the
+    // next admission of that lane restores it from host RAM instead of paying a re-prefill. The
+    // linear-attention mirror is sized separately (one image per lane per rank) and is NOT part of
+    // this budget, because it frees no device memory.
+    std::size_t host_context_bytes = 0;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
@@ -831,6 +839,11 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host lane tier. Both are 0 when the tier is disabled. `host_tier_parked_bytes` is the pinned
+    // host RAM the mirrored retained lanes hold right now: their KV, their GDN linear-attention
+    // state, and their hidden rows.
+    std::size_t host_tier_capacity_bytes          = 0;
+    std::size_t host_tier_parked_bytes            = 0;
 };
 
 // One row of the per-device memory table the load summary prints. At tp == 1 only `devices[0]` is

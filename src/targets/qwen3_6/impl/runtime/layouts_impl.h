@@ -762,6 +762,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->device              = inputs.device;
     impl->tp                  = inputs.tp;
+    impl->host_context_bytes  = inputs.host_context_bytes;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
@@ -876,8 +877,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // tp 2 captures like tp 1. `--no-cuda-graph` is the escape hatch that runs the same
         // forward pass eagerly (two streams, cross-device event sync) at either width.
         .use_cuda_graph = options.use_cuda_graph,
-        .device         = options.device,
-        .tp             = options.tp,
+        .device             = options.device,
+        .host_context_bytes = options.host_context_bytes,
+        .tp                 = options.tp,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

@@ -87,6 +87,9 @@ struct SequencePlanningInputs {
     std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     int device          = 0;
+    // Pinned host RAM budget for the host lane tier; zero disables it. Layout-neutral: it sizes
+    // host arenas the Program owns outside the planned device arenas.
+    std::size_t host_context_bytes = 0;
     // Tensor-parallel width. Every per-device geometry below (KV heads, GDN value heads, GDN conv
     // channels) is the model's own extent divided by `tp`, because each device holds only its own
     // head shard. Page COUNTS are not divided: all devices carry the same pages.
@@ -120,6 +123,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     int tp              = 1;
+    // Pinned host RAM budget for the host lane tier; zero disables it. See SequencePlanningInputs.
+    std::size_t host_context_bytes = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;
