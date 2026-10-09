@@ -1,7 +1,7 @@
 # 上下文两层寄存（host RAM + NVMe）
 
-**状态**：移植中，未实现。这是 active work 的**取回/移植计划与目标契约**，不是已交付能力，
-也不是一份从零设计。
+**状态**：移植中，未实现。P1（计价/决策层，§7.3）与 P2（Program 权能接口决策，§7.4）已落定，
+下一步 P3。这是 active work 的**取回/移植计划与目标契约**，不是已交付能力，也不是一份从零设计。
 **先例**：T1（host RAM 层）是本条线上游的既有能力，被 `7028d96a` 删除；T2（NVMe 层）在同源
 3090 线上已实现。取回面已在 §3 量化：18 个文件、14,748 行，其中计价/决策层在本树**已经存在
 且与上游逐字节相同**，只是没有调用者。
@@ -376,6 +376,11 @@ Block C  引擎壳（engine_core.h 2058 + engine.cpp）← Block B + 调度器�
 **序贯关键路径是 P1 → P2 → P3**。P1/P2 不碰 CUDA、不碰存储、不需要 GPU，
 是本计划里唯一能"先完整拿到确定性再往下走"的部分。
 
+P2 已落定走 (b)（见 §7.4）：Block D 不取回 `logical_kv_store.h`/`host_kv_extent_store.h` 的上游
+类型；`pressure_planner.h` 与存储无关（判定 2），其纯数据决策类型随 Program 权能一并加入，
+执行侧换成本树原语。`host_kv_arena.{h,cpp}` 与 `core/kv_page_geometry.h` 已就位，P3 的取回
+行数相应低于上表。
+
 ### 7.2 接口规格（P1/P2 的验收依据）
 
 #### 7.2.1 `Package` 必须提供的 25 个 typedef
@@ -474,14 +479,36 @@ release_failed_commit                 reserve_active_capture  reserve_materializ
 cmake -S . -B build-v100-test -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
       -DCMAKE_CUDA_ARCHITECTURES=70 \
+      -DCMAKE_CUDA_FLAGS="-isystem /usr/local/cuda-12.8/targets/x86_64-linux/include" \
       -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=OFF
 cmake --build build-v100-test --target ninfer_resource_manager_test -j
-./build-v100-test/bin/ninfer_resource_manager_test
+LD_LIBRARY_PATH=build/_deps/install/lib ./build-v100-test/tests/ninfer_resource_manager_test
 ```
 
 注意 `BUILD_TESTING` 默认 `OFF`，现有 `build-v100-duo/` 与 `tools/v100/build.sh`
-都显式关掉它，需要单独一个测试构建目录。CUDA 侧仍需
-`NVCC_PREPEND_FLAGS="-include tools/v100/glibc_c23_math_shim.h"`（见 §10 工作树说明）。
+都显式关掉它，需要单独一个测试构建目录；`LD_LIBRARY_PATH` 是 FFmpeg 的传递依赖
+（`libavformat` 拉 `libswresample`，rpath 不传递）。`-DCMAKE_CUDA_FLAGS` 里的
+`-isystem` 是 glibc ≥ 2.41 主机的**必要条件**：CMake 的 CUDA 编译器探测在项目
+`-isystem` 生效之前运行，会撞上 glibc C23 `cospi`/`sinpi` 与 CUDA 12.8
+`crt/math_functions.h` 的声明冲突；补上同一个 `-isystem` 后探测与真实 TU 一致，详见
+[V100 移植说明](../v100.md)。
+
+#### 已落地（本轮实测）
+
+- `ninfer_resource_manager_test` 全绿，`tests/test_resource_manager.cpp` 未改一行。
+- `ninfer` / `ninfer-serve` 在 `build-v100-duo` 全量重建（161 个 CUDA TU）并链接成功，
+  `ninja` 报 no work to do；`test_request_log`、`test_concurrent_executor` 一并复验通过。
+- 8 个取回文件与 `upstream/master` **逐字节相同**（`diff` 输出为空）。
+- 类型补齐：`nvtx::Name` 增 `ProgramSubmit`/`DeviceWait`/`ProgramPost`；`PrefixReusePath`
+  同时容纳本树的 realized 词表（`FullReset`…）与上游 planner 词表（`Root`…`SharedStablePrefix`）。
+  两套词表的统一是 §7.4 P2 的决策，本阶段不预判映射。
+- 类型补齐的实际规模：`include/ninfer/types.h` +490 行、`src/runtime/contract/types.h` +529 行。
+  其中有 24 个顶层声明只被 `src/product/logging/*`、`src/serve/operational_log.cpp` 这类
+  **未参与任何构建目标**的同树文件引用，或完全无引用；保留它们是为了与上游 `types.h` 同步，
+  不是 P1 的必需项，清理与否留待 P2 处理。
+- 回归修复：`runtime/contract/types.h` 现在传递包含 `core/nvtx.h`，而 `ninfer_v100_corpus`
+  只链 `ninfer_engine`、没有 CUDA include 目录，因此编译失败；已按 `tests/CMakeLists.txt`
+  的做法补 `${CUDAToolkit_INCLUDE_DIRS}`（`bench/CMakeLists.txt`）。
 
 #### 完成判据与风险
 
@@ -518,9 +545,159 @@ cmake --build build-v100-test --target ninfer_resource_manager_test -j
 
 三条都成立 → 走 (b)；任一条不成立 → 转 (a)。
 
-**建议先按 (b) 试**：它在 P3 的前两天就能给出结论，而 (a) 的最坏结果是重做 TP2 的 peer 锁步。
+#### 决策（P2 已落定）：走 (b)
+
+**结论：保留本树 Program，只补权能（(b)）。** 三条判定依据全部成立；第 1 条只在"必须自己
+写适配层"的意义上成立，不构成"必须取回上游两层 pool"的结构性依赖。
+
+| 判定 | 结论 | 证据 |
+|---|---|---|
+| 1. `HostKVExtentStore` 能否脱离两层 pool 表达 | 成立（需新适配层） | 它对 store 的依赖只有 16 个方法/数据面：`physical_pool().geometry()`、`valid`、`device_resident`、`host_resident`、`host_replica`、`content_epoch`、`committed_columns`、`address_references`、`source_pins`、`can_pin_source`、`pin_source`/`unpin_source`、`can_attach_host_replica`/`attach_host_replica`/`detach_host_replica`、`physical`。全部是可放在 `PagedKVAllocation` 之上的元数据，`physical(page)` 的句柄退化成 `page_ids()` 的 `int32` 物理页号。**物理层已实证**：`core/host_kv_arena.{h,cpp}`（939 行，除 `.h` 的 `#include` 一行外与上游逐字节相同）落在本树 |
+| 2. `PressureDecision` 是否只依赖 extent 抽象 | 成立 | `pressure_planner.h` 只 `#include "program.h"` + 标准库，全文不引用 `LogicalKVPageStore`/`DeviceKVPageHandle`；`PressureDecision` 是 `PressureKVDecision{begin_page,page_count,kind}` 的页区间、`PressureStateDecision` 与转移需求，按页数/字节计价。其中的 generation 是 planner 自己的 session/slot generation，与页句柄无关 |
+| 3. `page_ids()`+`publish_mapping()` 能否承担搬迁角色 | 成立（用所有权替代 generation） | `ninfer_context_tier_probe_test` 实证：保留中的 allocation 的页不会被别的 allocation 复用（所有权即 pin）；释放后的物理页号会被回收，所以 image 必须按内容而非页号寻址、restore 必须重新 materialize；按物理相邻页合并的 D2H park + H2D restore 逐字节相等；`publish_mapping()` 把恢复后的页号写回执行表 |
+
+**探测（本轮实测）**
+
+- `ninfer_host_kv_arena_test` 全绿：几何桥、`plan_host_kv_page_layout`、
+  `plan_host_kv_transfer_work`/`plan_device_kv_copy_work`（page-major/head-major 合并计数）、
+  arena allocate/split/`plan_after_releases`/`apply_recipe`。**不碰 CUDA kernel、不碰 device
+  pool**——上游 T1 的物理层确实是"恢复"，不是"设计"。
+- `ninfer_context_tier_probe_test` 全绿（真实 `PagedKVPool`）：保留页不复用、park/restore
+  逐字节、执行表回写、释放页号回收。
+
+**附带修正**
+
+- `src/core/paged_kv_storage.h` 原先与 `upstream/master` 逐字节相同，但**在本树不可编译**：
+  它 `switch` 到 `KvCacheStorage::Fp8E4M3Row256/Nvfp4Group16/Fp8KeyNvfp4Value`，而本树
+  `KvCacheStorage` 只有 `BFloat16/Int8Group64`（V100 只有两种 KV 存储，见 `include/ninfer/types.h`）。
+  已删掉三个不可达分支；它现在可编译，并被探测用于从 `PagedKVStorageLayout` 推导平面表。
+- 几何桥落在 `src/core/kv_page_geometry.h`：`KVPlaneGeometry = PagedKVPlaneSpec`（复用池的
+  平面类型，不再定义第二份），`KVPageGeometry{page_tokens, device_plane_order, planes}`，以及
+  `kv_page_geometry(PagedKVPoolSpec)` 投影。这是 §7.5.1 "`KVPageGeometry` ← `PagedKVStorageLayout`"
+  的精确形式——`PagedKVStorageLayout` 是**单层**的 K/V 向量 schema，`KVPageGeometry` 是**多层
+  平面表**，两者是推导关系而非同一类型。
+
+**对 (b) 的范围含义**
+
+P3 不再取回 `logical_kv_store.h`（1873）/`host_kv_extent_store.h`（711）的**上游类型**；
+`pressure_planner.h`（1485）本身不引用任何存储类型（判定 2），但它的决策类型
+（`PressureDecision`/`PressureStateDecision`/`PressureKVDecision`/`ResourceCandidateState`）定义在
+上游 `program.h`、本树尚无，需作为**纯数据**随 Program 权能一并加入——它们不牵动存储。需要
+新写的原语（P3 的落点）：
+
+- 逻辑页身份：`(PagedKVAllocation*, page index)` + `epoch` + `committed_columns`；
+- 设备副本生命周期：`drop_device_replica` 不能把页还给池（否则丢身份），需要"保留但非
+  device-resident"的所有权记录；
+- host extent：`HostKVArena` 已就位，extent 描述符表照 `HostKVExtentStore` 的
+  `prepare`/`device_sources`/`publish`/`abort`/`view` 形状写，`DeviceKVPageHandle` 换成 `int32` 页号；
+- 合并 D2H/H2D：按物理相邻页合并成少数 `cudaMemcpyAsync`（`publish_mapping` 已有 H2D 路径，
+  D2H 与区间合并是新增）；
+- **TP2 不动**：本树 `program_impl.h` 的 peer 锁步、`text_peer` 保持原样。这是 (b) 相对 (a)
+  的主要收益，也是选 (b) 的直接理由。
+
+**次决策（P1 遗留）**
+
+- **`PrefixReusePath` 两套词表**：保留单一枚举，含义对应如下，planning 侧由
+  `materialization_planner` 写、realized 侧由本树写，`request_log` 同时渲染两族；不新增适配
+  函数，因为两条路径各自只写自己那族（`RequestPlanSummary` 用 planner 侧，`BeginSummary`/
+  `GenerationMetrics` 用 realized 侧）。
+
+  | planner（planning） | engine（realized） |
+  |---|---|
+  | `Root` | `FullReset` |
+  | `PrivateEndpoint` | `AppendAtFrontier` |
+  | `PrivateTurnClosure` | `RestoreTurnCheckpoint` |
+  | `PrivateResponseReplay` | `RestoreResponseCheckpoint` |
+  | `PrivateLongAnchor` | （无对应；long-anchor checkpoint 本树尚未捕获） |
+  | `SharedStablePrefix` | （无对应；shared prefix 属 P4+） |
+
+- **P1 补齐的 24 个无引用顶层声明**：保留。它们来自上游 `types.h`/`contract/types.h`，是
+  Block C/D 的契约面；当前只被本树未参与任何构建目标的 `src/product/logging/*`、
+  `src/serve/operational_log.cpp` 引用或完全无引用。消费者集合要到 P4 才定型，现在删除会制造
+  往返；P4 收口时仍未引用者一并删除。
 
 ### 7.5 P3 — 物理存储层（Block D）
+
+#### 已落地（P3 首块，本轮实测）
+
+`src/core/host_kv_offload.{h,cpp}`：`HostKVOffload` 把一个 `PagedKVAllocation` 的页搬到
+`HostKVArena`（pinned host RAM）再搬回新页。page-major，按"逻辑与物理都相邻"的段做
+`cudaMemcpy2D`；恢复写进目标 allocation 自己的物理页、由调用方 `publish_mapping`。它不释放
+源页、也不依赖源页号——image 按内容寻址。
+
+`tests/test_host_kv_offload.cpp`（`ninfer_host_kv_offload_test`）按 27B/tp2/int8-group64 真实
+文本 KV 几何（16 层 × 4 平面 = 64 平面，1.03 MiB/页/设备）实测 128 页（132 MiB）：
+
+| 量 | 结果 |
+|---|---|
+| park D2H 132 MiB | 42.0 ms（3.14 GB/s） |
+| restore H2D 132 MiB ×2 | 82.8 ms（3.19 GB/s） |
+| host RSS | 112.8 → 245.1 MiB（+132 MiB，正好一份 KV） |
+| 目标指针 | `cudaMemoryTypeHost`（pinned，不是普通堆） |
+| 设备页回收 | 释放后 `free_pages()==512` |
+| 正确性 | 同一 image 恢复进**两个不同**物理页集合，逐字节相同 |
+
+带宽落在 §9 的 PCIe Gen3 模型内。测到的是 KV 层 primitives；把 engine 的 retained eviction
+接上它（还要镜像 GDN state / hidden / ledger）见下一块。
+
+#### 已落地（P3 第二块：GDN state + engine 逐出路径，本轮实测）
+
+上一块只搬 KV；而 §5.3 明确要求 tier image 必须包含**不能从 KV 前缀重建**的 GDN
+线性注意力 state。这一块把它补齐并接到了真实的 eviction 路径上。
+
+**新原语**
+
+- `src/core/host_linear_state.{h,cpp}`：`plan_host_linear_state_layout(spec, slots)` 把卷积态与
+  递归态排成"region → layer → slot"的紧凑镜像；`HostLinearStateArena` 在构造时一次性分配
+  全部 pinned 字节（逐出路径上零 CUDA 分配），`park_linear_state` 每个 (slot, region) 发一条
+  `cudaMemcpy2DAsync`（host pitch = 每层紧凑字节数，device pitch 取 slot 记录跨度）并在返回前
+  同步；`restore_linear_state{,_to}` 按**内容**寻址，允许 image 落到与寄存时不同的 slot。
+- `src/targets/qwen3_6/impl/runtime/host_lane_state_store.{h,cpp}`：一个 `HostLaneStateStore`
+  持有一个 KV arena、每个布局一个 `HostKVOffload`、一个按 lane 数定容的
+  `HostLinearStateArena`，以及 rank 0 两条 hidden 行（tail / rewrite checkpoint）的 pinned 镜像。
+
+**engine 接线**
+
+- `EngineOptions::host_context_bytes`（默认 0 = 关闭）；`MemorySummary` 增
+  `host_tier_capacity_bytes` / `host_tier_parked_bytes`。
+- `ProgramImplCore::evict_retained_lane` 先尝试 `park_lane`（整个 tier image：两 rank 的
+  Text KV + MTP KV、两 rank 的 GDN state、hidden、ledger/prefix 元数据），失败才退回原来的
+  `clear_lane`；`start_prefill_lane` 的复用分支按 `FullReset`/其余 走
+  `drop_parked_lane`/`restore_lane`；`clear_lane` 丢弃寄存镜像。
+- 寄存后 `sequence.retained = true` 且 prefix 元数据保留，planner 仍把它计价为可复用前缀；
+  `concurrent_executor` 在 tier 开启时让"严格更长复用"的逐出候选胜过直接准入（等长仍优先
+  直接准入，所以未开 tier 的路径逐字节不变）。
+
+**实测**
+
+`tests/test_host_linear_state.cpp`（`ninfer_host_linear_state_test`，48 层，卷积 [5120×3]
+BF16 + 递归 [128×128×24] FP32，2 slot = 146.8 MiB/rank）：
+
+| 量 | 结果 |
+|---|---|
+| park D2H 146.8 MiB | 46.7 ms（3.14 GB/s，PCIe 上限） |
+| 目标指针 | `cudaMemoryTypeHost` |
+| 正确性 | 同一 image 逐字节恢复到 slot {0,2}，并再次迁移恢复到 {1,3} |
+| arena | 寄存即计费、`release` 即归还 |
+
+`tests/targets/qwen3_6_27b/test_engine_host_tier_real.cpp`
+（`ninfer_qwen3_6_27b_host_tier_real_test`，27B/NVFP4，tp2 + MTP，`max_concurrency=2`，
+64 页池，`host_context_bytes=256 MiB`）：两个互不相关、约 1943 token 的长前缀并发占满两条
+lane，再提交一条约 2746 token 的第三前缀把它挤出池子。
+
+| 量 | 结果 |
+|---|---|
+| 单 lane 镜像 | 379,142,144 B（361.6 MiB）= 两 rank KV（~64 MiB）+ 两 rank GDN state（~294 MiB）|
+| RSS 增量 | +891 MiB（pinned 三块 arena 全部计入 RSS） |
+| 恢复 oracle | 恢复后的续写与"从不 swap"的对照运行**逐 token 相同**，复用路径与 frontier 相同，`computed_prefill_tokens` 增量为 **0** |
+| GDN 被搬运 | 镜像 >200 MiB，KV 单独只有 ~64 MiB |
+| 归还 | 第二轮 park/restore 后 parked 字节**精确回到**第一轮的值（镜像被 arena 归还并复用） |
+
+发现并修掉的接线 bug：`restore` 路径先是自己 `bind_row`、随后 `start_prefill_lane` 又
+`bind_sequence_kv`，触发"already bound"。按 `HostKVOffload::restore` 的契约（"调用方负责重
+发布映射，本方法既不 bind 也不同步"）删掉前者即可。
+
+仍未做：投影到 T2/NVMe（§7.8），以及把 tier 成本喂进 `ContextPortfolioValue`（§7.1）。
 
 #### 取回清单
 
@@ -546,8 +723,11 @@ cmake --build build-v100-test --target ninfer_resource_manager_test -j
 `recipe(...)` + `apply_recipe(...)` 的原子多目标分配，以及
 `HostKVAllocationHandle`/`View`/`ConstView` 的 generation 句柄。
 **唯一的适配点是 `KVPageGeometry`**——它来自上游 `paged_kv_cache.h`（本树该头文件已缩到 208 行）。
-本树的等价物是 `PagedKVStorageLayout`（`src/core/paged_kv_storage.h`）——**注意该头文件
-目前零 includer，是移植残留的死代码**，正好可以在这里复活或替换。
+本树按 §7.4 的 P2 决策在 `src/core/kv_page_geometry.h` 提供它：`KVPlaneGeometry` 复用池的
+`PagedKVPlaneSpec`，`KVPageGeometry` 是多层平面表，`kv_page_geometry(PagedKVPoolSpec)` 做投影，
+而平面表本身由 `paged_kv_storage_layout`（`src/core/paged_kv_storage.h`）推导。该头文件原先
+与上游逐字节相同却在本树不可编译（引用了本树没有的三个 `KvCacheStorage` 值），P2 已修掉；
+`core/host_kv_arena.{h,cpp}` 也已按原样落在本树。
 
 **`state_image`（809 + 460 + 173）** 与 pool 架构无关，可独立取回。
 `StateImageStore(StateImageDevicePool&, HostStatePool*, logical_capacity)`，
@@ -687,8 +867,6 @@ ctest --test-dir build-v100-test -R 'context_cost|context_store|state_image' --o
 - restore 期间同时持有 device page 和 host slot，这段瞬时占用要不要计入 admission 容量？
 - 只做 retained 路径，还是也允许抢占 value 低的 active request？后者是 preemption 味道的
   变体，本计划**明确推迟**。
-- **P2 的 (a)/(b) 选择**：忠于上游 Program 结构，还是保留本树 Program 只补权能接口？
-  这是阻塞 P3 的决策，判定依据见 §7.4。
 
 ---
 
