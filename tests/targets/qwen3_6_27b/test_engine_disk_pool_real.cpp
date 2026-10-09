@@ -2,8 +2,8 @@
 // the three tiers, every one of them resumable without re-prefilling.
 //
 // The scenario is the product question, not a synthetic one. A conversation is admitted, prefills its
-// long prompt once, answers, and is then displaced by the next conversation; its prefix goes to the
-// NVMe tier as it leaves. The engine is destroyed (taking the device pages, the host arena and every
+// long prompt once, answers, and its prefix reaches the NVMe tier as that turn completes; the next
+// conversation then displaces it from the paged pool. The engine is destroyed (taking the device pages, the host arena and every
 // resident prefix metadata with it) and reopened against the same directory. Each conversation's
 // prompt is then sent again, and the only thing that can answer it is the content-addressed record.
 //
@@ -19,6 +19,13 @@
 // Shrink it while iterating with NINFER_DISK_POOL_TOKENS / NINFER_DISK_POOL_LANES /
 // NINFER_DISK_POOL_CAPACITY / NINFER_DISK_POOL_HOST_BYTES. The scratch directory must not be a
 // tmpfs; its default is under /var/tmp and NINFER_DISK_TIER_DIR overrides it.
+//
+// NINFER_DISK_POOL_SPEC=none drops MTP; NINFER_DISK_POOL_CONCURRENCY (default 2) sets the lane count. At 1 the deployment has a
+// single lane, so every session displaces its predecessor from that one lane instead of parking it
+// to a free one: the record then has to reach the NVMe tier through the lane-replacement spill, and
+// a resume has to land back on the lane the previous session just used. That shape is what a
+// serial server runs, and it is the one the host tier alone cannot serve -- it only parks lanes
+// other than the one being admitted.
 
 #include "ninfer/engine.h"
 
@@ -70,13 +77,18 @@ ninfer::EngineOptions engine_options(const char* artifact, const std::filesystem
     options.prefill_chunk      = 1024;
     options.kv_cache           = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph     = true;
-    options.max_concurrency    = 2;
+    options.max_concurrency    = env_u32("NINFER_DISK_POOL_CONCURRENCY", 2);
     options.host_context_bytes = env_bytes("NINFER_DISK_POOL_HOST_BYTES", 12ULL << 30);
     options.disk_kv_path       = disk_path;
     options.disk_kv_bytes      = env_bytes("NINFER_DISK_POOL_DISK_BYTES", 96ULL << 30);
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    // The tier's publish hook sits on both resolution paths, so the gate runs the ordinary one too:
+    // NINFER_DISK_POOL_SPEC=none drops the speculative backend that the other shapes exercise.
+    const char* const spec = std::getenv("NINFER_DISK_POOL_SPEC");
+    if (spec == nullptr || std::string(spec) != "none") {
+        options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens  = 3;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    }
     return options;
 }
 
@@ -262,12 +274,14 @@ int main() {
                 std::cout.flush();
             }
 
-            // The last session is still resident: displace it too, with a prompt too short to matter.
-            (void)engine.generate(engine.prepare(long_prompt("flush", 2)), request_options(false));
-
+            // Nothing displaces the last session, and no flush request stands in for one: the tier
+            // has to hold each conversation as its turn completes, or the session a process happens
+            // to be holding when it exits would be the one conversation that is not on it. The
+            // resumed pass below is what proves it -- the last session's record can only come from
+            // its own completion.
             const ninfer::MemorySummary summary = engine.memory_summary();
             persisted                            = summary.disk_tier_used_bytes;
-            std::cout << "after displacement: host parked "
+            std::cout << "resident at exit: host parked "
                       << summary.host_tier_parked_bytes / (1ULL << 20) << " MiB, NVMe live "
                       << persisted / (1ULL << 20) << " MiB, restores " << summary.disk_tier_restores
                       << '\n';
