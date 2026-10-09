@@ -72,9 +72,12 @@ def main() -> None:
         files.append(str(path))
 
     if files:
+        formatter = Path(sys.executable).with_name("clang-format")
+        if not formatter.exists():
+            formatter = Path("/usr/bin/clang-format")
         subprocess.run(
             [
-                "/usr/bin/clang-format",
+                str(formatter),
                 "-i",
                 "--style=file",
                 "--fallback-style=none",
