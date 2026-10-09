@@ -169,6 +169,15 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
+
+    // The NVMe tier is consulted once per request, against the prompt's own content digests: a
+    // prefix another conversation spilled -- or this one spilled before a restart -- is addressed
+    // by what it says, not by which lane happens to hold it. Vision prompts stay out of it: their
+    // media would have to be re-encoded before a restored block could be trusted, and the plan
+    // already prices a full encode.
+    if (base->allow_prefix_reuse && disk_tier_ != nullptr && !prompt.has_media()) {
+        base->disk_restore_frontier = disk_restorable_frontier(prompt);
+    }
     return RequestBasePlan(std::move(base));
 }
 
@@ -232,9 +241,30 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
+    // Nothing resident matches, but the prompt's own content may still be on the NVMe tier. The
+    // lane is then rebuilt from that record: `disk_restore_frontier` marks it, the reuse base is
+    // the frontier the record closes, and the MTP bridge continues exactly where an in-place
+    // AppendAtFrontier would. A miss at restore time also lands on the cold prefill this plan
+    // priced, so the frontier only ever removes work.
+    if (plan->reuse == ReusePath::FullReset && base.disk_restore_frontier != 0) {
+        plan->disk_restore_frontier = base.disk_restore_frontier;
+        plan->reuse                 = ReusePath::AppendAtFrontier;
+        plan->reuse_base            = base.disk_restore_frontier;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
+                                    ? MtpBridgeMode::BeforeSuffix
+                                    : MtpBridgeMode::AfterExactHit;
+        }
+    }
+
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    // A disk-restorable plan carries no resident checkpoint at all, so an existing one can never
+    // match it: the suffix prefill captures the desired boundary, or the plan defers exactly as a
+    // resident hit past that boundary already does.
     const bool existing_checkpoint_matches =
-        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
+        desired && plan->reuse != ReusePath::FullReset && plan->disk_restore_frontier == 0 &&
+        sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                         desired->frontier);
@@ -254,7 +284,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
     }
 
-    plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    // A disk-restorable plan reports no reusable prefix. The frontier it names is a record the store
+    // may have lost, so the admission has to run like the prefill it can fall back to -- and it is
+    // priced that way below -- while the lane that actually lands is whatever the record answers.
+    plan->summary.reusable_prompt_tokens =
+        plan->disk_restore_frontier != 0 ? 0U : plan->reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
@@ -297,8 +331,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                  plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
              ? 1ULL
              : 0ULL);
+    // A disk-restorable plan is priced as the cold prefill it falls back to: the restore is a
+    // transfer, but a miss has to recompute the whole prompt, and only the caller that reads the
+    // bytes knows which one happened.
+    const std::uint32_t service_base = plan->disk_restore_frontier != 0 ? 0U : plan->reuse_base;
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+        projected_service_work(plan->summary, service_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));
 }
 

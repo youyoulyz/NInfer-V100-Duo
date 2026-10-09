@@ -518,6 +518,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     if (plan.host_context_bytes != 0) { enable_lane_tier(plan.host_context_bytes); }
+    if (!plan.disk_kv_path.empty()) {
+        if (lane_store_ == nullptr) {
+            throw std::invalid_argument(
+                "the NVMe lane tier needs a positive host context budget");
+        }
+        enable_disk_tier(plan.disk_kv_path, plan.disk_kv_bytes);
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -640,7 +647,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
-    if (request_plan.reuse != ReusePath::FullReset &&
+    // A disk-restorable plan names no resident prefix at all: the lane starts empty and the tier
+    // fills it below, with a cold prefill as the fallback the plan already priced.
+    if (request_plan.reuse != ReusePath::FullReset && request_plan.disk_restore_frontier == 0 &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
@@ -690,8 +699,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
-    const auto started       = Clock::now();
-    const std::uint32_t base = request_plan.reuse_base;
+    const auto started = Clock::now();
+    std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
             ? std::min({draft_window,
@@ -701,21 +710,46 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
+    const bool disk_plan = request_plan.reuse != ReusePath::FullReset &&
+                           request_plan.disk_restore_frontier != 0;
+    // The lane's own resident prefix is replaced whenever this plan cannot continue it: a full
+    // reset, or a disk record the lane does not hold. The admission pass only parks the OTHER
+    // lanes, so publish this one's bytes to the NVMe tier before its device pages are reclaimed --
+    // that is what keeps a wait for capacity from turning into a re-prefill. Best effort, and
+    // skipped on every reuse path, where the resident prefix is exactly what the request keeps.
+    if (disk_tier_ != nullptr && (request_plan.reuse == ReusePath::FullReset || disk_plan) &&
+        sequence.retained && sequence.kv.has_value()) {
+        (void)spill_device_prefix(lane);
+    }
     sequence.retained = false;
     try {
-        // A parked lane keeps its host prefix metadata so the planner still prices it as a
-        // reusable prefix; the bytes come back here, before the reuse branches consume them.
-        if (request_plan.reuse == ReusePath::FullReset) {
+        // A disk-restorable plan starts on an empty lane: its bytes are addressed by content, not by
+        // what happens to sit in the lane, so the lane is rebuilt from the record below.
+        bool cold = request_plan.reuse == ReusePath::FullReset || disk_plan;
+        if (cold) {
             drop_parked_lane(lane);
-        } else {
-            restore_lane(lane);
-        }
-        if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            sequence.prefix_digests.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
+            if (disk_plan) {
+                // The restore re-checks the whole record and answers with the frontier that landed,
+                // so a record the tier lost since planning becomes the cold prefill the plan priced.
+                cold = restore_lane_from_disk(lane, request_plan.disk_restore_frontier, prompt) == 0;
+            }
+        } else {
+            // A parked lane keeps its host prefix metadata so the planner still prices it as a
+            // reusable prefix; the bytes come back here, before the reuse branches consume them.
+            restore_lane(lane);
+        }
+        if (cold) {
+            // The plan priced a prefix this lane does not end up holding: a full reset, or a disk
+            // record that went missing between planning and the restore. Either way the request
+            // continues from zero, so everything below -- the trim, the ledger, the digests, the
+            // tail-hidden validity -- has to describe a cold start rather than the record's frontier.
+            base = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
@@ -741,6 +775,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+            sequence.prefix_digests.truncate(base);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
@@ -792,6 +827,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+            sequence.prefix_digests.truncate(base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -826,6 +862,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt);
+        sequence.prefix_digests.assign(prompt);
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
@@ -1120,6 +1157,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                           : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
+            sequence.prefix_digests.append_generated(
+                std::span<const TokenId>(token_base, committed), sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
@@ -1183,6 +1222,9 @@ void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
         if (parked) { return; }
         drop_parked_lane(lane);
     }
+    // The host tier could not hold the lane, so its device bytes are about to go. Mirror them to
+    // the NVMe tier first: that is the whole point of the tier below the host one.
+    if (disk_tier_ != nullptr) { (void)spill_device_prefix(lane); }
     clear_lane(sequences[lane], requests[lane]);
 }
 
@@ -1202,13 +1244,75 @@ void ProgramImplCore::enable_lane_tier(std::size_t host_bytes) {
     const std::array<std::int32_t, 2> slots{
         LinearStateSlots::current_state_slot(0, max_concurrency),
         LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)};
-    const std::size_t linear_image_bytes = plan_host_linear_state_layout(linear_spec, slots).total_bytes;
+    const HostLinearStateLayout linear_layout = plan_host_linear_state_layout(linear_spec, slots);
+    // The disk tier stores one state image per resumable frontier, and a resume only ever needs the
+    // role it continues from: the rewrite checkpoint is a rollback seam for a resident lane, and a
+    // restored prefix never lands on a resident rewrite. Keeping it out of the image halves what
+    // every parked conversation costs on disk.
+    const std::array<std::int32_t, 1> resume_slots{
+        LinearStateSlots::current_state_slot(0, max_concurrency)};
+    const HostLinearStateLayout resume_layout =
+        plan_host_linear_state_layout(linear_spec, resume_slots);
     // One linear-attention image per rank per lane: the peer's pool is a distinct physical pool.
-    const std::uint32_t linear_images = max_concurrency * static_cast<std::uint32_t>(tp == 2 ? 2 : 1);
+    const std::uint32_t ranks = static_cast<std::uint32_t>(tp == 2 ? 2 : 1);
 
-    lane_store_ = std::make_unique<qwen3_6::detail::HostLaneStateStore>(
-        std::move(layouts), host_bytes, linear_image_bytes, linear_images,
+    lane_store_ = std::make_unique<HostLaneStateStore>(
+        std::move(layouts), host_bytes, linear_layout, resume_layout, max_concurrency, ranks,
         static_cast<std::size_t>(TextConfig::hidden) * 2ULL);
+}
+
+// Opens the NVMe tier. Every geometry it needs comes from the pools and from the host tier's
+// staging, so the tier is a pure function of the execution profile: no caller sizes a page.
+void ProgramImplCore::enable_disk_tier(std::string path, std::size_t bytes) {
+    if (disk_tier_ != nullptr) { return; }
+    if (lane_store_ == nullptr) {
+        throw std::invalid_argument("the NVMe lane tier requires the host lane tier");
+    }
+    if (path.empty()) { throw std::invalid_argument("the NVMe lane tier needs a directory"); }
+    if (speculative_backend != SpeculativeBackend::None &&
+        speculative_backend != SpeculativeBackend::Mtp) {
+        // A DFlash lane resumes through its own context cache, which the disk tier does not carry;
+        // storing KV a restore could not use would only spend disk.
+        throw std::invalid_argument("the NVMe lane tier supports the MTP backend only");
+    }
+
+    qwen3_6::detail::LaneDiskTier::Options options;
+    options.path       = std::move(path);
+    options.text_stride = plan_host_kv_page_layout(text_kv_geometry()).page_stride;
+    if (backend_kv_cache() != nullptr) {
+        options.backend_stride = plan_host_kv_page_layout(backend_kv_geometry()).page_stride;
+    }
+    options.state_bytes = lane_store_->tier_state_staging_bytes();
+    options.backend_lag = speculative_backend == SpeculativeBackend::Mtp ? 1U : 0U;
+    options.tag         = program_identity_tag();
+    options.ranks       = lane_store_->ranks();
+    options.capacity_bytes =
+        bytes != 0 ? bytes : static_cast<std::size_t>(kDefaultDiskKvBytes);
+    disk_tier_ = std::make_unique<qwen3_6::detail::LaneDiskTier>(std::move(options));
+    disk_restores_ = 0;
+}
+
+std::uint32_t ProgramImplCore::program_identity_tag() const noexcept {
+    const KvCacheStorage storage =
+        kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    return identity_tag(speculative_backend, proposal_head, storage);
+}
+
+std::uint32_t ProgramImplCore::disk_restorable_frontier(const PreparedPromptData& prompt) const {
+    if (disk_tier_ == nullptr || prompt.token_ids.empty()) { return 0; }
+    PrefixDigests digests;
+    digests.assign(prompt);
+    const std::optional<DiskResumePoint> point =
+        disk_tier_->plan_resume(digests, static_cast<std::uint32_t>(prompt.token_ids.size()));
+    return point ? point->frontier : 0;
+}
+
+std::size_t ProgramImplCore::disk_tier_capacity_bytes() const noexcept {
+    return disk_tier_ != nullptr ? disk_tier_->options().capacity_bytes : 0;
+}
+
+std::size_t ProgramImplCore::disk_tier_used_bytes() const noexcept {
+    return disk_tier_ != nullptr ? disk_tier_->used_bytes() : 0;
 }
 
 KVPageGeometry ProgramImplCore::text_kv_geometry() const {
@@ -1343,6 +1447,9 @@ bool ProgramImplCore::park_lane(std::uint32_t lane) {
     image.linear_peer  = std::move(linear_peer);
     image.metadata.ledger                  = sequence.ledger;
     image.metadata.prefix_identity         = sequence.prefix_identity;
+    // The frozen digest image, so the NVMe spill derives its keys from what the lane held when it
+    // was parked rather than from a live sequence a later admission may already have rewound.
+    image.metadata.prefix_digests          = sequence.prefix_digests;
     image.metadata.execution_frontier      = sequence.execution_frontier;
     image.metadata.ledger_frontier         = sequence.ledger_frontier;
     image.metadata.text_kv_valid           = sequence.text_kv_valid;
@@ -1353,6 +1460,12 @@ bool ProgramImplCore::park_lane(std::uint32_t lane) {
     image.metadata.tail_hidden_valid       = sequence.tail_hidden_valid;
     image.metadata.rewrite_checkpoint      = sequence.rewrite_checkpoint;
     parked_images_[lane] = std::move(image);
+
+    // Publish the same prefix to the NVMe tier. The host image is the cheap copy to stream from,
+    // and it is the one that survives the host arena being reclaimed, so the spill runs here,
+    // immediately, while the lane's state is still exactly what the image describes. Best effort:
+    // a tier that cannot hold it must never fail the park.
+    (void)spill_parked_prefix(lane);
 
     // The prefix metadata stays live so the planner still sees the lane as reusable; only the
     // bytes leave the device.
@@ -1454,6 +1567,398 @@ bool ProgramImplCore::restore_parked_lane(std::uint32_t lane) {
     return true;
 }
 
+// Packs one lane's resumable state image into the tier's staging buffer: every rank's linear-
+// attention state for the role the tap continues from, then the hidden row of the token that
+// frontier follows. Both spills use this, and both read the device: a park releases a lane's KV
+// pages but never its linear slots (the GDN pool is statically partitioned by lane) nor its hidden
+// tensors, so a parked lane's state is still where it was.
+//
+// Two roles are tappable, and they are the two frontiers a later prompt can land on:
+//   * the current slot, which is the state after the lane's last committed token;
+//   * the rewrite-checkpoint slot, which the prefill copied at the checkpoint frontier and which is
+//     therefore the state at the END OF THE PROMPT -- exactly the frontier a re-sent prompt (or a
+//     follow-up turn whose new text the tokenizer renders onto the same prefix) resumes from.
+bool ProgramImplCore::stage_tier_state(std::uint32_t lane, bool checkpoint) noexcept {
+    if (lane_store_ == nullptr || lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    const HostLinearStateLayout& layout = lane_store_->tier_state_layout();
+    const std::size_t linear_bytes = layout.total_bytes;
+    const std::size_t hidden_bytes = lane_store_->hidden_bytes();
+    const std::size_t ranks        = lane_store_->ranks();
+    if (linear_bytes == 0 || hidden_bytes == 0 || ranks == 0 ||
+        sequence.tail_hidden.bytes() != hidden_bytes ||
+        sequence.rewrite_checkpoint_hidden.bytes() != hidden_bytes ||
+        lane_store_->tier_state_staging_bytes() != linear_bytes * ranks + 2ULL * hidden_bytes) {
+        return false;
+    }
+    std::byte* const staging = lane_store_->tier_state_staging();
+    if (staging == nullptr) { return false; }
+    const std::array<std::int32_t, 1> slots{checkpoint
+                                                ? LinearStateSlots::rewrite_checkpoint_state_slot(
+                                                      lane, max_concurrency)
+                                                : LinearStateSlots::current_state_slot(
+                                                      lane, max_concurrency)};
+    // The tap closes `frontier`, so its image ends with the hidden row of token `frontier - 1`:
+    // the tail hidden for the lane's own frontier, the checkpoint's hidden for the seam.
+    const Tensor& row = checkpoint ? sequence.rewrite_checkpoint_hidden : sequence.tail_hidden;
+    try {
+        park_linear_state_into(staging, layout, decoder->linear_attention, slots, device.stream);
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            park_linear_state_into(staging + linear_bytes, layout, peer->decoder->linear_attention,
+                                   slots, peer->device.stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(staging + ranks * linear_bytes, row.data, hidden_bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        // The second row is not read back: a restored lane carries no rewrite seam, because the
+        // seam belonged to the lane that spilled. It is filled so the image is a whole buffer.
+        CUDA_CHECK(cudaMemcpyAsync(staging + ranks * linear_bytes + hidden_bytes,
+                                   sequence.rewrite_checkpoint_hidden.data, hidden_bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Writes one tap from the lane's live device allocations: every rank's chain in staging-sized
+// batches, then the state image that publishes the frontier. False leaves the store as it was.
+bool ProgramImplCore::spill_device_tap(std::uint32_t lane, std::uint32_t frontier,
+                                       bool checkpoint) noexcept {
+    SequenceState& sequence = sequences[lane];
+    if (frontier == 0 || frontier > sequence.text_kv_valid ||
+        frontier > sequence.execution_frontier || frontier > sequence.prefix_digests.size()) {
+        return false;
+    }
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if (sequence.kv.has_value() == false || sequence.kv->backend.has_value() != mtp) { return false; }
+    const std::uint32_t backend_chain = disk_tier_->backend_frontier(frontier);
+    if (mtp && sequence.mtp_kv_valid < backend_chain) { return false; }
+
+    HostKVOffload* const text_staging = lane_store_->staging_offload_for(text_kv_geometry());
+    HostKVOffload* const backend_staging =
+        mtp ? lane_store_->staging_offload_for(backend_kv_geometry()) : nullptr;
+    if (text_staging == nullptr || (mtp && backend_staging == nullptr)) { return false; }
+    const std::uint32_t batch = HostLaneStateStore::staging_pages();
+    try {
+        HostKVImage& text_image = lane_store_->staging_kv(text_kv_geometry());
+        HostKVImage* backend_image = nullptr;
+        if (mtp) { backend_image = &lane_store_->staging_kv(backend_kv_geometry()); }
+        // One rank's chain, staging-sized batches at a time. The staging image is host memory and
+        // is reused across ranks, so every batch is synchronized before the next one overwrites it.
+        const auto spill_chain = [&](std::uint32_t rank, DiskKVKind kind, std::uint32_t chain,
+                                     HostKVOffload& staging, HostKVImage& image, PagedKVPool& pool,
+                                     PagedKVAllocation& source, cudaStream_t stream) {
+            const std::uint32_t pages = LaneDiskTier::prefix_pages(chain);
+            for (std::uint32_t first = 0; first < pages; first += batch) {
+                const std::uint32_t count = std::min(batch, pages - first);
+                staging.park_range(pool, source, first, count, image, 0, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const std::size_t stride = staging.layout().page_stride;
+                if (!disk_tier_->spill_pages(sequence.prefix_digests, kind, rank, chain, first,
+                                             count,
+                                             {staging.data(image),
+                                              static_cast<std::size_t>(count) * stride})) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            if (!spill_chain(1, DiskKVKind::MainKV, frontier, *text_staging, text_image,
+                             peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                             peer->device.stream)) {
+                return false;
+            }
+            if (mtp && !spill_chain(1, DiskKVKind::BackendKV, backend_chain, *backend_staging,
+                                    *backend_image, peer->decoder->mtp_cache()->pool(),
+                                    *sequence.kv->backend_peer, peer->device.stream)) {
+                return false;
+            }
+        }
+        if (!spill_chain(0, DiskKVKind::MainKV, frontier, *text_staging, text_image,
+                         decoder->text_kv.pool(), sequence.kv->text, device.stream)) {
+            return false;
+        }
+        if (mtp && !spill_chain(0, DiskKVKind::BackendKV, backend_chain, *backend_staging,
+                                *backend_image, backend_kv_cache()->pool(),
+                                *sequence.kv->backend, device.stream)) {
+            return false;
+        }
+        if (!stage_tier_state(lane, checkpoint)) { return false; }
+        return disk_tier_->spill_state(sequence.prefix_digests, frontier,
+                                       {lane_store_->tier_state_staging(),
+                                        lane_store_->tier_state_staging_bytes()});
+    } catch (...) {
+        return false;
+    }
+}
+
+// Writes one lane's live device prefix to the NVMe tier, as the one or two taps a later prompt can
+// land on. False means nothing resumable was published, so a failed spill only costs a recompute.
+bool ProgramImplCore::spill_device_prefix(std::uint32_t lane) noexcept {
+    if (disk_tier_ == nullptr || lane_store_ == nullptr || lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (!sequence.retained || !sequence.kv) { return false; }
+    if (request.lifecycle != Lifecycle::Empty && request.lifecycle != Lifecycle::Complete) {
+        return false;
+    }
+    if (peer.has_value() != sequence.kv->text_peer.has_value()) { return false; }
+    const std::uint32_t frontier =
+        std::min({sequence.execution_frontier, sequence.text_kv_valid,
+                  static_cast<std::uint32_t>(sequence.prefix_digests.size())});
+    // The state image closes `frontier`, and the recurrent slot is advanced in place: a lane whose
+    // KV is behind or ahead of its state has no state at the frontier a resume would land on.
+    if (frontier == 0 || sequence.execution_frontier != frontier) { return false; }
+    std::array<std::pair<std::uint32_t, bool>, 2> taps{};
+    std::size_t tap_count = 0;
+    if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
+        sequence.rewrite_checkpoint.frontier < frontier) {
+        taps[tap_count++] = {sequence.rewrite_checkpoint.frontier, true};
+    }
+    taps[tap_count++] = {frontier, false};
+    bool spilled = false;
+    for (std::size_t index = 0; index < tap_count; ++index) {
+        spilled = spill_device_tap(lane, taps[index].first, taps[index].second) || spilled;
+    }
+    return spilled;
+}
+
+// The same spill from a lane the host tier already holds: its KV lives in the parked host image, so
+// a batch is a direct view into it and no device transfer is involved.
+bool ProgramImplCore::spill_parked_prefix(std::uint32_t lane) noexcept {
+    if (disk_tier_ == nullptr || lane_store_ == nullptr || lane >= max_concurrency) { return false; }
+    std::optional<LaneStateImage>& parked = parked_images_[lane];
+    if (!parked) { return false; }
+    const LaneStateMetadata& metadata = parked->metadata;
+    const std::uint32_t frontier =
+        std::min({metadata.execution_frontier, metadata.text_kv_valid,
+                  static_cast<std::uint32_t>(metadata.prefix_digests.size())});
+    if (frontier == 0 || metadata.execution_frontier != frontier) { return false; }
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+
+    HostKVOffload* const text_offload = lane_store_->offload_for(text_kv_geometry());
+    HostKVOffload* const backend_offload =
+        mtp ? lane_store_->offload_for(backend_kv_geometry()) : nullptr;
+    if (text_offload == nullptr || (mtp && backend_offload == nullptr)) { return false; }
+
+    const auto spill_image = [&](std::uint32_t rank, DiskKVKind kind, std::uint32_t chain,
+                                 const std::optional<HostKVImage>& image, HostKVOffload& offload) {
+        if (!image) { return false; }
+        const std::uint32_t pages = LaneDiskTier::prefix_pages(chain);
+        if (image->page_count() < pages) { return false; }
+        const std::size_t stride    = offload.layout().page_stride;
+        const std::byte* const base = offload.data(*image);
+        const std::uint32_t batch   = HostLaneStateStore::staging_pages();
+        for (std::uint32_t first = 0; first < pages; first += batch) {
+            const std::uint32_t count = std::min(batch, pages - first);
+            if (!disk_tier_->spill_pages(metadata.prefix_digests, kind, rank, chain, first, count,
+                                         {base + static_cast<std::size_t>(first) * stride,
+                                          static_cast<std::size_t>(count) * stride})) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto spill_tap = [&](std::uint32_t tap_frontier, bool checkpoint) {
+        if (tap_frontier == 0 || tap_frontier > metadata.text_kv_valid ||
+            tap_frontier > metadata.execution_frontier ||
+            tap_frontier > metadata.prefix_digests.size()) {
+            return false;
+        }
+        const std::uint32_t backend_chain = disk_tier_->backend_frontier(tap_frontier);
+        if (mtp && metadata.mtp_kv_valid < backend_chain) { return false; }
+        try {
+            if (!spill_image(0, DiskKVKind::MainKV, tap_frontier, parked->text, *text_offload)) {
+                return false;
+            }
+            if (peer && !spill_image(1, DiskKVKind::MainKV, tap_frontier, parked->text_peer,
+                                     *text_offload)) {
+                return false;
+            }
+            if (mtp) {
+                if (!spill_image(0, DiskKVKind::BackendKV, backend_chain, parked->backend,
+                                 *backend_offload) ||
+                    (peer && !spill_image(1, DiskKVKind::BackendKV, backend_chain,
+                                          parked->backend_peer, *backend_offload))) {
+                    return false;
+                }
+            }
+            if (!stage_tier_state(lane, checkpoint)) { return false; }
+            return disk_tier_->spill_state(metadata.prefix_digests, tap_frontier,
+                                           {lane_store_->tier_state_staging(),
+                                            lane_store_->tier_state_staging_bytes()});
+        } catch (...) {
+            return false;
+        }
+    };
+
+    std::array<std::pair<std::uint32_t, bool>, 2> taps{};
+    std::size_t tap_count = 0;
+    if (metadata.rewrite_checkpoint.valid && metadata.rewrite_checkpoint.frontier != 0 &&
+        metadata.rewrite_checkpoint.frontier < frontier) {
+        taps[tap_count++] = {metadata.rewrite_checkpoint.frontier, true};
+    }
+    taps[tap_count++] = {frontier, false};
+    bool spilled = false;
+    for (std::size_t index = 0; index < tap_count; ++index) {
+        spilled = spill_tap(taps[index].first, taps[index].second) || spilled;
+    }
+    return spilled;
+}
+
+// Loads a content-addressed prefix the disk tier holds into `lane`, returning the frontier that
+// landed. Zero is a miss of some kind -- an evicted record, a corrupt page, a shape the tier
+// refuses -- and the caller then pays the cold prefill its plan already priced. The lane is left
+// without a KV bundle on every failure, so the caller's fallback starts from the same place a
+// never-restored lane does.
+std::uint32_t ProgramImplCore::restore_lane_from_disk(std::uint32_t lane, std::uint32_t frontier,
+                                                      const PreparedPromptData& prompt) {
+    if (disk_tier_ == nullptr || lane_store_ == nullptr || lane >= max_concurrency) { return 0; }
+    SequenceState& sequence = sequences[lane];
+    if (sequence.kv.has_value() || frontier == 0) { return 0; }
+    // The keys come from the prompt's own content, and the sequence keeps the image so the reuse
+    // branch below can truncate it in lockstep with the ledger.
+    sequence.prefix_digests.assign(prompt);
+    const std::optional<DiskResumePoint> point = disk_tier_->plan_resume(
+        sequence.prefix_digests, static_cast<std::uint32_t>(prompt.token_ids.size()));
+    // Re-checked here, not merely at plan time: a record the tier lost in between must fall back to
+    // the recompute rather than resume a prefix the store no longer holds end to end.
+    if (!point || point->frontier != frontier) {
+        sequence.prefix_digests.clear();
+        return 0;
+    }
+
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if ((backend_kv_cache() != nullptr) != mtp) {
+        sequence.prefix_digests.clear();
+        return 0;
+    }
+    const std::uint32_t backend_pages = mtp ? std::max(point->backend_pages, 1U) : 0U;
+    const std::uint32_t batch         = HostLaneStateStore::staging_pages();
+    bool landed                       = false;
+    try {
+        reserve_sequence_kv(sequence, point->text_pages, backend_pages);
+        // The bytes land in this store's staging image, so the staging offload is the one that can
+        // read it back: an image is only addressable through the arena that allocated it.
+        HostKVOffload* const text_staging =
+            lane_store_->staging_offload_for(text_kv_geometry());
+        if (text_staging == nullptr) { throw std::runtime_error("tier"); }
+        HostKVImage& text_image = lane_store_->staging_kv(text_kv_geometry());
+        HostKVOffload* backend_staging = nullptr;
+        if (mtp) {
+            backend_staging = lane_store_->staging_offload_for(backend_kv_geometry());
+            if (backend_staging == nullptr) { throw std::runtime_error("tier"); }
+        }
+        // One rank's chain, staging-sized batches at a time. Each batch is synchronized because the
+        // next read overwrites the host staging image the previous upload reads from.
+        const auto load_chain = [&](DiskKVKind kind, std::uint32_t rank, std::uint32_t pages,
+                                    HostKVOffload& staging, HostKVImage& image,
+                                    PagedKVPool& pool, PagedKVAllocation& allocation,
+                                    cudaStream_t stream) {
+            for (std::uint32_t first = 0; first < pages; first += batch) {
+                const std::uint32_t count = std::min(batch, pages - first);
+                if (!disk_tier_->load_kv_pages(sequence.prefix_digests, *point, kind, rank, first,
+                                               count, staging.mutable_data(image))) {
+                    return false;
+                }
+                staging.restore_range(image, 0, count, pool, allocation, first, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+            return true;
+        };
+
+        sequence.kv->text.materialize_pages(point->text_pages, device.stream);
+        if (!load_chain(DiskKVKind::MainKV, 0, point->text_pages, *text_staging, text_image,
+                        decoder->text_kv.pool(), sequence.kv->text, device.stream)) {
+            throw std::runtime_error("tier");
+        }
+        if (mtp) {
+            sequence.kv->backend->materialize_pages(backend_pages, device.stream);
+            HostKVImage& backend_image =
+                lane_store_->staging_kv(backend_kv_geometry());
+            if (!load_chain(DiskKVKind::BackendKV, 0, point->backend_pages, *backend_staging,
+                            backend_image, backend_kv_cache()->pool(), *sequence.kv->backend,
+                            device.stream)) {
+                    throw std::runtime_error("tier");
+            }
+        }
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            sequence.kv->text_peer->materialize_pages(point->text_pages, peer->device.stream);
+            if (!load_chain(DiskKVKind::MainKV, 1, point->text_pages, *text_staging, text_image,
+                            peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                            peer->device.stream)) {
+                    throw std::runtime_error("tier");
+            }
+            if (mtp) {
+                sequence.kv->backend_peer->materialize_pages(backend_pages, peer->device.stream);
+                HostKVImage& backend_image =
+                    lane_store_->staging_kv(backend_kv_geometry());
+                if (!load_chain(DiskKVKind::BackendKV, 1, point->backend_pages, *backend_staging,
+                                backend_image, peer->decoder->mtp_cache()->pool(),
+                                *sequence.kv->backend_peer, peer->device.stream)) {
+                            throw std::runtime_error("tier");
+                }
+            }
+        }
+
+        // The state image. It is what makes the resume legal, so it is read after every KV byte and
+        // a failure here is a miss like any other.
+        const HostLinearStateLayout& layout = lane_store_->tier_state_layout();
+        const std::size_t linear_bytes = layout.total_bytes;
+        const std::size_t hidden_bytes = lane_store_->hidden_bytes();
+        std::byte* const staging_state  = lane_store_->tier_state_staging();
+        if (sequence.tail_hidden.bytes() != hidden_bytes ||
+            sequence.rewrite_checkpoint_hidden.bytes() != hidden_bytes ||
+            !disk_tier_->load_state(sequence.prefix_digests, *point,
+                                    {staging_state, lane_store_->tier_state_staging_bytes()})) {
+            throw std::runtime_error("tier");
+        }
+        const std::array<std::int32_t, 1> slots{
+            LinearStateSlots::current_state_slot(lane, max_concurrency)};
+        restore_linear_state_into(staging_state, layout, decoder->linear_attention, slots,
+                                  device.stream);
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            restore_linear_state_into(staging_state + linear_bytes, layout,
+                                      peer->decoder->linear_attention, slots,
+                                      peer->device.stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data,
+                                   staging_state + lane_store_->ranks() * linear_bytes,
+                                   hidden_bytes, cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            sequence.rewrite_checkpoint_hidden.data,
+            staging_state + lane_store_->ranks() * linear_bytes + hidden_bytes, hidden_bytes,
+            cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        landed = true;
+    } catch (...) {
+        landed = false;
+    }
+    if (!landed) {
+        sequence.kv.reset();
+        sequence.prefix_digests.clear();
+        return 0;
+    }
+    sequence.text_kv_valid      = frontier;
+    sequence.mtp_kv_valid       = mtp ? point->backend_frontier : 0;
+    sequence.execution_frontier = frontier;
+    sequence.ledger_frontier    = frontier;
+    sequence.ledger.assign(prompt.token_ids.begin(),
+                           prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(frontier));
+    sequence.tail_hidden_valid  = true;
+    // The stored image carries the continuation state only: the rewrite seam it may also have held
+    // belongs to the lane that spilled, not to the prefix this resume landed on.
+    sequence.rewrite_checkpoint = {};
+    ++disk_restores_;
+    return frontier;
+}
+
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
 }
@@ -1471,6 +1976,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
     sequence.prefix_identity.clear();
+    sequence.prefix_digests.clear();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
@@ -2763,6 +3269,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
         sequence.ledger.push_back(host_tokens[0]);
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+        sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
+                                                sequence.rope_delta);
         sequence.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
             if (sequence.mtp_kv_valid != prompt_tokens) {
@@ -2915,6 +3423,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            sequence.prefix_digests.append_generated(std::span<const TokenId>(&token, 1),
+                                                    sequence.rope_delta);
             request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
                                                  .base_E        = base_E,
                                                  .base_S        = base_S,
@@ -3568,6 +4078,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
             2ULL * lane_store_->hidden_bytes() * static_cast<std::size_t>(max_concurrency);
         out.host_tier_parked_bytes = parked_host_bytes();
     }
+    out.disk_tier_capacity_bytes = disk_tier_capacity_bytes();
+    out.disk_tier_used_bytes     = disk_tier_used_bytes();
+    out.disk_tier_restores       = disk_tier_restores();
     return out;
 }
 

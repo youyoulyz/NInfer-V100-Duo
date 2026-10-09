@@ -13,8 +13,11 @@
 
 #include "targets/qwen3_6/impl/runtime/host_lane_state_store.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/identity_tag.h"
+#include "targets/qwen3_6/impl/runtime/lane_disk_tier.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/prefix_digests.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -72,6 +75,10 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    // Deepest frontier of this prompt the disk tier can resume (0 when it cannot or the tier is
+    // off). Probed once per request, because the answer depends on the prompt alone: any lane may
+    // use it, and the restore re-checks it before trusting a byte.
+    std::uint32_t disk_restore_frontier = 0;
 };
 
 template <>
@@ -89,6 +96,9 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    // Set when this lane's prefix comes from the NVMe tier instead of from the lane itself: the
+    // lane starts empty and the restore fills it, falling back to a cold prefill on a miss.
+    std::uint32_t disk_restore_frontier = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -144,6 +154,9 @@ struct SequenceKVBundle {
 struct LaneStateMetadata {
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    // The frozen digest image, so a spill derives its keys from the snapshot rather than from a
+    // live sequence that a later admission may already have rewound.
+    qwen3_6::detail::PrefixDigests prefix_digests;
     std::uint32_t execution_frontier      = 0;
     std::uint32_t ledger_frontier         = 0;
     std::uint32_t text_kv_valid           = 0;
@@ -199,6 +212,10 @@ struct SequenceState {
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    // Rolling content digest of every token frontier this sequence has committed, in lockstep with
+    // `ledger` and `prefix_identity`. It is what the disk tier keys a block by, so the spill and a
+    // later lookup derive the same identity for the same content.
+    qwen3_6::detail::PrefixDigests prefix_digests;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
@@ -320,6 +337,20 @@ public:
     [[nodiscard]] bool restore_parked_lane(std::uint32_t lane);
     [[nodiscard]] std::size_t parked_host_bytes() const noexcept;
     [[nodiscard]] std::size_t tier_device_kv_bytes() const noexcept;
+
+    // NVMe tier. `enable_disk_tier` opens the content-addressed block store once at construction;
+    // it requires the host tier, whose arenas hold the staging and the hidden rows a restore needs.
+    // The tier is layout-neutral: it stores bytes the other tiers shed, and every lookup is decided
+    // by content, so it never changes what a plan computes.
+    void enable_disk_tier(std::string path, std::size_t bytes);
+    [[nodiscard]] bool disk_tier_enabled() const noexcept { return disk_tier_ != nullptr; }
+    // Deepest frontier of `prompt`'s own prefix the disk tier can resume, or 0. Consulted once per
+    // request, so a prompt can address a prefix no lane ever produced.
+    [[nodiscard]] std::uint32_t disk_restorable_frontier(const PreparedPromptData& prompt) const;
+    [[nodiscard]] std::size_t disk_tier_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t disk_tier_used_bytes() const noexcept;
+    // Resumes that landed from the NVMe tier, cumulative since the Program opened it.
+    [[nodiscard]] std::uint64_t disk_tier_restores() const noexcept { return disk_restores_; }
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -396,6 +427,9 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::unique_ptr<qwen3_6::detail::HostLaneStateStore> lane_store_;
     std::array<std::optional<LaneStateImage>, kMaximumConcurrency> parked_images_;
+    // The NVMe tier under the host tier, and the frontier of the last restore that came off it.
+    std::unique_ptr<qwen3_6::detail::LaneDiskTier> disk_tier_;
+    std::uint32_t disk_restores_ = 0;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -528,6 +562,22 @@ private:
                          std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool park_lane(std::uint32_t lane);
     void restore_lane(std::uint32_t lane);
+    // Loads a content-addressed prefix the disk tier holds into `lane`, returning the frontier that
+    // landed (0 when the record is no longer complete, which is a cold prefill).
+    [[nodiscard]] std::uint32_t restore_lane_from_disk(std::uint32_t lane, std::uint32_t frontier,
+                                                       const PreparedPromptData& prompt);
+    // Writes one lane's whole prefix to the disk tier. `parked` sources it from the lane's host
+    // image, `device` from the live device allocations. False leaves whatever the tier already
+    // held, so a failed spill only costs a recompute later.
+    [[nodiscard]] bool spill_parked_prefix(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool spill_device_prefix(std::uint32_t lane) noexcept;
+    // Writes a single (frontier, state-role) tap from the lane's live device allocations.
+    [[nodiscard]] bool spill_device_tap(std::uint32_t lane, std::uint32_t frontier,
+                                        bool checkpoint) noexcept;
+    // Packs one lane's resumable state image into the disk tier's staging buffer.
+    [[nodiscard]] bool stage_tier_state(std::uint32_t lane, bool checkpoint) noexcept;
+    [[nodiscard]] std::uint32_t program_identity_tag() const noexcept;
+
     void drop_parked_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] KVPageGeometry text_kv_geometry() const;
     [[nodiscard]] KVPageGeometry backend_kv_geometry() const;

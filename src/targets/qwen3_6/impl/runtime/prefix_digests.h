@@ -29,6 +29,11 @@ public:
     // Derives the whole image from a prepared prompt. Throws when the prompt's metadata axes
     // disagree or a Vision item is not prefix ordered.
     void assign(const PreparedPromptData& prompt);
+    // The same derivation from the pieces a parked lane keeps once its prompt is gone; `positions`
+    // is the three MRoPE axes flattened with the token-count stride.
+    void assign(std::span<const TokenId> tokens, std::span<const std::uint8_t> token_types,
+                std::span<const std::int32_t> positions, std::span<const VisionItem> vision_items,
+                std::optional<std::uint32_t> rewrite_frontier);
     void swap(PrefixDigests& other) noexcept;
     // Extends the image by generated tokens, which carry no token type and one uniform position
     // per axis. `tokens` are the committed ids in order.

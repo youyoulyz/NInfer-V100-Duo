@@ -33,6 +33,11 @@ inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
+// Default NVMe (L3) tier budget when `EngineOptions::disk_kv_path` names a directory. At the
+// registered 27B geometry one 150K-token INT8-G64 lane costs ~2.5 GiB per rank, so this holds
+// roughly 25 parked conversations; it is not a device or host limit, only a disk budget.
+inline constexpr std::size_t kDefaultDiskKvBytes = 64ULL << 30;
+
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
@@ -209,6 +214,22 @@ struct EngineOptions {
     // linear-attention mirror is sized separately (one image per lane per rank) and is NOT part of
     // this budget, because it frees no device memory.
     std::size_t host_context_bytes = 0;
+    // NVMe (L3) tier: a directory of content-addressed 64-token KV blocks and state images. A
+    // resolved lane whose prefix cannot stay on the device (or in host RAM) is mirrored there as
+    // it is displaced, and the NEXT request whose prompt reaches that prefix -- any lane, any
+    // session, and after a restart -- resumes it instead of paying a re-prefill. Every block is
+    // keyed by the content digest of its first tokens, so the same text in two conversations
+    // dedupes onto one record, and a miss of any kind is a recompute, never a wrong answer.
+    //
+    // Empty (the default) disables the tier. The path must be on a writable filesystem that
+    // survives the process (never a tmpfs: the store is the only copy of what it holds), and the
+    // tier requires `host_context_bytes` to be positive, because the hidden rows a restored
+    // frontier needs are held by the host lane store.
+    std::filesystem::path disk_kv_path;
+    // Disk budget, split 65/25/10 across the Main KV, MTP KV and state families (85/15 without an
+    // MTP pool). Zero selects `kDefaultDiskKvBytes`. A spill that does not fit its family fails,
+    // so the store never displaces a conversation another lane still resumes from.
+    std::size_t disk_kv_bytes = 0;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
@@ -844,6 +865,13 @@ struct MemorySummary {
     // state, and their hidden rows.
     std::size_t host_tier_capacity_bytes          = 0;
     std::size_t host_tier_parked_bytes            = 0;
+    // NVMe lane tier. Both are 0 when the tier is disabled. `disk_tier_used_bytes` counts the
+    // slot records (payload plus their 4 KiB-aligned headers) currently stored.
+    std::size_t disk_tier_capacity_bytes          = 0;
+    std::size_t disk_tier_used_bytes              = 0;
+    // Cumulative resumes served off that tier. It is what distinguishes "the prefix was already
+    // there" from "the prefix was recomputed", so a zero-re-prefill run can be read directly.
+    std::uint64_t disk_tier_restores              = 0;
 };
 
 // One row of the per-device memory table the load summary prints. At tp == 1 only `devices[0]` is

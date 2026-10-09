@@ -763,6 +763,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->tp                  = inputs.tp;
     impl->host_context_bytes  = inputs.host_context_bytes;
+    impl->disk_kv_path        = inputs.disk_kv_path;
+    impl->disk_kv_bytes       = inputs.disk_kv_bytes;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
@@ -879,6 +881,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph = options.use_cuda_graph,
         .device             = options.device,
         .host_context_bytes = options.host_context_bytes,
+        .disk_kv_path       = options.disk_kv_path.string(),
+        .disk_kv_bytes      = options.disk_kv_bytes,
         .tp                 = options.tp,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

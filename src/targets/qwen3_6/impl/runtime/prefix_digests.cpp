@@ -102,40 +102,49 @@ void PrefixDigests::reserve(std::size_t tokens) {
 void PrefixDigests::clear() noexcept { digests_.clear(); }
 
 void PrefixDigests::assign(const PreparedPromptData& prompt) {
-    const std::size_t tokens = prompt.token_ids.size();
-    if (prompt.token_types.size() != tokens || prompt.positions.size() != 3U * tokens) {
+    assign(prompt.token_ids, prompt.token_types, prompt.positions, prompt.vision_items,
+           prompt.identity.rewrite_checkpoint
+               ? std::optional<std::uint32_t>(prompt.identity.rewrite_checkpoint->frontier)
+               : std::nullopt);
+}
+
+void PrefixDigests::assign(std::span<const TokenId> tokens,
+                           std::span<const std::uint8_t> token_types,
+                           std::span<const std::int32_t> positions,
+                           std::span<const VisionItem> vision_items,
+                           std::optional<std::uint32_t> rewrite_frontier) {
+    const std::size_t count = tokens.size();
+    if (token_types.size() != count || positions.size() != 3U * count) {
         throw std::invalid_argument("prepared prompt digest metadata has an invalid shape");
     }
-    std::array<std::uint32_t, 1> rewrite_frontier{};
+    std::array<std::uint32_t, 1> rewrite_holder{};
     std::span<const std::uint32_t> rewrite_frontiers;
-    if (prompt.identity.rewrite_checkpoint) {
-        const std::uint32_t frontier = prompt.identity.rewrite_checkpoint->frontier;
-        if (frontier == 0 || frontier > tokens) {
+    if (rewrite_frontier) {
+        if (*rewrite_frontier == 0 || *rewrite_frontier > count) {
             throw std::invalid_argument("rewrite checkpoint must sit inside the prompt");
         }
-        rewrite_frontier[0] = frontier;
-        rewrite_frontiers   = rewrite_frontier;
+        rewrite_holder[0] = *rewrite_frontier;
+        rewrite_frontiers = rewrite_holder;
     }
     digests_.clear();
-    reserve(tokens);
+    reserve(count);
     digests_.push_back(kDigestOffset);
     std::size_t next_rewrite = 0;
     std::size_t next_vision  = 0;
     std::size_t next_vision_end =
-        prompt.vision_items.empty() ? 0 : checked_vision_end(prompt.vision_items.front(), tokens);
-    for (std::size_t index = 0; index < tokens; ++index) {
-        const std::array<std::int32_t, 3> positions{prompt.positions[index],
-                                                    prompt.positions[tokens + index],
-                                                    prompt.positions[2U * tokens + index]};
-        append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions,
-                      rewrite_frontiers, next_rewrite);
+        vision_items.empty() ? 0 : checked_vision_end(vision_items.front(), count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::array<std::int32_t, 3> axes{positions[index], positions[count + index],
+                                               positions[2U * count + index]};
+        append_digest(digests_, tokens[index], token_types[index], axes, rewrite_frontiers,
+                      next_rewrite);
         // A Vision item's KV is only complete at its last span end, so it enters the digest there.
         const std::size_t frontier = index + 1U;
-        while (next_vision < prompt.vision_items.size() && next_vision_end == frontier) {
-            mix_vision_item(digests_.back(), prompt.vision_items[next_vision]);
+        while (next_vision < vision_items.size() && next_vision_end == frontier) {
+            mix_vision_item(digests_.back(), vision_items[next_vision]);
             ++next_vision;
-            if (next_vision < prompt.vision_items.size()) {
-                next_vision_end = checked_vision_end(prompt.vision_items[next_vision], tokens);
+            if (next_vision < vision_items.size()) {
+                next_vision_end = checked_vision_end(vision_items[next_vision], count);
                 if (next_vision_end < frontier) {
                     throw std::invalid_argument("Vision shortlist items are not prefix ordered");
                 }
@@ -145,7 +154,7 @@ void PrefixDigests::assign(const PreparedPromptData& prompt) {
     if (next_rewrite != rewrite_frontiers.size()) {
         throw std::invalid_argument("rewrite checkpoint exceeds the prompt");
     }
-    if (next_vision != prompt.vision_items.size()) {
+    if (next_vision != vision_items.size()) {
         throw std::invalid_argument("Vision shortlist item exceeds the prompt");
     }
 }
