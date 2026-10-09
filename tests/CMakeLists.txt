@@ -243,6 +243,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_disk_tier_real_test
 target_link_libraries(ninfer_qwen3_6_27b_disk_tier_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_disk_tier_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# The product question at scale: N long sessions retained across the three tiers, every one of
+# them resumable with zero prefill tokens after the engine that produced them is gone.
+ninfer_add_test(ninfer_qwen3_6_27b_disk_pool_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_disk_pool_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_disk_pool_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_disk_pool_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 14400)
 ninfer_add_test(ninfer_qwen3_8_27b_v100-duo_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100-duo_prefix_real.cpp
   LIBRARIES ninfer_engine)
