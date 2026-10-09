@@ -213,6 +213,14 @@ target_link_libraries(ninfer_qwen3_8_27b_v100-duo_real_test PRIVATE CUDA::cudart
 set_tests_properties(ninfer_qwen3_8_27b_v100-duo_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # TP2 INT8 KV + optimized MTP3 cache continuation and response-checkpoint replay.
+# Host lane tier end to end: park a retained lane into pinned host RAM on eviction and restore it
+# on the next admission, with the GDN linear-attention state mirrored alongside the KV.
+ninfer_add_test(ninfer_qwen3_6_27b_host_tier_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_host_tier_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_host_tier_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_host_tier_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 ninfer_add_test(ninfer_qwen3_8_27b_v100-duo_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100-duo_prefix_real.cpp
   LIBRARIES ninfer_engine)
