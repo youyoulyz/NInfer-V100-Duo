@@ -70,27 +70,37 @@
 | GDN linear state park（146.8 MiB） | 46.7 ms（3.14 GB/s） |
 | host tier 端到端（1943-token 前缀、2 lane 池、`host_context_bytes=256 MiB`） | 单 lane image 379,142,144 B；三种 arena 全部计入 RSS（+891 MiB）；恢复后的续写与"从不 swap"对照**逐 token 相同**，`computed_prefill_tokens` 增量 **0** |
 | NVMe tier 端到端（同场景 + `disk_kv_path`） | 两次逐出落盘 763,723,776 B；**销毁 engine**（host arena、device 页、parked image、resident 元数据全部消失）后重开同一目录，两条前缀各自从 NVMe 恢复：**0 个 prefill token**、`reused_prompt_tokens` = prompt frontier、续写与冷跑**逐 token 相同**，TTFT 2.92 s / 5.91 s 冷 → **0.124 s / 0.193 s** 从盘上回来（冷跑的对照值在并发 prefill 下取得，所以这个倍数偏保守） |
+| **多会话池端到端**（8 × 150,022 token 会话、池 153,600 token、`disk_kv_bytes = 96 GiB`、引擎销毁后重开） | 每条被逐出的会话在盘上占 5,462 MiB，8 条共 43,697 MiB（42.7 GiB）；销毁 engine 并重开后盘上占用不变；**8 条全部 0 个 prefill token**、`reused_prompt_tokens` = 150,022 = prompt frontier、续写与各自的冷跑**逐 token 相同**、`disk_tier_restores` = 8；TTFT 207.5–227.7 s 冷 → **6.0–8.0 s** 从盘上恢复（30–37×）。全程 `host_tier_parked_bytes` = 0（见 §0.5） |
 
 ### 0.5 目标形态：10 × 150K 的算术
 
 本机 150K lane ≈ 2.51 GiB INT8 KV/device（16.5 KiB/token/device），加 state image 后约
 2.6 GiB/device。
 
-| 层 | 预算（本机） | 装得下的 150K lane |
+| 层 | 预算（本机实测） | 装得下的 150K lane |
 |---|---|---|
-| L1 device | ~5.5 GiB/device 空闲 | 2（显存限制，不是策略限制） |
-| L2 host RAM | `host_context_bytes`（30 GB 内存下可给 ~24 GB） | ~9 |
-| L3 NVMe | `disk_kv_bytes`（默认 64 GiB） | ~24 |
+| L1 device | 池开 153,600 token（= 一条 150K lane + 余量）时 device 已用 15.1 / 16.4 GB，只剩 ~1.2 GB | **1**（第二条 150K lane 还要 +2.6 GB/device） |
+| L2 host RAM | `host_context_bytes`（每条 parked image ≈ KV 5.4 GiB + state + 隐藏行） | ≤ `max_concurrency`（= 2）；本机实测**未用上**，见下 |
+| L3 NVMe | `disk_kv_bytes`，Main family 占 65% | 96 GiB → 62.4 GiB / 每条 4.72 GiB ≈ **13**；默认 64 GiB → **8** |
 
-所以"10 个 150K 对话不 re-prefill"在容量上可达：device 装 2 条，其余在 host/NVMe 上轮转，
+每条 150K 会话在 L3 上的实际成本（实测推算）：Main KV 4.72 GiB（双 rank × 2344 页 ×
+1,081,344 B）+ MTP KV 0.29 GiB + state image 2 × 154 MB ≈ **5.33 GiB**（实测 5,462 MiB，
+多出的部分是两个 tap 各写一张 state image）。
+
+所以"10 个 150K 对话不 re-prefill"在容量上可达：device 装 1 条，其余在 host/NVMe 上轮转，
 回到前台时从下层搬回；只有 L2 与 L3 都装不下的才会真的 recompute。代价是延迟不是正确性——
 PCIe Gen3 x4（~3 GB/s）单向搬 2.6 GiB 约 0.9 s，而这条 prompt 的冷 prefill 在 V100 上是分钟级。
+
+为什么实测里 L2 一直是空的：本机池只装得下 1 条 150K lane，新会话因此被**直接**准入到同一条
+lane（`can_admit_lane` 把该 lane 自己的常驻前缀算作可回收），`start_prefill_lane` 在替换它之前
+把前缀直接 spill 到 L3 —— 从来不需要 park，也就没有 host image。L2 起作用的前提是池能同时装下
+两条，需要去 evict **别的** lane（`evict_retained_lane`）。
 
 两条注意：
 
 - **`max_concurrency` 仍是 8**（产品语义未变）：同时 active 的请求还是 8 条，10 条 150K 是
   "10 段会话轮流活动"，不是"10 条同时 decode"。同时驻留的 150K lane 数受 device 显存限制，
-  本机是 2。
+  本机是 1（实测：池 153,600 token 时 device 只剩 ~1.2 GB，而一条 150K lane 要 2.6 GB）。
 - **L2 的实际占用不止 `host_context_bytes`**：它只约束 KV arena。线性 state arena 按
   `lane 数 × rank 数 × 每个 slot 的布局` 定容（27B、TP2、8 lane、两个 slot ≈ 2.4 GB），
   staging 也是常驻的。给 `host_context_bytes` 定预算时要把这两块加进去。
@@ -1031,6 +1041,7 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 | TP2 分片一致 | 两 rank 各自恢复出的分片与寄存前相等；跑 `tools/tp2` parity |
 | 失败不污染正确性 | 注入损坏的 NVMe 页 → 必须表现为 miss |
 | 收益真实 | 8k / 64k / 200k 下的 park/restore 延迟落在带宽模型内 |
+| 目标形态规模 | `ninfer_qwen3_6_27b_disk_pool_real_test`（默认 8 × 150K）：池 153,600 token、引擎销毁重开后 8 条全部 **0 prefill token**、各自续写与冷跑逐 token 相同、盘上 42.7 GiB 不变 |
 
 ---
 
@@ -1045,6 +1056,12 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
   真正的 demotion 策略（按 parked 时间挤掉最老的一条）需要一个 executor 侧的 policy hook：
   Program 无法在 `evict_retained_lane` 里作废另一条 lane 的缓存 plan，做错会把一个请求放上
   没有 KV 的 lane。
+- **一个 tap 可能只落一半**：`spill_device_tap` 先写 KV chain（大）再写 state image（154 MB）。
+  state family 装不下时 tap 失败，已经写进去的 chain 就成了**孤儿**——占盘、但因为没有 state
+  image 而永远无法 resume（实测触发过一次：2 GiB 预算下 state family 只有 205 MiB，第二条会话
+  落盘 55 MiB 无用数据）。state family 是每条会话 308 MB 的固定成本（2 个 tap），所以短会话
+  下它比 Main family 先爆（4K 会话：Main 138 MB vs state 308 MB）。修法是把 state image 写在
+  chain 之前——失败时只浪费 154 MB 而不是 5 GiB。
 - 把 swap 从 non-goal 清单里拿掉是**产品契约变更**，文档与测试必须同步移动。
 - **最大不确定点是 P2**：若 (b) 失败转 (a)，改动面会从"补 8 个 Program 方法"跳到
   "重接约 9k 行 Program 逻辑"，并连带重做 TP2 peer 锁步。这是本计划唯一需要中途重新决策的门。

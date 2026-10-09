@@ -1560,6 +1560,29 @@ NINFER_TEST_TP2=1 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ni
   build-v100-test/tests/ninfer_qwen3_6_27b_disk_tier_real_test   # scratch dir must not be tmpfs
 ```
 
+At the product shape -- eight 150K-token sessions against a pool that holds one of them -- the same
+gate scales up (`ninfer_qwen3_6_27b_disk_pool_real_test`, 8 x 150,022 tokens, 153,600-token
+capacity, 96 GiB tier, 8 output tokens, ~40 min):
+
+| path | ttft | computed prefill tokens | NVMe per session |
+|---|---:|---:|---:|
+| cold prefill, one session at a time | 207.5-227.7 s | 150,022 | -- |
+| resumed from NVMe, engine destroyed in between | 6.0-8.0 s | **0** | 5,462 MiB |
+
+All eight continuations are greedy-identical to their cold runs, and the engine is destroyed before
+the resumes, so nothing but the NVMe record can answer them: 8 x 5,462 MiB = 42.7 GiB on the tier,
+unchanged across the reopen, `disk_tier_restores == 8`. The host tier stays empty in this shape -- one
+150K lane is all the device holds, so a new session is admitted straight into that lane and its
+predecessor is spilled to NVMe before its pages are reclaimed (see context tiering section 0.5).
+
+```bash
+NINFER_TEST_TP2=1 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  build-v100-test/tests/ninfer_qwen3_6_27b_disk_pool_real_test   # 8 x 150K by default
+NINFER_DISK_POOL_LANES=3 NINFER_DISK_POOL_TOKENS=1500 NINFER_DISK_POOL_CAPACITY=4096 \
+  NINFER_DISK_POOL_DISK_BYTES=8589934592 \
+  build-v100-test/tests/ninfer_qwen3_6_27b_disk_pool_real_test   # same shape, seconds
+```
+
 One host park/restore round trip of the whole lane (KV, both ranks' GDN state and the hidden rows) is
 379,142,144 B at this prefix length; the parked bytes return exactly to their previous value after a
 second cycle, which is what proves the arena extents are reused rather than leaked.
