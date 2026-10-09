@@ -64,6 +64,10 @@ public:
         // Total budget, split 65/25/10 across main/backend/state (85/15 without a backend).
         std::size_t capacity_bytes = 0;
         bool verify_crc            = true;
+        // A full family refuses a page that would displace a live one instead of evicting it: the
+        // tier holds what the device and host tiers shed, so its pages are the only copy and a
+        // spill must not destroy another lane's chain. False from the store's upsert.
+        bool allow_eviction = true;
         // Restore consecutive pages through DirectStorage (Windows builds with
         // NINFER_DIRECTSTORAGE); a failed batch falls back to mapped reads.
         bool direct_storage = false;
@@ -118,6 +122,9 @@ public:
 
     [[nodiscard]] DiskKVBridgeStats stats() const;
     [[nodiscard]] std::uint32_t slot_count(DiskKVKind kind) const;
+    // Bytes the three families' live slot records currently occupy (payload plus their aligned
+    // headers), so a summary can report the tier's footprint without walking the stores.
+    [[nodiscard]] std::size_t used_bytes() const;
 
 private:
     struct Family {

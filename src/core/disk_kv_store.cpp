@@ -433,6 +433,7 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
             return true;
         }
         if (free_slots_.empty()) {
+            if (!options_.allow_eviction) { return false; }
             const std::optional<DiskKVIdentity> victim = evict_one_lru_locked();
             if (!victim) { return false; }
             if (evicted != nullptr) { evicted->push_back(*victim); }

@@ -49,6 +49,7 @@ DiskKVBridge::DiskKVBridge(Options options) : options_(std::move(options)) {
         store.capacity_bytes      = budget;
         store.verify_crc          = options_.verify_crc;
         store.defer_index_updates = true;
+        store.allow_eviction      = options_.allow_eviction;
         target.store              = std::make_unique<DiskKVStore>(std::move(store));
     };
     open(DiskKVKind::MainKV, options_.main_page_stride, main_share);
@@ -333,6 +334,14 @@ DiskKVBridgeStats DiskKVBridge::stats() const {
 std::uint32_t DiskKVBridge::slot_count(DiskKVKind kind) const {
     const Family& target = family(kind);
     return target.store != nullptr ? target.store->slot_count() : 0U;
+}
+
+std::size_t DiskKVBridge::used_bytes() const {
+    std::size_t total = 0;
+    for (const Family& target : families_) {
+        if (target.store != nullptr) { total += target.store->used_bytes(); }
+    }
+    return total;
 }
 
 } // namespace ninfer

@@ -60,6 +60,11 @@ public:
         // Defer publishing new pages to the index until flush_index(). Evictions stay eager. The
         // owner must flush before shutdown; the destructor does not.
         bool defer_index_updates = false;
+        // Refuse an insert that would displace a live page instead of evicting the coldest one.
+        // A tier that holds the only copy of a parked conversation sets this so a spill can never
+        // silently break a chain another lane still needs; replacing content is then an explicit
+        // policy decision rather than a side effect of one lane's fill.
+        bool allow_eviction = true;
     };
 
     // Opens or creates the data file and loads (or rebuilds) the index. Throws on I/O errors or a
@@ -82,8 +87,8 @@ public:
     [[nodiscard]] bool index_rebuilt_from_scan() const noexcept { return rebuilt_from_scan_; }
 
     // Inserts the page, or refreshes its LRU stamp when already present. A full store evicts its
-    // least recently used page first (reported through `evicted`). False when the store is full
-    // and every live slot is being read.
+    // least recently used page first (reported through `evicted`) unless the store was opened with
+    // allow_eviction off. False when the insert would have to displace a live page it may not.
     bool upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
                      std::vector<DiskKVIdentity>* evicted = nullptr);
 
