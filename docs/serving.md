@@ -98,6 +98,39 @@ device without a speculative backend and 17.69 GiB with `--spec mtp --draft-toke
 at extended context requires a smaller `--max-context` (roughly 500,000 tokens for two slots at
 INT8 KV). `--kv-dtype int8` is mandatory at that window.
 
+### Retained context: a session pool that does not re-prefill
+
+`--host-kv-mib` and `--disk-kv-path` keep a displaced prefix instead of discarding it. A prefix
+leaves the paged KV pool when another conversation takes its lane, and it is stored on the way out;
+a later request that reaches the same tokens resumes the stored frontier instead of prefilling
+again. With `--disk-kv-path` the record is on NVMe and content-addressed, so it also survives a
+server restart, and the store never evicts: a record disappears only when its session is rewritten.
+
+The serial long-context profile -- one request at a time, every conversation up to the full
+`--max-context` -- is what a coding agent drives:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 200000 --kv-capacity 200000 --kv-dtype int8 --prefill-chunk 1024 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 3600000 \
+  --host-kv-mib 2048 --disk-kv-path /var/tmp/ninfer-kv --disk-kv-mib 98304
+```
+
+`--max-concurrency 1` reuses the single lane every time, so a displaced prefix is written straight
+to the NVMe tier and the pinned host arena stays empty (`parked=` in the startup record); the host
+tier still has to be enabled, because the NVMe tier opens under it. A conversation is stored as each
+turn completes rather than only when the next one displaces it, so stopping and restarting the server
+costs a resume, not a re-prefill -- including for the session that was active when it stopped. The
+first turn of a session writes its whole prefix; each later turn writes only what it appended. Size `--disk-kv-mib` for the
+whole pool: a 200K-token session costs about 7.1 GiB on NVMe, so eight of them need roughly 60 GiB
+of the budget, and `--host-kv-mib` only has to be non-zero for this shape.
+
+Each completed request reports what it reused. `cache` is the reused prompt-token count and `path`
+is how reuse was realized, so a resumed session shows `cache` at the prompt frontier and no
+`prefill` rate at all; the startup record reports `live=` (bytes held on NVMe) and `restores=`.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -521,6 +554,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--host-kv-mib N` | pinned host lane tier; a prefix displaced from the paged KV pool is parked there instead of discarded. `0` disables the tier, and the NVMe tier with it | `0` |
+| `--disk-kv-path DIR` | content-addressed NVMe tier directory, under which displaced prefixes survive a process restart. Requires `--host-kv-mib` | unset |
+| `--disk-kv-mib N` | NVMe tier budget; `0` selects the engine default | `0` |
 | `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
 | `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
 | `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |

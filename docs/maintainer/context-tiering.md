@@ -30,6 +30,12 @@
 
 **逐出完整性（本轮落地）**：任何一条 retained lane 在 device 页被回收前，字节一定先落到下一层。
 
+- 一条 retained lane 在 **request 完成时**就把前缀 `spill_device_prefix` 到下层
+  （`publish_retained_prefix`）。否则"盘上有记录"就取决于逐出顺序：进程退出时手上正握着的那条
+  会话会一条记录都没有，重开后**恰好是最后在用的那条**要重付 prefill。发布是增量的：
+  `SequenceState::disk_published_frontier` 记着已发布 frontier，每个 tap 只从它的上一块开始走，
+  所以一条会话的第一轮搬整条前缀，之后每轮只搬新增的块 + 新 frontier 的 state image；
+  `spill_pages` 对已在库里的块还有一层 `contains` 跳过。
 - admission pass 只寄存**别的** retained lane；请求自己要用的那条 lane，由
   `start_prefill_lane` 在被覆写之前 `spill_device_prefix` 出去。
 - `park_lane` 成功后就地 `spill_parked_prefix`，所以 L2 里的每条 lane 在 L3 上都已有记录。
@@ -71,6 +77,7 @@
 | host tier 端到端（1943-token 前缀、2 lane 池、`host_context_bytes=256 MiB`） | 单 lane image 379,142,144 B；三种 arena 全部计入 RSS（+891 MiB）；恢复后的续写与"从不 swap"对照**逐 token 相同**，`computed_prefill_tokens` 增量 **0** |
 | NVMe tier 端到端（同场景 + `disk_kv_path`） | 两次逐出落盘 763,723,776 B；**销毁 engine**（host arena、device 页、parked image、resident 元数据全部消失）后重开同一目录，两条前缀各自从 NVMe 恢复：**0 个 prefill token**、`reused_prompt_tokens` = prompt frontier、续写与冷跑**逐 token 相同**，TTFT 2.92 s / 5.91 s 冷 → **0.124 s / 0.193 s** 从盘上回来（冷跑的对照值在并发 prefill 下取得，所以这个倍数偏保守） |
 | **多会话池端到端**（8 × 150,022 token 会话、池 153,600 token、`disk_kv_bytes = 96 GiB`、引擎销毁后重开） | 每条被逐出的会话在盘上占 5,462 MiB，8 条共 43,697 MiB（42.7 GiB）；销毁 engine 并重开后盘上占用不变；**8 条全部 0 个 prefill token**、`reused_prompt_tokens` = 150,022 = prompt frontier、续写与各自的冷跑**逐 token 相同**、`disk_tier_restores` = 8；TTFT 207.5–227.7 s 冷 → **6.0–8.0 s** 从盘上恢复（30–37×）。全程 `host_tier_parked_bytes` = 0（见 §0.5） |
+| **串行服务 profile 端到端**（真 HTTP endpoint：`ninfer-serve --max-context 200000 --kv-capacity 200000 --max-concurrency 1 --host-kv-mib 2048 --disk-kv-path <dir> --disk-kv-mib 98304`，tp2 / MTP3 / INT8-G64） | 8 条 194,950 token 会话各冷 prefill 一次：TTFT 298.7–327.8 s（595–653 tok/s）。**进程完整重启两次**后重发同样 8 条：`cache=194,948/194,950`（frontier 差 2 token 的 append）、`reuse=append_frontier`、**0 prefill token**、TTFT **5.2–6.2 s**（≈50× 冷启动）；重启后启动行 `live=55.34 GiB` 即 8 条记录全部由新进程重新载入。全程 `host-tier parked=0` |
 
 ### 0.5 目标形态：10 × 150K 的算术
 
@@ -95,6 +102,11 @@ PCIe Gen3 x4（~3 GB/s）单向搬 2.6 GiB 约 0.9 s，而这条 prompt 的冷 p
 lane（`can_admit_lane` 把该 lane 自己的常驻前缀算作可回收），`start_prefill_lane` 在替换它之前
 把前缀直接 spill 到 L3 —— 从来不需要 park，也就没有 host image。L2 起作用的前提是池能同时装下
 两条，需要去 evict **别的** lane（`evict_retained_lane`）。
+
+串行服务 profile（`--max-concurrency 1`）把这个原因变成结构性事实：被替换的 lane 永远就是
+被准入的那条 lane，所以前缀只会经 `start_prefill_lane` → `spill_device_prefix` 直接落到 L3，
+L2 一次都用不上。`--host-kv-mib` 在这种部署里只承担"打开 NVMe 层"的作用（`enable_disk_tier`
+要求 host 层已开），容量给多小都不影响 0-re-prefill，见 `docs/serving.md`。
 
 两条注意：
 
@@ -997,9 +1009,9 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 
 ### 7.9 P7 — 文档与 CLI
 
-**文档（本轮已收口）**：
+**文档**：
 
-- 本文改写为当前权威：§0 记已交付能力与实测，§7.8 记 NVMe 接线，§9 记风险，本节记未做。
+- 本文是当前权威：§0 记已交付能力与实测，§7.8 记 NVMe 接线，§9 记风险，本节记 CLI 与文档。
 - `paged-kv-cache.md` §1.1、`concurrent-inference-architecture.md` §1.2 把 swap/KV offload 从
   non-goal 里拿掉，改为指向本文。
 - `docs/performance.md` 增 context-tier 小节（park/restore 带宽与 0-re-prefill 端到端）。
@@ -1007,12 +1019,19 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 - **没有**取回上游 `resource-scheduling-and-context-cache.md`（1028 行）：它描述的是上游的
   `resource_manager` 形态，与本文 §0 的落点不是一回事，取回会造出第二套平级权威。
 
-**CLI（未做）**：`host_context_bytes` 与 `disk_kv_path`/`disk_kv_bytes` 目前只有 C++ API
-（`EngineOptions`）能设，`apps/cli` 与 `ninfer-serve` 都没有对应选项，也就是说**产品命令行还
-打不开这两层**。要对齐上游就是 `--host-kv-mib`（直接映射 `host_context_bytes`）与
-`--context-tier-nvme <path:size>`（`disk_kv_path` + `disk_kv_bytes`），再同步 `--help` 与
-`serve_usage_text` 测试。上游的 `--device-state-slots`/`--host-state-slots` 对应本树没有的对象，
-不取回。
+**CLI/服务（已做）**：三个选项在 `apps/cli` 与 `ninfer-serve` 上同名并列在 `--help` 里：
+
+| 选项 | 映射 |
+|---|---|
+| `--host-kv-mib N` | `EngineOptions::host_context_bytes`（`0` = 关，NVMe 层随之关闭） |
+| `--disk-kv-path DIR` | `EngineOptions::disk_kv_path`（要求 host 层已开） |
+| `--disk-kv-mib N` | `EngineOptions::disk_kv_bytes`（`0` = 引擎默认 64 GiB） |
+
+`ninfer-serve` 启动记录在 host/disk 层任一开启时追加 `host-tier=/parked=/disk-tier=/live=/
+restores=`。用户文档见 `docs/serving.md` 的 "Retained context" 与 `docs/cli.md`。上游把 NVMe
+层的容量写进路径（`--context-tier-nvme <path:size>`），本树拆成 `--disk-kv-path` +
+`--disk-kv-mib`，因为容量在 `EngineOptions` 里本来就是独立字段；上游的
+`--device-state-slots`/`--host-state-slots` 对应本树没有的对象，不取回。
 
 ### 7.10 工时估计与里程碑（事后回看）
 
@@ -1022,7 +1041,7 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 | M2 | P2 权能接口决策；`host_kv_arena` 对接 | ✅ |
 | M3 | P3 park→restore 逐字节 / 逐 token 正确（含逐出完整性） | ✅ |
 | M4 | P4 + P5：见 §7.6/§7.7 | 本树**没有**取回 `engine_core.h`，也没有重做 TP2 peer 锁步；host tier 直接接在现有引擎壳（`evict_retained_lane` + admission policy + `start_prefill_lane`）上，双卡由 `ranks = 2` 的逐 rank 分片覆盖 |
-| M5 | P6 + P7 | NVMe 下沉 ✅；CLI ✗（见 §7.9） |
+| M5 | P6 + P7 | NVMe 下沉 ✅；CLI/serve 选项与文档 ✅（见 §7.9） |
 
 最初的区间主要被 P2 的 (a)/(b) 选择支配；实际按 (b) 走通，且 P4/P5 用更小的改动达成，
 没有出现"重接约 9k 行 Program 逻辑"的那条分支。
@@ -1041,7 +1060,8 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 | TP2 分片一致 | 两 rank 各自恢复出的分片与寄存前相等；跑 `tools/tp2` parity |
 | 失败不污染正确性 | 注入损坏的 NVMe 页 → 必须表现为 miss |
 | 收益真实 | 8k / 64k / 200k 下的 park/restore 延迟落在带宽模型内 |
-| 目标形态规模 | `ninfer_qwen3_6_27b_disk_pool_real_test`（默认 8 × 150K）：池 153,600 token、引擎销毁重开后 8 条全部 **0 prefill token**、各自续写与冷跑逐 token 相同、盘上 42.7 GiB 不变 |
+| 目标形态规模 | `ninfer_qwen3_6_27b_disk_pool_real_test`（默认 8 × 150K）：池 153,600 token、引擎销毁重开后 8 条全部 **0 prefill token**、各自续写与冷跑逐 token 相同、盘上 42.7 GiB 不变。门里**不发 flush 请求**：最后那条常驻会话的记录只能来自它自己的完成发布，`NINFER_DISK_POOL_CONCURRENCY=1` 覆盖单 lane 的串行形态，`NINFER_DISK_POOL_SPEC=none` 覆盖非投机（默认）解析路径 |
+| 服务形态规模 | 真 HTTP endpoint 的 8 × 194,950 token 会话池（见 §0.4）：两次进程重启后 8/8 零 prefill 恢复，TTFT 5.2–6.2 s |
 
 ---
 
@@ -1056,6 +1076,12 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
   真正的 demotion 策略（按 parked 时间挤掉最老的一条）需要一个 executor 侧的 policy hook：
   Program 无法在 `evict_retained_lane` 里作废另一条 lane 的缓存 plan，做错会把一个请求放上
   没有 KV 的 lane。
+- **完成时的发布是同步的，且第一轮要搬整条前缀。** `publish_retained_prefix` 在 terminal round
+  里调用，与逐出路径共用同一套 `spill_device_tap`：一条会话的第一轮会把整条 chain 从 device
+  搬到 host 再落盘（195K 会话 ≈ 7 GiB，秒级），之后每轮只有新增块 + 一张 state image
+  （195K 下 ≈ 0.6 GiB）。串行 profile（`--max-concurrency 1`）下这段延迟不影响别人；并发 profile
+  下 `max_concurrency` 条 lane 同时 terminal 会叠加，是这套设计当前最重的临界区。把它挪到后台
+  线程或 idle tick 需要 executor 侧的调度钩子（与 demotion 策略同一处），本轮没做。
 - **一个 tap 可能只落一半**：`spill_device_tap` 先写 KV chain（大）再写 state image（154 MB）。
   state family 装不下时 tap 失败，已经写进去的 chain 就成了**孤儿**——占盘、但因为没有 state
   image 而永远无法 resume（实测触发过一次：2 GiB 预算下 state family 只有 205 MiB，第二条会话

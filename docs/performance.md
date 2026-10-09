@@ -1583,7 +1583,22 @@ All eight continuations are greedy-identical to their cold runs, and the engine 
 the resumes, so nothing but the NVMe record can answer them: 8 x 5,462 MiB = 42.7 GiB on the tier,
 unchanged across the reopen, `disk_tier_restores == 8`. The host tier stays empty in this shape -- one
 150K lane is all the device holds, so a new session is admitted straight into that lane and its
-predecessor is spilled to NVMe before its pages are reclaimed (see context tiering section 0.5).
+predecessor is spilled to NVMe before its pages are reclaimed (see context tiering section 0.5). No
+flush request stands in for a displacement here: each conversation is published as its turn
+completes, so the one the engine is holding when it exits is on the tier too.
+
+The same shape through the server endpoint (`--max-context 200000 --kv-capacity 200000
+--max-concurrency 1 --host-kv-mib 2048 --disk-kv-path DIR --disk-kv-mib 98304`, tp2, MTP3), measured
+by re-sending eight 194,950-token prompts after two full process restarts:
+
+| path | ttft | reused prompt tokens | prefill tokens |
+|---|---:|---:|---:|
+| cold prefill, one session at a time | 298.7-327.8 s | 0 | 194,950 |
+| resumed from NVMe after a restart, 8 of 8 | 5.2-6.2 s | 194,948 | **2** |
+
+The two-token residue is the append frontier: the stored image closes the prompt, and the request
+re-evaluates its last two tokens. 55.34 GiB of records are reloaded by the new process (`live=` in
+the startup record) and every resumed session reports `reuse=append_frontier`.
 
 ```bash
 NINFER_TEST_TP2=1 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
@@ -1597,10 +1612,17 @@ One host park/restore round trip of the whole lane (KV, both ranks' GDN state an
 379,142,144 B at this prefix length; the parked bytes return exactly to their previous value after a
 second cycle, which is what proves the arena extents are reused rather than leaked.
 
-Both tiers are reachable only through the C++ API today (`EngineOptions::host_context_bytes`,
-`disk_kv_path`, `disk_kv_bytes`); `ninfer-serve` and the CLI do not expose them yet. The host arena
-itself does not reclaim, so when it is full a lane parks on NVMe instead — a slower resume, never a
-re-prefill.
+A conversation is published when its turn completes, not only when another conversation displaces
+it, so the tier does not depend on what happens to be resident when a process exits. The publication
+is incremental: the first turn of a session writes its whole prefix, every later turn only the blocks
+it appended plus the state image at the new frontier.
+
+Both tiers are set through `EngineOptions::host_context_bytes` / `disk_kv_path` / `disk_kv_bytes`
+and through their CLI and server spellings `--host-kv-mib` / `--disk-kv-path` / `--disk-kv-mib`.
+The host arena itself does not reclaim, so when it is full a lane parks on NVMe instead — a
+slower resume, never a re-prefill. At `--max-concurrency 1` the replaced lane IS the admitted one,
+so its prefix is spilled straight to the NVMe tier and the host arena is never used; see
+`docs/serving.md`, “Retained context”.
 
 ## Inherited RTX 5090 campaigns
 

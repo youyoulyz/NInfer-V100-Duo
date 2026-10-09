@@ -141,6 +141,9 @@ measured recommendation rather than a semantic limit.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--host-kv-mib N` | pinned host lane tier; a prefix displaced from the paged KV pool is parked there instead of discarded. `0` disables the tier, and the NVMe tier with it | `0` |
+| `--disk-kv-path DIR` | content-addressed NVMe tier directory, under which displaced prefixes survive a process restart. Requires `--host-kv-mib` | unset |
+| `--disk-kv-mib N` | NVMe tier budget; `0` selects the engine default | `0` |
 | `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
 | `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
 | `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |

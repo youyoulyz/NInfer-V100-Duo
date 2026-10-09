@@ -26,6 +26,12 @@ Any remaining arguments are passed to ninfer-serve after these defaults and ther
 For the previous long-context configuration, pass --max-context 200000 --prefill-chunk 1024
 together: 200000 plus the 4096-token default chunk exceeds the 16 GB reservation.
 
+For a coding-agent session pool, where several conversations each grow to the full context but only
+one request runs at a time, pass --host-kv-mib 2048 --disk-kv-path DIR --disk-kv-mib N: a prefix
+displaced from the KV pool is stored under DIR instead of discarded, so a conversation that comes
+back resumes it instead of prefilling again, and it survives a restart. Size --disk-kv-mib for the
+whole pool: a 200K-token session costs about 7.1 GiB on NVMe, so eight of them need roughly 60 GiB.
+
 Vision stays off by default. For the recommended single-request vision profile on 16 GB cards,
 pass --vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024
 --max-concurrency 1 --kv-capacity 155648 (about 881 MiB free on the primary GPU).
