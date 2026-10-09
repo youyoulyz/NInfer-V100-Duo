@@ -784,7 +784,13 @@ private:
                 selected_reuse = reuse;
             }
         }
-        if (selected) { return selected; }
+        // With the host lane tier enabled, a directly admissible lane is no longer automatically
+        // the right choice: admitting a lane whose prefix is parked on the host costs one host-to-
+        // device image, while discarding a longer retained prefix costs a full re-prefill. So keep
+        // the eviction pass in the running and let a STRICTLY longer reuse win; an equal reuse
+        // still prefers the direct admission, which is why this leaves the ordinary path intact.
+        const bool tier = instance_.program->lane_tier_enabled();
+        if (selected && !tier) { return selected; }
 
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }

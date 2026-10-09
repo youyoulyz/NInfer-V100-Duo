@@ -214,6 +214,8 @@ public:
         return can_admit_lane(lane, plan);
     }
 
+    [[nodiscard]] bool lane_tier_enabled() const noexcept { return false; }
+
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
                                              ScriptedPlan&& plan, rt::TransientRegion) {
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
