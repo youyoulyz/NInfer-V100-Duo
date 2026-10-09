@@ -36,6 +36,7 @@ constexpr std::int32_t kHeadDim   = 256;
 constexpr std::int32_t kQuant     = 64;
 constexpr std::uint32_t kPages    = 128;  // 8,192 tokens at 64 tokens/page
 constexpr std::uint32_t kCapacity = 512;
+constexpr std::uint32_t kStaging  = 32;   // pages a tier holds while it streams one lane out
 
 int fail(const char* message) {
     std::cerr << message << '\n';
@@ -155,7 +156,8 @@ int main() {
     failures += cuda_ok(cudaStreamSynchronize(ctx.stream), "fill sync") ? 0 : 1;
 
     const std::size_t rss_before = process_rss_bytes();
-    ninfer::HostKVArena host_arena(host_layout.page_stride * kPages, {&host_layout, 1});
+    // Room for the whole lane image plus the bounded staging image a tier streams through.
+    ninfer::HostKVArena host_arena(host_layout.page_stride * (kPages + kStaging), {&host_layout, 1});
     ninfer::HostKVOffload offload(host_arena, geometry);
     failures += expect(offload.accepts(pool), "offload accepts pool") ? 0 : 1;
 
@@ -228,6 +230,8 @@ int main() {
         }
     }
     failures += expect(mismatches == 0, "both restores are byte-exact") ? 0 : 1;
+    // The streamed round trip below reuses the second table row; the copies that needed it are done.
+    second.unbind_row();
 
     const auto seconds = [](auto begin, auto end) {
         return std::chrono::duration<double>(end - begin).count();
@@ -246,7 +250,66 @@ int main() {
     std::cout << "host RSS " << (rss_before / (1024.0 * 1024.0)) << " -> "
               << (rss_after / (1024.0 * 1024.0)) << " MiB\n";
 
+    // 5. The batched form a tier streams through: a bounded staging image is filled from one live
+    //    allocation a range at a time and written back into another, at the same logical offsets.
+    //    A run that is not the whole lane is what makes a lane-sized image unnecessary.
+    std::optional<ninfer::HostKVImage> staging = offload.allocate(kStaging);
+    failures += expect(staging.has_value(), "staging image allocated") ? 0 : 1;
+    if (!staging) {
+        std::cout << "FAIL\n";
+        return 1;
+    }
+    ninfer::PagedKVAllocation streamed = pool.reserve(kPages);
+    streamed.materialize_pages(kPages, ctx.stream);
+    streamed.bind_row(1, ctx.stream);
+    struct Range {
+        std::uint32_t begin;
+        std::uint32_t count;
+    };
+    // Full batches tile the whole allocation; the extra short run covers a partial batch at a
+    // mid-lane offset, which is what a chain whose page count is not a multiple of the staging
+    // depth looks like.
+    for (const Range range : {Range{0, kStaging}, Range{32, kStaging}, Range{64, kStaging},
+                              Range{96, kStaging}, Range{5, 13}}) {
+        offload.park_range(pool, first, range.begin, range.count, *staging, 0, ctx.stream);
+        offload.restore_range(*staging, 0, range.count, pool, streamed, range.begin, ctx.stream);
+    }
+    streamed.publish_mapping(ctx.stream);
+    failures += cuda_ok(cudaStreamSynchronize(ctx.stream), "range sync") ? 0 : 1;
+    cudaPointerAttributes staging_attributes{};
+    failures += cuda_ok(cudaPointerGetAttributes(&staging_attributes, offload.data(*staging)),
+                        "staging pointer attributes")
+                    ? 0
+                    : 1;
+    failures += expect(staging_attributes.type == cudaMemoryTypeHost,
+                       "staging bytes are pinned host")
+                    ? 0
+                    : 1;
+    cudaMemsetAsync(offload.mutable_data(*staging), 0, host_layout.page_stride, ctx.stream);
+    failures += cuda_ok(cudaStreamSynchronize(ctx.stream), "staging writable sync") ? 0 : 1;
+
+    std::size_t range_mismatches = 0;
+    for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+        const std::size_t pitch = pool.plane(plane).nb[3];
+        const std::size_t width = host_layout.planes[plane].page_payload_bytes;
+        std::vector<std::uint8_t> read_back(static_cast<std::size_t>(pool.plane(plane).bytes()));
+        failures += cuda_ok(cudaMemcpy(read_back.data(), pool.plane(plane).data, read_back.size(),
+                                       cudaMemcpyDeviceToHost),
+                            "read plane")
+                        ? 0
+                        : 1;
+        const std::vector<std::int32_t> streamed_ids = ids_of(streamed);
+        for (std::uint32_t page = 0; page < kPages; ++page) {
+            const std::size_t begin = static_cast<std::size_t>(streamed_ids[page]) * pitch;
+            for (std::size_t byte = 0; byte < width; ++byte) {
+                if (read_back[begin + byte] != pattern(plane, page)) { ++range_mismatches; }
+            }
+        }
+    }
+    failures += expect(range_mismatches == 0, "the streamed ranges are byte-exact") ? 0 : 1;
+
     image.reset();
+    staging.reset();
     failures += expect(host_arena.occupied_bytes() == 0, "arena released after image drop") ? 0 : 1;
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << '\n';
