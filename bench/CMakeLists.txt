@@ -90,7 +90,8 @@ target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
 add_executable(ninfer_v100_corpus ${PROJECT_SOURCE_DIR}/tools/v100/prepare_corpus.cpp)
 target_include_directories(ninfer_v100_corpus PRIVATE
   ${PROJECT_SOURCE_DIR}/src
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(ninfer_v100_corpus PRIVATE ninfer_engine)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
