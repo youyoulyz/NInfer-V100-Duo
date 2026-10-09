@@ -235,6 +235,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_host_tier_real_test
 target_link_libraries(ninfer_qwen3_6_27b_host_tier_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_host_tier_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# NVMe lane tier end to end: evict two retained lanes, destroy the engine, and resume both prefixes
+# out of the disk records alone with a greedy-identical continuation and zero prefill tokens.
+ninfer_add_test(ninfer_qwen3_6_27b_disk_tier_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_disk_tier_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_disk_tier_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_disk_tier_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 ninfer_add_test(ninfer_qwen3_8_27b_v100-duo_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100-duo_prefix_real.cpp
   LIBRARIES ninfer_engine)
