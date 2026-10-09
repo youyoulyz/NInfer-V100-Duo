@@ -163,23 +163,41 @@ std::optional<HostLinearStateImage>
 park_linear_state(HostLinearStateArena& arena, const LinearAttentionStatePool& pool,
                   std::span<const std::int32_t> slots, cudaStream_t stream) {
     const HostLinearStateLayout layout = plan_host_linear_state_layout(pool.spec, slots);
-    if (pool.layer_count() != layout.spec.layers) { return std::nullopt; }
-    for (const std::int32_t slot : layout.slots) {
-        if (slot < 0 || slot >= pool.slot_count()) { return std::nullopt; }
-    }
-
     std::optional<HostLinearStateImage> image = arena.allocate(layout);
     if (!image) { return std::nullopt; }
+    try {
+        park_linear_state_into(const_cast<std::byte*>(image->data()), layout, pool, layout.slots,
+                               stream);
+    } catch (...) {
+        image->release();
+        throw;
+    }
+    return image;
+}
 
+void park_linear_state_into(std::byte* destination, const HostLinearStateLayout& layout,
+                            const LinearAttentionStatePool& pool,
+                            std::span<const std::int32_t> slots, cudaStream_t stream) {
+    if (destination == nullptr || slots.size() != layout.slots.size()) {
+        throw std::invalid_argument("Linear Attention state harvest needs a destination per slot");
+    }
+    if (pool.layer_count() != layout.spec.layers) {
+        throw std::invalid_argument("Linear Attention state harvest pool mismatch");
+    }
+    for (const std::int32_t slot : slots) {
+        if (slot < 0 || slot >= pool.slot_count()) {
+            throw std::out_of_range("Linear Attention state harvest slot is out of range");
+        }
+    }
     const LinearAttentionStateAllLayersView view = pool.all_layers_view();
-    std::byte* const base = const_cast<std::byte*>(image->data());
+    std::byte* const base = destination;
     const std::size_t conv_region =
         static_cast<std::size_t>(layout.spec.layers) * layout.conv_layer_bytes;
     // Layer addresses are affine and each (layer, slot) record is contiguous, so one 2D copy
     // carries every layer of one mirrored slot: the host pitch is the packed per-layer size, the
     // device pitch is the pool's own layer stride.
     for (std::size_t position = 0; position < layout.slots.size(); ++position) {
-        const std::int32_t slot = layout.slots[position];
+        const std::int32_t slot = slots[position];
         CUDA_ASSERT(cudaMemcpy2DAsync(
             base + position * layout.conv_record_bytes, layout.conv_layer_bytes,
             static_cast<const std::byte*>(view.conv_layer0.data) +
@@ -195,13 +213,19 @@ park_linear_state(HostLinearStateArena& arena, const LinearAttentionStatePool& p
             layout.recurrent_record_bytes, layout.spec.layers, cudaMemcpyDeviceToHost, stream));
     }
     CUDA_ASSERT(cudaStreamSynchronize(stream));
-    return image;
 }
 
 void restore_linear_state_to(const HostLinearStateImage& image, LinearAttentionStatePool& pool,
                              std::span<const std::int32_t> destination_slots, cudaStream_t stream) {
     if (!image.valid()) { throw std::invalid_argument("Linear Attention state image is empty"); }
-    const HostLinearStateLayout& layout = image.layout();
+    restore_linear_state_into(image.data(), image.layout(), pool, destination_slots, stream);
+}
+
+void restore_linear_state_into(const std::byte* image, const HostLinearStateLayout& layout,
+                               LinearAttentionStatePool& pool,
+                               std::span<const std::int32_t> destination_slots,
+                               cudaStream_t stream) {
+    if (image == nullptr) { throw std::invalid_argument("Linear Attention state image is empty"); }
     if (!same_spec(pool.spec, layout.spec) || pool.layer_count() != layout.spec.layers) {
         throw std::invalid_argument("Linear Attention state image pool mismatch");
     }
@@ -215,7 +239,7 @@ void restore_linear_state_to(const HostLinearStateImage& image, LinearAttentionS
     }
 
     const LinearAttentionStateAllLayersView view = pool.all_layers_view();
-    const std::byte* const base = image.data();
+    const std::byte* const base = image;
     const std::size_t conv_region =
         static_cast<std::size_t>(layout.spec.layers) * layout.conv_layer_bytes;
     for (std::size_t position = 0; position < layout.slots.size(); ++position) {

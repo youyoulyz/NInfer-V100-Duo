@@ -55,6 +55,8 @@ public:
     [[nodiscard]] const HostLinearStateLayout& layout() const noexcept { return layout_; }
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
     [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+    // Mutable base, for a caller that fills the image itself (the disk tier reading it back).
+    [[nodiscard]] std::byte* mutable_data() noexcept { return data_; }
 
     // Returns the extent to the arena early. Idempotent.
     bool release() noexcept;
@@ -118,11 +120,28 @@ park_linear_state(HostLinearStateArena& arena, const LinearAttentionStatePool& p
                   std::span<const std::int32_t> slots, cudaStream_t stream);
 
 /**
+ * The same harvest into a caller-owned buffer of `layout.total_bytes`, in the packed layout order.
+ * This is what a tier writing a state image straight to disk uses, so the bytes it stores are the
+ * bytes a restore would demand; it synchronizes before returning.
+ */
+void park_linear_state_into(std::byte* destination, const HostLinearStateLayout& layout,
+                            const LinearAttentionStatePool& pool,
+                            std::span<const std::int32_t> slots, cudaStream_t stream);
+
+/**
  * Copies `image` back into the slot ids recorded in `image.layout()`. The caller owns the ordering
  * contract for the destination state; this function neither zeroes nor synchronizes.
  */
 void restore_linear_state(const HostLinearStateImage& image, LinearAttentionStatePool& pool,
                           cudaStream_t stream);
+
+/**
+ * The same restore from a packed buffer of `layout.total_bytes` rather than from an arena image,
+ * which is how a tier that read the bytes back itself lands them.
+ */
+void restore_linear_state_into(const std::byte* image, const HostLinearStateLayout& layout,
+                               LinearAttentionStatePool& pool,
+                               std::span<const std::int32_t> destination_slots, cudaStream_t stream);
 
 /**
  * Copies `image` into `destination_slots`, in the order the image recorded them. This is what lets
