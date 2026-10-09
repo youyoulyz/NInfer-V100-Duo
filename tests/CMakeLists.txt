@@ -129,6 +129,12 @@ ninfer_add_test(ninfer_host_kv_offload_test
 ninfer_add_test(ninfer_host_linear_state_test
   SOURCES test_host_linear_state.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_disk_kv_store_test
+  SOURCES test_disk_kv_store.cpp
+  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_disk_kv_bridge_test
+  SOURCES test_disk_kv_bridge.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)

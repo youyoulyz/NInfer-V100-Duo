@@ -24,6 +24,9 @@ add_library(ninfer_core STATIC
   core/paged_kv_cache.cpp
   core/host_kv_arena.cpp
   core/host_kv_offload.cpp
+  core/disk_kv_store.cpp
+  core/disk_kv_bridge.cpp
+  core/direct_storage_reader.cpp
   core/linear_attention_state.cpp
   core/host_linear_state.cpp
   core/layout.cpp
