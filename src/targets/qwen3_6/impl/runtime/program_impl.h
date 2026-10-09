@@ -517,6 +517,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    if (plan.host_context_bytes != 0) { enable_lane_tier(plan.host_context_bytes); }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -702,6 +703,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
     try {
+        // A parked lane keeps its host prefix metadata so the planner still prices it as a
+        // reusable prefix; the bytes come back here, before the reuse branches consume them.
+        if (request_plan.reuse == ReusePath::FullReset) {
+            drop_parked_lane(lane);
+        } else {
+            restore_lane(lane);
+        }
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
             ordered_reset(sequence);
@@ -1165,7 +1173,285 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
+    if (lane_store_ != nullptr) {
+        bool parked = false;
+        try {
+            parked = park_lane(lane);
+        } catch (...) {
+            parked = false;
+        }
+        if (parked) { return; }
+        drop_parked_lane(lane);
+    }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+void ProgramImplCore::enable_lane_tier(std::size_t host_bytes) {
+    if (lane_store_ != nullptr) { return; }
+    if (host_bytes == 0) {
+        throw std::invalid_argument("Host lane tier needs a positive KV byte budget");
+    }
+
+    std::vector<HostKVPageLayout> layouts;
+    layouts.push_back(plan_host_kv_page_layout(text_kv_geometry()));
+    if (backend_kv_cache() != nullptr) {
+        layouts.push_back(plan_host_kv_page_layout(backend_kv_geometry()));
+    }
+
+    const LinearAttentionStatePoolSpec& linear_spec = decoder->linear_attention.spec;
+    const std::array<std::int32_t, 2> slots{
+        LinearStateSlots::current_state_slot(0, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)};
+    const std::size_t linear_image_bytes = plan_host_linear_state_layout(linear_spec, slots).total_bytes;
+    // One linear-attention image per rank per lane: the peer's pool is a distinct physical pool.
+    const std::uint32_t linear_images = max_concurrency * static_cast<std::uint32_t>(tp == 2 ? 2 : 1);
+
+    lane_store_ = std::make_unique<qwen3_6::detail::HostLaneStateStore>(
+        std::move(layouts), host_bytes, linear_image_bytes, linear_images,
+        static_cast<std::size_t>(TextConfig::hidden) * 2ULL);
+}
+
+KVPageGeometry ProgramImplCore::text_kv_geometry() const {
+    const PagedKVPool& pool = decoder->text_kv.pool();
+    KVPageGeometry geometry;
+    geometry.page_tokens        = static_cast<std::uint32_t>(kPagedKVPageSize);
+    geometry.device_plane_order = PagedKVPlaneOrder::PageMajor;
+    geometry.planes.reserve(pool.plane_count());
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const Tensor& plane = pool.plane(index);
+        geometry.planes.push_back(KVPlaneGeometry{plane.dtype, plane.ne[0], plane.ne[2], 256});
+    }
+    return geometry;
+}
+
+KVPageGeometry ProgramImplCore::backend_kv_geometry() const {
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend == nullptr) { throw std::logic_error("no speculative backend KV pool"); }
+    const PagedKVPool& pool = backend->pool();
+    KVPageGeometry geometry;
+    geometry.page_tokens        = static_cast<std::uint32_t>(kPagedKVPageSize);
+    geometry.device_plane_order = PagedKVPlaneOrder::PageMajor;
+    geometry.planes.reserve(pool.plane_count());
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const Tensor& plane = pool.plane(index);
+        geometry.planes.push_back(KVPlaneGeometry{plane.dtype, plane.ne[0], plane.ne[2], 256});
+    }
+    return geometry;
+}
+
+bool ProgramImplCore::has_parked_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency && parked_images_[lane].has_value();
+}
+
+void ProgramImplCore::drop_parked_lane(std::uint32_t lane) noexcept {
+    if (lane < max_concurrency) { parked_images_[lane].reset(); }
+}
+
+std::size_t ProgramImplCore::parked_host_bytes() const noexcept {
+    if (lane_store_ == nullptr) { return 0; }
+    std::size_t total = 0;
+    for (const std::optional<LaneStateImage>& image : parked_images_) {
+        if (!image) { continue; }
+        for (const std::optional<HostKVImage>* kv :
+             {&image->text, &image->backend, &image->text_peer, &image->backend_peer}) {
+            if (kv->has_value()) { total += (*kv)->byte_count(); }
+        }
+        if (image->linear) { total += image->linear->bytes(); }
+        if (image->linear_peer) { total += image->linear_peer->bytes(); }
+        total += 2ULL * lane_store_->hidden_bytes();
+    }
+    return total;
+}
+
+// Mirrors one lane's whole continuable state into the host tier and releases its device KV pages.
+//
+// Read-only on the device until the commit at the end, so a failure at any point leaves the lane
+// exactly as it was: the arena allocations return their extents with the locals that hold them.
+bool ProgramImplCore::park_lane(std::uint32_t lane) {
+    if (lane_store_ == nullptr || lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (!sequence.retained || parked_images_[lane].has_value() || !sequence.kv) { return false; }
+    if (request.lifecycle != Lifecycle::Empty && request.lifecycle != Lifecycle::Complete) {
+        return false;
+    }
+    if (peer.has_value() != sequence.kv->text_peer.has_value()) { return false; }
+
+    HostKVOffload* const text_offload = lane_store_->offload_for(text_kv_geometry());
+    if (text_offload == nullptr) { return false; }
+    std::optional<HostKVImage> text =
+        text_offload->park(decoder->text_kv.pool(), sequence.kv->text, device.stream);
+    if (!text) { return false; }
+
+    std::optional<HostKVImage> backend;
+    if (sequence.kv->backend) {
+        HostKVOffload* const backend_offload = lane_store_->offload_for(backend_kv_geometry());
+        if (backend_offload == nullptr) { return false; }
+        backend = backend_offload->park(backend_kv_cache()->pool(), *sequence.kv->backend,
+                                        device.stream);
+        if (!backend) { return false; }
+    }
+
+    std::optional<HostKVImage> text_peer;
+    std::optional<HostKVImage> backend_peer;
+    if (peer) {
+        const ScopedDevice scope(peer->device.device);
+        text_peer = text_offload->park(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                                       peer->device.stream);
+        if (!text_peer) { return false; }
+        if (sequence.kv->backend_peer) {
+            HostKVOffload* const backend_offload = lane_store_->offload_for(backend_kv_geometry());
+            if (backend_offload == nullptr) { return false; }
+            backend_peer = backend_offload->park(peer->decoder->mtp_cache()->pool(),
+                                                 *sequence.kv->backend_peer, peer->device.stream);
+            if (!backend_peer) { return false; }
+        }
+    }
+
+    const std::array<std::int32_t, 2> slots{
+        LinearStateSlots::current_state_slot(lane, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency)};
+    std::optional<HostLinearStateImage> linear = park_linear_state(
+        lane_store_->linear_arena(), decoder->linear_attention, slots, device.stream);
+    if (!linear) { return false; }
+    std::optional<HostLinearStateImage> linear_peer;
+    if (peer) {
+        const ScopedDevice scope(peer->device.device);
+        linear_peer = park_linear_state(lane_store_->linear_arena(),
+                                        peer->decoder->linear_attention, slots,
+                                        peer->device.stream);
+        if (!linear_peer) { return false; }
+    }
+
+    // Rank 0's hidden rows. They are not freed by a park (they live in the persistent arena), but
+    // the lane can be handed to another request before this prefix is claimed again.
+    CUDA_CHECK(cudaMemcpyAsync(lane_store_->hidden_row(lane, false), sequence.tail_hidden.data,
+                               sequence.tail_hidden.bytes(), cudaMemcpyDeviceToHost,
+                               device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(lane_store_->hidden_row(lane, true),
+                               sequence.rewrite_checkpoint_hidden.data,
+                               sequence.rewrite_checkpoint_hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+
+    LaneStateImage image;
+    image.text         = std::move(text);
+    image.backend      = std::move(backend);
+    image.text_peer    = std::move(text_peer);
+    image.backend_peer = std::move(backend_peer);
+    image.linear       = std::move(linear);
+    image.linear_peer  = std::move(linear_peer);
+    image.metadata.ledger                  = sequence.ledger;
+    image.metadata.prefix_identity         = sequence.prefix_identity;
+    image.metadata.execution_frontier      = sequence.execution_frontier;
+    image.metadata.ledger_frontier         = sequence.ledger_frontier;
+    image.metadata.text_kv_valid           = sequence.text_kv_valid;
+    image.metadata.mtp_kv_valid            = sequence.mtp_kv_valid;
+    image.metadata.dflash_context_frontier = sequence.dflash_context_frontier;
+    image.metadata.mtp_draft_count         = sequence.mtp_draft_count;
+    image.metadata.rope_delta              = sequence.rope_delta;
+    image.metadata.tail_hidden_valid       = sequence.tail_hidden_valid;
+    image.metadata.rewrite_checkpoint      = sequence.rewrite_checkpoint;
+    parked_images_[lane] = std::move(image);
+
+    // The prefix metadata stays live so the planner still sees the lane as reusable; only the
+    // bytes leave the device.
+    sequence.kv.reset();
+    sequence.retained = true;
+    return true;
+}
+
+// Rebuilds a lane's device state from its parked image. A no-op when nothing is parked, so the
+// ordinary live-lane reuse path is untouched.
+void ProgramImplCore::restore_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    std::optional<LaneStateImage>& parked = parked_images_[lane];
+    if (!parked) { return; }
+    if (lane_store_ == nullptr) { throw std::logic_error("host lane tier is not enabled"); }
+    SequenceState& sequence = sequences[lane];
+    if (sequence.kv) { throw std::logic_error("parked lane already owns a device KV bundle"); }
+
+    HostKVOffload* const text_offload = lane_store_->offload_for(text_kv_geometry());
+    if (text_offload == nullptr) { throw std::logic_error("host lane tier lost its KV layout"); }
+
+    SequenceKVBundle bundle;
+    {
+        const std::uint32_t pages = parked->text->page_count();
+        PagedKVAllocation allocation = decoder->text_kv.pool().reserve(pages);
+        allocation.materialize_pages(pages, device.stream);
+        text_offload->restore(*parked->text, decoder->text_kv.pool(), allocation, device.stream);
+        bundle.text = std::move(allocation);
+    }
+    if (parked->backend) {
+        const std::uint32_t pages = parked->backend->page_count();
+        PagedKVAllocation allocation = backend_kv_cache()->pool().reserve(pages);
+        allocation.materialize_pages(pages, device.stream);
+        lane_store_->offload_for(backend_kv_geometry())
+            ->restore(*parked->backend, backend_kv_cache()->pool(), allocation, device.stream);
+        bundle.backend.emplace(std::move(allocation));
+    }
+    if (peer) {
+        const ScopedDevice scope(peer->device.device);
+        const std::uint32_t pages = parked->text_peer->page_count();
+        PagedKVAllocation allocation = peer->decoder->text_kv.pool().reserve(pages);
+        allocation.materialize_pages(pages, peer->device.stream);
+        text_offload->restore(*parked->text_peer, peer->decoder->text_kv.pool(), allocation,
+                              peer->device.stream);
+        bundle.text_peer.emplace(std::move(allocation));
+        if (parked->backend_peer) {
+            const std::uint32_t backend_pages = parked->backend_peer->page_count();
+            PagedKVAllocation backend_allocation =
+                peer->decoder->mtp_cache()->pool().reserve(backend_pages);
+            backend_allocation.materialize_pages(backend_pages, peer->device.stream);
+            lane_store_->offload_for(backend_kv_geometry())
+                ->restore(*parked->backend_peer, peer->decoder->mtp_cache()->pool(),
+                          backend_allocation, peer->device.stream);
+            bundle.backend_peer.emplace(std::move(backend_allocation));
+        }
+    }
+
+    const std::array<std::int32_t, 2> slots{
+        LinearStateSlots::current_state_slot(lane, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency)};
+    restore_linear_state(*parked->linear, decoder->linear_attention, device.stream);
+    if (parked->linear_peer) {
+        const ScopedDevice scope(peer->device.device);
+        restore_linear_state(*parked->linear_peer, peer->decoder->linear_attention,
+                             peer->device.stream);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, lane_store_->hidden_row(lane, false),
+                               sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice,
+                               device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data,
+                               lane_store_->hidden_row(lane, true),
+                               sequence.rewrite_checkpoint_hidden.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+
+    sequence.ledger                  = parked->metadata.ledger;
+    sequence.prefix_identity         = parked->metadata.prefix_identity;
+    sequence.execution_frontier      = parked->metadata.execution_frontier;
+    sequence.ledger_frontier         = parked->metadata.ledger_frontier;
+    sequence.text_kv_valid           = parked->metadata.text_kv_valid;
+    sequence.mtp_kv_valid            = parked->metadata.mtp_kv_valid;
+    sequence.dflash_context_frontier = parked->metadata.dflash_context_frontier;
+    sequence.mtp_draft_count         = parked->metadata.mtp_draft_count;
+    sequence.rope_delta              = parked->metadata.rope_delta;
+    sequence.tail_hidden_valid       = parked->metadata.tail_hidden_valid;
+    sequence.rewrite_checkpoint      = parked->metadata.rewrite_checkpoint;
+    sequence.kv                      = std::move(bundle);
+    sequence.retained                = true;
+    parked.reset();
+}
+
+bool ProgramImplCore::park_retained_lane(std::uint32_t lane) {
+    if (!has_retained_lane(lane)) { return false; }
+    return park_lane(lane);
+}
+
+bool ProgramImplCore::restore_parked_lane(std::uint32_t lane) {
+    if (!has_parked_lane(lane)) { return false; }
+    restore_lane(lane);
+    return true;
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1179,6 +1465,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     sequence.kv.reset();
+    drop_parked_lane(sequence.lane);
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
@@ -3275,6 +3562,12 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_node_count          = graph_node_count;
     out.kv_payload_bytes               = kv_payload_bytes;
     out.gdn_state_bytes                = gdn_state_bytes;
+    if (lane_store_ != nullptr) {
+        out.host_tier_capacity_bytes =
+            lane_store_->kv_capacity_bytes() + lane_store_->linear_capacity_bytes() +
+            2ULL * lane_store_->hidden_bytes() * static_cast<std::size_t>(max_concurrency);
+        out.host_tier_parked_bytes = parked_host_bytes();
+    }
     return out;
 }
 

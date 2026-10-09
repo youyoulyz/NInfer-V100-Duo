@@ -202,6 +202,36 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::enable_lane_tier(std::size_t host_bytes) {
+    impl_->enable_lane_tier(host_bytes);
+}
+
+template <>
+bool Program<Variant>::lane_tier_enabled() const noexcept {
+    return impl_->lane_tier_enabled();
+}
+
+template <>
+bool Program<Variant>::has_parked_lane(std::uint32_t lane) const noexcept {
+    return impl_->has_parked_lane(lane);
+}
+
+template <>
+bool Program<Variant>::park_retained_lane(std::uint32_t lane) {
+    return impl_->park_retained_lane(lane);
+}
+
+template <>
+bool Program<Variant>::restore_parked_lane(std::uint32_t lane) {
+    return impl_->restore_parked_lane(lane);
+}
+
+template <>
+std::size_t Program<Variant>::parked_host_bytes() const noexcept {
+    return impl_->parked_host_bytes();
+}
+
+template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
 }

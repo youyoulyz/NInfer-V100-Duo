@@ -172,6 +172,18 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Host lane tier. `enable_lane_tier` sizes and allocates the pinned host arenas once; until it
+    // runs, eviction discards the lane exactly as before. Once enabled, `evict_retained_lane`
+    // parks a retained lane's complete continuable state (KV for both ranks, the GDN
+    // linear-attention slots, the hidden rows, and the prefix metadata) into host RAM and releases
+    // its device KV pages; the next admission of that lane restores it from the host image.
+    void enable_lane_tier(std::size_t host_bytes);
+    [[nodiscard]] bool lane_tier_enabled() const noexcept;
+    [[nodiscard]] bool has_parked_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool park_retained_lane(std::uint32_t lane);
+    [[nodiscard]] bool restore_parked_lane(std::uint32_t lane);
+    [[nodiscard]] std::size_t parked_host_bytes() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

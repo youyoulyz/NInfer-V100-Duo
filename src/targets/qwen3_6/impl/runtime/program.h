@@ -4,11 +4,14 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_kv_offload.h"
+#include "core/host_linear_state.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "targets/qwen3_6/impl/runtime/host_lane_state_store.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -137,6 +140,33 @@ struct SequenceKVBundle {
     std::optional<PagedKVAllocation> backend_peer;
 };
 
+// Everything a parked lane must remember that already lives on the host.
+struct LaneStateMetadata {
+    std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    std::uint32_t execution_frontier      = 0;
+    std::uint32_t ledger_frontier         = 0;
+    std::uint32_t text_kv_valid           = 0;
+    std::uint32_t mtp_kv_valid            = 0;
+    std::uint32_t dflash_context_frontier = 0;
+    std::uint32_t mtp_draft_count         = 0;
+    std::int32_t rope_delta               = 0;
+    bool tail_hidden_valid                = false;
+    RewriteCheckpoint rewrite_checkpoint;
+};
+
+// One lane's parked bytes, both ranks. Move-only: the images return their extents to the Program's
+// HostLaneStateStore when this is destroyed or reset.
+struct LaneStateImage {
+    std::optional<HostKVImage> text;
+    std::optional<HostKVImage> backend;
+    std::optional<HostKVImage> text_peer;
+    std::optional<HostKVImage> backend_peer;
+    std::optional<HostLinearStateImage> linear;
+    std::optional<HostLinearStateImage> linear_peer;
+    LaneStateMetadata metadata;
+};
+
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
     std::uint32_t min_execution_frontier = 0;
@@ -240,6 +270,10 @@ struct PeerRuntime {
     Tensor token_counts;
 };
 
+namespace ninfer::targets::qwen3_6::detail {
+class HostLaneStateStore;
+} // namespace ninfer::targets::qwen3_6::detail
+
 class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, const LoadedModelData* peer_model,
@@ -273,6 +307,19 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Host tier. `enable_lane_tier` sizes and allocates the pinned arenas once; until it runs the
+    // Program behaves exactly as before, and eviction discards the lane instead of parking it.
+    void enable_lane_tier(std::size_t host_bytes);
+    [[nodiscard]] bool lane_tier_enabled() const noexcept { return lane_store_ != nullptr; }
+    [[nodiscard]] bool has_parked_lane(std::uint32_t lane) const noexcept;
+    // Parks `lane`'s complete continuable state into pinned host RAM and releases its device KV
+    // pages. Returns false when the lane is not retained, already parked, or the tier cannot fit it.
+    [[nodiscard]] bool park_retained_lane(std::uint32_t lane);
+    // Rebuilds `lane`'s device state from its parked image. Returns false when nothing is parked.
+    [[nodiscard]] bool restore_parked_lane(std::uint32_t lane);
+    [[nodiscard]] std::size_t parked_host_bytes() const noexcept;
+    [[nodiscard]] std::size_t tier_device_kv_bytes() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -347,6 +394,8 @@ public:
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
+    std::unique_ptr<qwen3_6::detail::HostLaneStateStore> lane_store_;
+    std::array<std::optional<LaneStateImage>, kMaximumConcurrency> parked_images_;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -477,6 +526,11 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash2_batch(std::span<const std::uint32_t> lanes,
                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] bool park_lane(std::uint32_t lane);
+    void restore_lane(std::uint32_t lane);
+    void drop_parked_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] KVPageGeometry text_kv_geometry() const;
+    [[nodiscard]] KVPageGeometry backend_kv_geometry() const;
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
