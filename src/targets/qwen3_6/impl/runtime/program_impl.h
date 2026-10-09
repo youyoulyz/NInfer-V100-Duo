@@ -1187,6 +1187,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 unbind_sequence_kv(sequence);
                 sequence.retained = true;
                 request.lifecycle = Lifecycle::Complete;
+                publish_retained_prefix(lanes[row]);
             } else {
                 request.lifecycle = Lifecycle::Active;
             }
@@ -1624,8 +1625,8 @@ bool ProgramImplCore::stage_tier_state(std::uint32_t lane, bool checkpoint) noex
 
 // Writes one tap from the lane's live device allocations: every rank's chain in staging-sized
 // batches, then the state image that publishes the frontier. False leaves the store as it was.
-bool ProgramImplCore::spill_device_tap(std::uint32_t lane, std::uint32_t frontier,
-                                       bool checkpoint) noexcept {
+bool ProgramImplCore::spill_device_tap(std::uint32_t lane, std::uint32_t frontier, bool checkpoint,
+                                       std::uint32_t first_page) noexcept {
     SequenceState& sequence = sequences[lane];
     if (frontier == 0 || frontier > sequence.text_kv_valid ||
         frontier > sequence.execution_frontier || frontier > sequence.prefix_digests.size()) {
@@ -1649,15 +1650,15 @@ bool ProgramImplCore::spill_device_tap(std::uint32_t lane, std::uint32_t frontie
         // is reused across ranks, so every batch is synchronized before the next one overwrites it.
         const auto spill_chain = [&](std::uint32_t rank, DiskKVKind kind, std::uint32_t chain,
                                      HostKVOffload& staging, HostKVImage& image, PagedKVPool& pool,
-                                     PagedKVAllocation& source, cudaStream_t stream) {
+                                     PagedKVAllocation& source, cudaStream_t stream,
+                                     std::uint32_t first) {
             const std::uint32_t pages = LaneDiskTier::prefix_pages(chain);
-            for (std::uint32_t first = 0; first < pages; first += batch) {
-                const std::uint32_t count = std::min(batch, pages - first);
-                staging.park_range(pool, source, first, count, image, 0, stream);
+            for (std::uint32_t at = first; at < pages; at += batch) {
+                const std::uint32_t count = std::min(batch, pages - at);
+                staging.park_range(pool, source, at, count, image, 0, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 const std::size_t stride = staging.layout().page_stride;
-                if (!disk_tier_->spill_pages(sequence.prefix_digests, kind, rank, chain, first,
-                                             count,
+                if (!disk_tier_->spill_pages(sequence.prefix_digests, kind, rank, chain, at, count,
                                              {staging.data(image),
                                               static_cast<std::size_t>(count) * stride})) {
                     return false;
@@ -1669,22 +1670,26 @@ bool ProgramImplCore::spill_device_tap(std::uint32_t lane, std::uint32_t frontie
             const ScopedDevice scope(peer->device.device);
             if (!spill_chain(1, DiskKVKind::MainKV, frontier, *text_staging, text_image,
                              peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
-                             peer->device.stream)) {
+                             peer->device.stream, first_page)) {
                 return false;
             }
             if (mtp && !spill_chain(1, DiskKVKind::BackendKV, backend_chain, *backend_staging,
                                     *backend_image, peer->decoder->mtp_cache()->pool(),
-                                    *sequence.kv->backend_peer, peer->device.stream)) {
+                                    *sequence.kv->backend_peer, peer->device.stream,
+                                    std::min(first_page, LaneDiskTier::prefix_pages(backend_chain) -
+                                                             1U))) {
                 return false;
             }
         }
         if (!spill_chain(0, DiskKVKind::MainKV, frontier, *text_staging, text_image,
-                         decoder->text_kv.pool(), sequence.kv->text, device.stream)) {
+                         decoder->text_kv.pool(), sequence.kv->text, device.stream, first_page)) {
             return false;
         }
         if (mtp && !spill_chain(0, DiskKVKind::BackendKV, backend_chain, *backend_staging,
                                 *backend_image, backend_kv_cache()->pool(),
-                                *sequence.kv->backend, device.stream)) {
+                                *sequence.kv->backend, device.stream,
+                                std::min(first_page,
+                                         LaneDiskTier::prefix_pages(backend_chain) - 1U))) {
             return false;
         }
         if (!stage_tier_state(lane, checkpoint)) { return false; }
@@ -1720,11 +1725,36 @@ bool ProgramImplCore::spill_device_prefix(std::uint32_t lane) noexcept {
         taps[tap_count++] = {sequence.rewrite_checkpoint.frontier, true};
     }
     taps[tap_count++] = {frontier, false};
+    // A tap below the published frontier only has to re-key the one block that was partial when
+    // that frontier was written: growing the chain changes its key from the old frontier to the
+    // new one. Everything under it is already in the store and is skipped by `contains`.
+    const std::uint32_t published = sequence.disk_published_frontier;
     bool spilled = false;
+    bool frontier_published = false;
     for (std::size_t index = 0; index < tap_count; ++index) {
-        spilled = spill_device_tap(lane, taps[index].first, taps[index].second) || spilled;
+        const std::uint32_t tap = taps[index].first;
+        const std::uint32_t first_page =
+            published == 0 ? 0
+                           : std::min(LaneDiskTier::prefix_pages(published),
+                                      LaneDiskTier::prefix_pages(tap)) -
+                                 1;
+        const bool ok = spill_device_tap(lane, tap, taps[index].second, first_page);
+        spilled = spilled || ok;
+        if (index + 1 == tap_count) { frontier_published = ok; }
     }
+    if (frontier_published) { sequence.disk_published_frontier = frontier; }
     return spilled;
+}
+
+// The tier is only ever filled from a lane that still owns its bytes, and a retained lane that
+// nothing has displaced yet owns them in exactly one place: the device. Publishing at completion is
+// what makes the tier a property of the conversation rather than of the displacement order, so the
+// session a process happens to be holding when it exits is still resumable. Synchronous and
+// incremental: the first turn of a session copies its whole prefix, every later turn only the
+// blocks it appended plus the state image at the new frontier.
+void ProgramImplCore::publish_retained_prefix(std::uint32_t lane) noexcept {
+    if (disk_tier_ == nullptr || !has_retained_lane(lane)) { return; }
+    (void)spill_device_prefix(lane);
 }
 
 // The same spill from a lane the host tier already holds: its KV lives in the parked host image, so
@@ -1745,15 +1775,17 @@ bool ProgramImplCore::spill_parked_prefix(std::uint32_t lane) noexcept {
         mtp ? lane_store_->offload_for(backend_kv_geometry()) : nullptr;
     if (text_offload == nullptr || (mtp && backend_offload == nullptr)) { return false; }
 
+    const std::uint32_t published = sequences[lane].disk_published_frontier;
     const auto spill_image = [&](std::uint32_t rank, DiskKVKind kind, std::uint32_t chain,
-                                 const std::optional<HostKVImage>& image, HostKVOffload& offload) {
+                                 const std::optional<HostKVImage>& image, HostKVOffload& offload,
+                                 std::uint32_t start) {
         if (!image) { return false; }
         const std::uint32_t pages = LaneDiskTier::prefix_pages(chain);
-        if (image->page_count() < pages) { return false; }
+        if (image->page_count() < pages || start >= pages) { return false; }
         const std::size_t stride    = offload.layout().page_stride;
         const std::byte* const base = offload.data(*image);
         const std::uint32_t batch   = HostLaneStateStore::staging_pages();
-        for (std::uint32_t first = 0; first < pages; first += batch) {
+        for (std::uint32_t first = start; first < pages; first += batch) {
             const std::uint32_t count = std::min(batch, pages - first);
             if (!disk_tier_->spill_pages(metadata.prefix_digests, kind, rank, chain, first, count,
                                          {base + static_cast<std::size_t>(first) * stride,
@@ -1763,6 +1795,13 @@ bool ProgramImplCore::spill_parked_prefix(std::uint32_t lane) noexcept {
         }
         return true;
     };
+    const auto start_for = [&](std::uint32_t chain) {
+        return published == 0
+                   ? 0U
+                   : std::min(LaneDiskTier::prefix_pages(published),
+                              LaneDiskTier::prefix_pages(chain)) -
+                         1U;
+    };
     const auto spill_tap = [&](std::uint32_t tap_frontier, bool checkpoint) {
         if (tap_frontier == 0 || tap_frontier > metadata.text_kv_valid ||
             tap_frontier > metadata.execution_frontier ||
@@ -1771,19 +1810,23 @@ bool ProgramImplCore::spill_parked_prefix(std::uint32_t lane) noexcept {
         }
         const std::uint32_t backend_chain = disk_tier_->backend_frontier(tap_frontier);
         if (mtp && metadata.mtp_kv_valid < backend_chain) { return false; }
+        const std::uint32_t start      = start_for(tap_frontier);
+        const std::uint32_t backend_at =
+            std::min(start, LaneDiskTier::prefix_pages(backend_chain) - 1U);
         try {
-            if (!spill_image(0, DiskKVKind::MainKV, tap_frontier, parked->text, *text_offload)) {
+            if (!spill_image(0, DiskKVKind::MainKV, tap_frontier, parked->text, *text_offload,
+                             start)) {
                 return false;
             }
             if (peer && !spill_image(1, DiskKVKind::MainKV, tap_frontier, parked->text_peer,
-                                     *text_offload)) {
+                                     *text_offload, start)) {
                 return false;
             }
             if (mtp) {
                 if (!spill_image(0, DiskKVKind::BackendKV, backend_chain, parked->backend,
-                                 *backend_offload) ||
+                                 *backend_offload, backend_at) ||
                     (peer && !spill_image(1, DiskKVKind::BackendKV, backend_chain,
-                                          parked->backend_peer, *backend_offload))) {
+                                          parked->backend_peer, *backend_offload, backend_at))) {
                     return false;
                 }
             }
@@ -1804,9 +1847,13 @@ bool ProgramImplCore::spill_parked_prefix(std::uint32_t lane) noexcept {
     }
     taps[tap_count++] = {frontier, false};
     bool spilled = false;
+    bool frontier_published = false;
     for (std::size_t index = 0; index < tap_count; ++index) {
-        spilled = spill_tap(taps[index].first, taps[index].second) || spilled;
+        const bool ok = spill_tap(taps[index].first, taps[index].second);
+        spilled = spilled || ok;
+        if (index + 1 == tap_count) { frontier_published = ok; }
     }
+    if (frontier_published) { sequences[lane].disk_published_frontier = frontier; }
     return spilled;
 }
 
@@ -1955,6 +2002,9 @@ std::uint32_t ProgramImplCore::restore_lane_from_disk(std::uint32_t lane, std::u
     // The stored image carries the continuation state only: the rewrite seam it may also have held
     // belongs to the lane that spilled, not to the prefix this resume landed on.
     sequence.rewrite_checkpoint = {};
+    // The record this resume read IS the store's copy of that frontier, so nothing before it has to
+    // be written again; only what the lane appends from here on.
+    sequence.disk_published_frontier = frontier;
     ++disk_restores_;
     return frontier;
 }
@@ -1980,6 +2030,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    sequence.disk_published_frontier = 0;
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
@@ -2239,6 +2290,7 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    sequence.disk_published_frontier = 0;
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -4049,6 +4101,8 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
+    // After the lifecycle flip: a spill only ever sources a Complete or Empty lane.
+    if (terminal) { publish_retained_prefix(sequence.lane); }
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

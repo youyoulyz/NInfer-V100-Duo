@@ -217,6 +217,10 @@ struct SequenceState {
     // later lookup derive the same identity for the same content.
     qwen3_6::detail::PrefixDigests prefix_digests;
     std::int32_t rope_delta               = 0;
+    // Largest frontier whose whole chain AND state image the NVMe tier already holds. Every tap
+    // that publishes a prefix starts one block below it, which is why a completed turn costs the
+    // blocks it just produced instead of the whole conversation again.
+    std::uint32_t disk_published_frontier = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
@@ -571,9 +575,15 @@ private:
     // held, so a failed spill only costs a recompute later.
     [[nodiscard]] bool spill_parked_prefix(std::uint32_t lane) noexcept;
     [[nodiscard]] bool spill_device_prefix(std::uint32_t lane) noexcept;
-    // Writes a single (frontier, state-role) tap from the lane's live device allocations.
-    [[nodiscard]] bool spill_device_tap(std::uint32_t lane, std::uint32_t frontier,
-                                        bool checkpoint) noexcept;
+    // Writes a single (frontier, state-role) tap from the lane's live device allocations, walking
+    // its chain from `first_page` (0 for a prefix nothing has published yet).
+    [[nodiscard]] bool spill_device_tap(std::uint32_t lane, std::uint32_t frontier, bool checkpoint,
+                                        std::uint32_t first_page) noexcept;
+    // Publishes the prefix of a lane that has just completed a request. A retained lane keeps its
+    // device KV and is normally published when the next request displaces it, but that leaves the
+    // conversation the process is holding when it exits with no record at all: the next process
+    // would re-prefill exactly the session that was active last. Best effort, like every spill.
+    void publish_retained_prefix(std::uint32_t lane) noexcept;
     // Packs one lane's resumable state image into the disk tier's staging buffer.
     [[nodiscard]] bool stage_tier_state(std::uint32_t lane, bool checkpoint) noexcept;
     [[nodiscard]] std::uint32_t program_identity_tag() const noexcept;
