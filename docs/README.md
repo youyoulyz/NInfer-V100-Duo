@@ -45,6 +45,7 @@ Runtime and Op references:
 
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
+- [Context tiering: retained-context parking in host RAM and on NVMe](maintainer/context-tiering.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Dual-GPU (TP2) execution and YaRN 1M context](maintainer/tp2-yarn-1m.md)

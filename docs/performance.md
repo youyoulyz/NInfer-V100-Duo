@@ -1516,6 +1516,59 @@ The HTTP smoke uses a temporary local server with a 1,024-token capacity and 128
 The cache remains process-local and can resume only the current frontier or its saved complete
 turn/response checkpoint; see [serving cache behavior](serving.md#execution-behavior).
 
+## V100 Duo context tier (host RAM + NVMe)
+
+Retained (idle) conversations are parked instead of discarded. A lane evicted from the paged KV pool
+is mirrored into pinned host RAM, and every parked lane is also published to a content-addressed NVMe
+store, so restoring a prefix is a transfer rather than a re-prefill. The contract, the identity
+model and the eviction-integrity rules are in
+[context tiering](maintainer/context-tiering.md).
+
+Same two V100-SXM2 16 GB cards, 27B NVFP4 artifact, TP2, optimized MTP3, INT8 group-64 KV,
+4,096-token capacity, 256-token chunks, greedy sampling, 8 output tokens. The primitives, at the
+registered 27B text-KV geometry (128 pages = 132 MiB of one device's Main Text KV; the GDN linear
+state is 146.8 MiB per rank):
+
+| operation | bytes | time | rate |
+|---|---:|---:|---:|
+| host KV park (D2H, one device) | 132 MiB | 42.1 ms | 3.14 GB/s |
+| host KV restore (H2D, one device) | 132 MiB | 82.8 ms for two of them | 3.19 GB/s |
+| GDN linear state park (D2H) | 146.8 MiB | 46.7 ms | 3.14 GB/s |
+
+Those rates sit at these cards' PCIe Gen3 ceiling, so the tier's cost is bytes over bandwidth and
+nothing else.
+
+End to end on the real artifact, 1,943-token prefixes in a two-lane pool with
+`host_context_bytes=256 MiB`:
+
+| path | ttft | computed prefill tokens |
+|---|---:|---:|
+| cold prefill (two lanes prefilling together) | 2.92 s / 5.91 s | 1,943 |
+| resumed from NVMe, engine destroyed in between | 0.124 s / 0.193 s | **0** |
+
+The resumed continuation is greedy-identical to the cold run. The NVMe leg deliberately destroys the
+engine first, so those 0.124 s/0.193 s cannot be a host-tier hit: the host arena, the device pages,
+the parked images and the resident prefix metadata are all gone, and the two prefixes are re-derived
+from `disk_kv_path` by content. The cold reference prefilled under contention with its sibling lane,
+so the 24x/31x ratios understate a lone resume.
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+NINFER_TEST_TP2=1 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  build-v100-test/tests/ninfer_qwen3_6_27b_host_tier_real_test
+NINFER_TEST_TP2=1 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  build-v100-test/tests/ninfer_qwen3_6_27b_disk_tier_real_test   # scratch dir must not be tmpfs
+```
+
+One host park/restore round trip of the whole lane (KV, both ranks' GDN state and the hidden rows) is
+379,142,144 B at this prefix length; the parked bytes return exactly to their previous value after a
+second cycle, which is what proves the arena extents are reused rather than leaked.
+
+Both tiers are reachable only through the C++ API today (`EngineOptions::host_context_bytes`,
+`disk_kv_path`, `disk_kv_bytes`); `ninfer-serve` and the CLI do not expose them yet. The host arena
+itself does not reclaim, so when it is full a lane parks on NVMe instead — a slower resume, never a
+re-prefill.
+
 ## Inherited RTX 5090 campaigns
 
 Tested Git revisions for the inherited campaigns:

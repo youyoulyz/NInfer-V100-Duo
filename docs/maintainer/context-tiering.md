@@ -1,14 +1,99 @@
 # 上下文两层寄存（host RAM + NVMe）
 
-**状态**：移植中，未实现。P1（计价/决策层，§7.3）与 P2（Program 权能接口决策，§7.4）已落定，
-下一步 P3。这是 active work 的**取回/移植计划与目标契约**，不是已交付能力，也不是一份从零设计。
-**先例**：T1（host RAM 层）是本条线上游的既有能力，被 `7028d96a` 删除；T2（NVMe 层）在同源
-3090 线上已实现。取回面已在 §3 量化：18 个文件、14,748 行，其中计价/决策层在本树**已经存在
-且与上游逐字节相同**，只是没有调用者。
+**状态**：**已落地并验证**（retained 上下文的寄存与恢复）。本文是这项能力的当前权威：契约、
+落点、实测证据、验证门，以及明确未做的部分。§3–§7 保留最初的取回/移植推演，用来解释为什么
+落点是现在这样；其中**没有执行**的清单已在 §7.8/§7.9 与开头注明，不要当成计划执行。
 
-本文修订 [Paged KV Context Store](paged-kv-cache.md) §1.1 —— 那里把 `swap、KV offload`
-列为 non-goal；本计划把它变成一条有明确契约的能力。范围只覆盖 **retained（空闲）上下文的
-寄存与恢复**，不覆盖 active request 的抢占，也不改变单请求的上下文上限。
+**范围**：只覆盖 **retained（空闲）上下文的寄存与恢复**，不改变单请求的上下文上限，
+也不覆盖 active request 的抢占。位置语义是**搬迁**而不是预留：寄存后 device 页被释放，
+恢复时写到新的物理页，所以 image 从不依赖原页号。
+
+本文修订 [Paged KV Context Store](paged-kv-cache.md) §1.1 与
+[小规模并发推理架构](concurrent-inference-architecture.md) §1.2 —— 那里把 `swap、KV offload`
+列为 non-goal，现在它是一条有明确契约的能力。
+
+## 0. 现在的能力（已落地）
+
+### 0.1 形状
+
+淘汰不再等于丢弃。一条 retained lane 被淘汰时按三层寄存器处理：
+
+| 层 | 载体 | 进入 | 回到 device |
+|---|---|---|---|
+| L1 device | paged KV pool | — | — |
+| L2 host RAM（pinned） | `HostKVArena` + `HostLinearStateArena` | `evict_retained_lane` → `park_lane` | `restore_lane` |
+| L3 NVMe | `DiskKVBridge`：内容寻址 64-token 块 + state image | `spill_device_prefix` / `spill_parked_prefix` | `restore_lane_from_disk` |
+
+一次寄存搬运的是**整个可继续状态**：两个 rank 的 Main Text KV、MTP KV、两个 rank 的 GDN 线性
+注意力 state、hidden 行，以及 ledger/prefix 元数据。GDN state 不能从 KV 前缀重建，所以 image
+必须包含它，这也是 image 远大于 KV 本身的原因。
+
+**逐出完整性（本轮落地）**：任何一条 retained lane 在 device 页被回收前，字节一定先落到下一层。
+
+- admission pass 只寄存**别的** retained lane；请求自己要用的那条 lane，由
+  `start_prefill_lane` 在被覆写之前 `spill_device_prefix` 出去。
+- `park_lane` 成功后就地 `spill_parked_prefix`，所以 L2 里的每条 lane 在 L3 上都已有记录。
+- `evict_retained_lane` 在 L2 装不下时，先 `spill_device_prefix` 再 `clear_lane`。
+- 磁盘命中失败（读失败、校验失败、链不完整）一律退化为 recompute，不是错误结果。
+- `forward-only`：`disk_kv_path` 为空时，以上路径全部是空操作，行为与加这一层之前逐字节相同。
+
+### 0.2 磁盘身份
+
+- **键**：`DiskKVIdentity{lo,hi,tag,frontier}`。`{lo,hi}` 是 `PrefixDigests` 在 `frontier` 处的
+  前缀摘要——**每 token 一条滚动摘要**，是前 `frontier` 个 token 及其 token_type、position 轴、
+  以及在该 frontier 折入的 rewrite checkpoint / Vision item 的纯函数。
+- **块**：KV 按 64-token 块存，块的键取**块末**的摘要；链的前缀纯度因此可以直接比对。
+- **tag**：`identity_tag(backend, proposal_head, storage)`；TP2 下 rank r 用 `tag | (r << 24)`，
+  因为每个 rank 持有同一批 token 的不同分片。一条 frontier 只有**所有 rank 的分片都在**才可恢复。
+- **state image**：按 `frontier` 寻址（不分 rank），是唯一让恢复合法的 commit——链可以先写，
+  只有 image 落地才发布这个 frontier。
+
+### 0.3 哪两个 frontier 可恢复
+
+一条 lane 换出时写**两个 tap**：
+
+1. **prompt frontier**（就是 rewrite checkpoint 的 frontier）：整条 prompt 结束时捕获的 state。
+   同一个 prompt 再来、或后续 turn 把它当前缀，都落在这一点上。
+2. **channel end**（`execution_frontier`）：本条 lane 最后提交 token 之后的状态。下一个 turn 的
+   prompt 原样包含上一次生成的响应（`preserve_thinking=true` 的 ResponseReplay），所以它也落在
+   这一点上。
+
+两个 tap 覆盖的正是"同一段内容的下一次请求"。其余 frontier 没有 state image，也就不可恢复——
+对 GDN 模型这是硬约束：没有 state 的 KV 前缀单独无法使用。
+
+### 0.4 实测（2 × Tesla V100-SXM2 16GB、TP2、27B NVFP4、MTP3、INT8-G64 KV）
+
+| 量 | 结果 |
+|---|---|
+| host KV park（132 MiB） | 42.0 ms（3.14 GB/s，PCIe Gen3 上限附近） |
+| host KV restore（132 MiB ×2） | 82.8 ms（3.19 GB/s） |
+| GDN linear state park（146.8 MiB） | 46.7 ms（3.14 GB/s） |
+| host tier 端到端（1943-token 前缀、2 lane 池、`host_context_bytes=256 MiB`） | 单 lane image 379,142,144 B；三种 arena 全部计入 RSS（+891 MiB）；恢复后的续写与"从不 swap"对照**逐 token 相同**，`computed_prefill_tokens` 增量 **0** |
+| NVMe tier 端到端（同场景 + `disk_kv_path`） | 两次逐出落盘 763,723,776 B；**销毁 engine**（host arena、device 页、parked image、resident 元数据全部消失）后重开同一目录，两条前缀各自从 NVMe 恢复：**0 个 prefill token**、`reused_prompt_tokens` = prompt frontier、续写与冷跑**逐 token 相同**，TTFT 2.92 s / 5.91 s 冷 → **0.124 s / 0.193 s** 从盘上回来（冷跑的对照值在并发 prefill 下取得，所以这个倍数偏保守） |
+
+### 0.5 目标形态：10 × 150K 的算术
+
+本机 150K lane ≈ 2.51 GiB INT8 KV/device（16.5 KiB/token/device），加 state image 后约
+2.6 GiB/device。
+
+| 层 | 预算（本机） | 装得下的 150K lane |
+|---|---|---|
+| L1 device | ~5.5 GiB/device 空闲 | 2（显存限制，不是策略限制） |
+| L2 host RAM | `host_context_bytes`（30 GB 内存下可给 ~24 GB） | ~9 |
+| L3 NVMe | `disk_kv_bytes`（默认 64 GiB） | ~24 |
+
+所以"10 个 150K 对话不 re-prefill"在容量上可达：device 装 2 条，其余在 host/NVMe 上轮转，
+回到前台时从下层搬回；只有 L2 与 L3 都装不下的才会真的 recompute。代价是延迟不是正确性——
+PCIe Gen3 x4（~3 GB/s）单向搬 2.6 GiB 约 0.9 s，而这条 prompt 的冷 prefill 在 V100 上是分钟级。
+
+两条注意：
+
+- **`max_concurrency` 仍是 8**（产品语义未变）：同时 active 的请求还是 8 条，10 条 150K 是
+  "10 段会话轮流活动"，不是"10 条同时 decode"。同时驻留的 150K lane 数受 device 显存限制，
+  本机是 2。
+- **L2 的实际占用不止 `host_context_bytes`**：它只约束 KV arena。线性 state arena 按
+  `lane 数 × rank 数 × 每个 slot 的布局` 定容（27B、TP2、8 lane、两个 slot ≈ 2.4 GB），
+  staging 也是常驻的。给 `host_context_bytes` 定预算时要把这两块加进去。
 
 ---
 
@@ -119,6 +204,11 @@ V100 线上唯一在推进缓存准入的是 `mylordmonkeyman/ninfer-v100`（`ho
 ---
 
 ## 3. 移植面（量化）
+
+> **本节的定位**：这是最初写下的取回清单，用来量化工作量、判断可行性。实际落地**没有**按它
+> 逐文件取回（见 §0 与 §7.8）：`engine_core.h`、`logical_kv_store.h`、`host_kv_extent_store.h`、
+> `pressure_planner.h`、`state_image_store.h` 都没有进本树，对应能力改由本树已有的
+> `paged_kv_cache` / `host_kv_*` / `disk_kv_*` 原语提供。这一节保留下来只是为了解释当时的判断。
 
 从 12 个种子头文件出发、按 `#include` 依赖做传递闭包，得到下面的取回集合。
 数字都是 `upstream/master` 的行数。
@@ -697,7 +787,16 @@ lane，再提交一条约 2746 token 的第三前缀把它挤出池子。
 `bind_sequence_kv`，触发"already bound"。按 `HostKVOffload::restore` 的契约（"调用方负责重
 发布映射，本方法既不 bind 也不同步"）删掉前者即可。
 
-仍未做：投影到 T2/NVMe（§7.8），以及把 tier 成本喂进 `ContextPortfolioValue`（§7.1）。
+#### 已落地（P3 第三块：逐出完整性 + NVMe 端到端，本轮实测）
+
+上一块把 lane 镜像落到 host RAM，但"淘汰"本身还有两个洞：admission pass 只寄存**别的**
+retained lane（请求自己要用的那条被直接丢掉），而 host arena 满时整条 lane 也只是被
+`clear_lane`。这一块把两处都补成"先落到下一层再释放"，并把 NVMe 层接到同一条路径上。
+
+要点、落点与实测见 §0（尤其 §0.1 的逐出完整性、§0.4 的 NVMe 端到端表、§7.8 的接线说明）。
+
+**仍未做**：把 tier 成本喂进 admission/`ContextPortfolioValue` 的取舍（§7.1），
+host arena 自身的回收策略（§9），以及 CLI/serve 的开关（§7.9）。
 
 #### 取回清单
 
@@ -856,34 +955,67 @@ Linux 上留 `false` 即可，代码零改动。
 GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的概念；本树没有这些对象，
 也超出"前缀指引的 chunk 存储管理"的范围。
 
-**引擎接线（P6 剩余）**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是它们
-`ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
-`LogicalKVPageHandle`、snapshot 模型、`context_cache.disk_kv_path`）。本树落点是
-`ProgramImplCore::park_lane/restore_lane` + 三块 host arena，并把 `BlockIndex` 的 `copies`
-接到 device/host/disk 三层。
+**引擎接线已落地（本轮）**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是
+它们 `ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
+`LogicalKVPageHandle`、snapshot 模型），与本树的两层 pool 结构性不兼容，所以**没有整文件取回**，
+而是把它的语义落到本树已有的原语上：
+
+- `EngineOptions::disk_kv_path` / `disk_kv_bytes` → `SequencePlanningInputs` →
+  `SequencePlanImpl` → `ProgramImplCore` 构造尾部 `enable_disk_tier`。`disk_kv_path` 非空时要求
+  host tier 已开启（恢复要读 hidden 行），且后端只支持 MTP（DFlash 的 lane 恢复走它自己的
+  context cache，磁盘层不携带）。
+- `qwen3_6::detail::LaneDiskTier`（`impl/runtime/lane_disk_tier.{h,cpp}`）：按 64-token 块写入
+  每个 rank 的链，最后写 state image 作为 commit（`spill_pages` / `spill_state`）。同一份
+  batch 接口既服务 device 侧（`spill_device_prefix`）也服务 host 侧（`spill_parked_prefix`，
+  直接从 parked image 流式写出）。`plan_resume` 在**本 prompt 自己的摘要**下找最深的、
+  每个 rank 链完整且 image 存在的 frontier。`allow_eviction=false`：磁盘族满了就让这次 spill
+  失败，绝不挤掉另一条对话仍在恢复的记录。
+- 恢复：`plan_request_base` 每个请求探测一次 `disk_restorable_frontier(prompt)`，把
+  `FullReset` 改写成该 frontier 上的 `AppendAtFrontier`；`start_prefill_lane` 先把 lane 清空
+  （同时把它自己那条 retained 前缀 spill 出去），再 `restore_lane_from_disk`：逐 batch 读进
+  staging image → H2D → 重发布 block table，最后读 state image 决定 frontier。任一步失败就
+  退化成冷 prefill。磁盘方案按**它可能退化的那次冷 prefill**计价（`service_base = 0`、
+  `reusable_prompt_tokens = 0`），因为只有真去读字节的那一次才知道是命中还是 miss。
+- `MemorySummary` 新增 `disk_tier_capacity_bytes` / `disk_tier_used_bytes` /
+  `disk_tier_restores`，让"这次是从盘上回来的"可以直接读出来。
+
+**没有**把 `BlockIndex` 接成引擎的第二套权威。磁盘层的 `DiskKVStore` 索引已经按内容
+（`{lo,hi,tag,frontier}`）回答"有没有、在哪"；device 驻留由 lane 自己的
+`PagedKVAllocation` 回答，host 驻留由 `parked_images_` 回答。再加一层 `BlockIndex` 会是同一
+事实的平行副本，而 per-block 的 device/host 驻留目前**没有消费者**。`BlockIndex` 仍是纯身份/
+拓扑层（`copies` 位留给未来真的要用块级驻留的那个调用方）。
 
 ### 7.9 P7 — 文档与 CLI
 
-- 取回上游 `docs/maintainer/resource-scheduling-and-context-cache.md`（1028 行）作为本计划的
-  上级权威，删掉本文与之重复的部分——**一个当前权威，不留平行文档**。
-- 修订 `paged-kv-cache.md` §1.1 与 `concurrent-inference-architecture.md`，把 swap 从
-  non-goals 里拿掉，写上 tier 契约。
-- `docs/performance.md` 加 context-switch 表（park/restore 延迟与字节 vs re-prefill）。
-- CLI/serve：先对齐上游 `--device-state-slots`、`--host-state-slots`、`--host-kv-mib`
-  （上游 `src/serve/serve_options.cpp:76,219`）；再加 `--context-tier-nvme <path:size>`。
-  同步 `--help` 与 `serve_usage_text` 测试。
+**文档（本轮已收口）**：
 
-### 7.10 工时估计与里程碑
+- 本文改写为当前权威：§0 记已交付能力与实测，§7.8 记 NVMe 接线，§9 记风险，本节记未做。
+- `paged-kv-cache.md` §1.1、`concurrent-inference-architecture.md` §1.2 把 swap/KV offload 从
+  non-goal 里拿掉，改为指向本文。
+- `docs/performance.md` 增 context-tier 小节（park/restore 带宽与 0-re-prefill 端到端）。
+- `docs/README.md` 把本文从"待实现"挪进 maintainer references。
+- **没有**取回上游 `resource-scheduling-and-context-cache.md`（1028 行）：它描述的是上游的
+  `resource_manager` 形态，与本文 §0 的落点不是一回事，取回会造出第二套平级权威。
 
-| 里程碑 | 内容 | 累计估计 |
+**CLI（未做）**：`host_context_bytes` 与 `disk_kv_path`/`disk_kv_bytes` 目前只有 C++ API
+（`EngineOptions`）能设，`apps/cli` 与 `ninfer-serve` 都没有对应选项，也就是说**产品命令行还
+打不开这两层**。要对齐上游就是 `--host-kv-mib`（直接映射 `host_context_bytes`）与
+`--context-tier-nvme <path:size>`（`disk_kv_path` + `disk_kv_bytes`），再同步 `--help` 与
+`serve_usage_text` 测试。上游的 `--device-state-slots`/`--host-state-slots` 对应本树没有的对象，
+不取回。
+
+### 7.10 工时估计与里程碑（事后回看）
+
+| 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M1 | P1 完成：`ninfer_resource_manager_test` 全绿 | 3–5 人日 |
-| M2 | P2 决策落定（含 `host_kv_arena` 对接探测） | 4–7 人日 |
-| M3 | P3 完成：park→restore 逐字节 / 逐 token 正确 | 12–22 人日 |
-| M4 | P4 + P5 完成：单卡回退无、双卡 park/restore 正确 | 19–36 人日 |
-| M5 | P6 + P7 完成：NVMe 下沉 + 文档/CLI 收口 | 26–49 人日 |
+| M1 | P1 计价/决策层：`ninfer_resource_manager_test` 全绿 | ✅ |
+| M2 | P2 权能接口决策；`host_kv_arena` 对接 | ✅ |
+| M3 | P3 park→restore 逐字节 / 逐 token 正确（含逐出完整性） | ✅ |
+| M4 | P4 + P5：见 §7.6/§7.7 | 本树**没有**取回 `engine_core.h`，也没有重做 TP2 peer 锁步；host tier 直接接在现有引擎壳（`evict_retained_lane` + admission policy + `start_prefill_lane`）上，双卡由 `ranks = 2` 的逐 rank 分片覆盖 |
+| M5 | P6 + P7 | NVMe 下沉 ✅；CLI ✗（见 §7.9） |
 
-区间宽度主要由 P2 的 (a)/(b) 选择决定：(b) 落在下沿，(a) 因需重做 TP2 peer 锁步而靠上沿。
+最初的区间主要被 P2 的 (a)/(b) 选择支配；实际按 (b) 走通，且 P4/P5 用更小的改动达成，
+没有出现"重接约 9k 行 Program 逻辑"的那条分支。
 
 **建议的第一步就是 P1**：它不碰 CUDA、不碰存储、不需要 GPU，用一份只含一个 `#include`
 的测试文件就能验证整套权能接口定义是否正确。这是整条移植路径上最便宜的一次"方向对不对"检验。
@@ -907,7 +1039,12 @@ GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的
 - **瓶颈是 PCIe Gen3 x4（~3 GB/s），不是 NVMe。** 200k 上下文 ≈ 1.1 GB/设备 →
   单向 ~370 ms。比 re-prefill 快约 200×，但不再是零。
 - restore 在 claim 路径上；如果不能与 admission 交叠，就会串行化，收益被吞掉。
-- host slot 耗尽时仍然要丢——需要 T1 自己的 LRU。
+- **host arena 自己不回收**。`HostKVOffload` / `HostLinearStateArena` 只分配与释放，不会为了
+  新 lane 去挤掉旧 lane。L2 满时这一次 park 失败，该 lane 降级到 L3（它已经有记录），恢复变成
+  一次磁盘读而不是 host 读——**开了 NVMe 层就不丢前缀，代价是延迟；只开 host 层才会真的丢。**
+  真正的 demotion 策略（按 parked 时间挤掉最老的一条）需要一个 executor 侧的 policy hook：
+  Program 无法在 `evict_retained_lane` 里作废另一条 lane 的缓存 plan，做错会把一个请求放上
+  没有 KV 的 lane。
 - 把 swap 从 non-goal 清单里拿掉是**产品契约变更**，文档与测试必须同步移动。
 - **最大不确定点是 P2**：若 (b) 失败转 (a)，改动面会从"补 8 个 Program 方法"跳到
   "重接约 9k 行 Program 逻辑"，并连带重做 TP2 peer 锁步。这是本计划唯一需要中途重新决策的门。

@@ -28,7 +28,8 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 ### 1.2 Non-goals
 
-- request preemption、swap 或 pause/resume；
+- request preemption 或 pause/resume（retained 上下文的 swap 不属于本节范围，见
+  [上下文两层寄存](context-tiering.md)）；
 - 多请求 batched prefill 或 prefill/decode mixed forward；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；

@@ -27,7 +27,10 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ### 1.1 Non-goals
 
-- request preemption、swap、KV offload 或跨 GPU storage；
+- request preemption 或跨 GPU storage。**retained（空闲）上下文的 swap / KV offload 不在本节的
+  non-goal 里**：它由 [上下文两层寄存](context-tiering.md) 定义契约（host RAM + NVMe 两层、
+  搬迁而非预留、image 必须含 GDN state），本文只规定它复用的 page ownership 与 reservation
+  accounting；
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
 - arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
