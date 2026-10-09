@@ -1,0 +1,62 @@
+{
+  "artifacts": {
+    "Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer": {
+      "answers": {
+        "anagram": "yes",
+        "capital": "Canberra",
+        "count_r": "3",
+        "followup": "Paris",
+        "french": "Bonjour",
+        "german": "German",
+        "gold": "Au",
+        "len": "3",
+        "mul": "391",
+        "percent": "30",
+        "power": "2 to the power of 9",
+        "reverse": "fedcba",
+        "sum10": "55"
+      },
+      "continuation_reuse_path": "restore_turn_checkpoint",
+      "identity": "qwen3.8-27b/groupwise-int"
+    },
+    "qwen3_8_27b_nvfp4.ninfer": {
+      "answers": {
+        "anagram": "yes",
+        "capital": "Canberra",
+        "count_r": "3",
+        "followup": "Paris",
+        "french": "Bonjour",
+        "german": "German",
+        "gold": "Au",
+        "len": "3",
+        "mul": "391",
+        "percent": "30",
+        "power": "2 to the power of 9",
+        "reverse": "fedcba",
+        "sum10": "55"
+      },
+      "continuation_reuse_path": "restore_turn_checkpoint",
+      "identity": "qwen3.8-27b/nvfp4"
+    },
+    "swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer": {
+      "answers": {
+        "anagram": "yes",
+        "capital": "Canberra",
+        "count_r": "3",
+        "followup": "Paris",
+        "french": "Bonjour",
+        "german": "German",
+        "gold": "Au",
+        "len": "3",
+        "mul": "391",
+        "percent": "30",
+        "power": "2 to the power of 9",
+        "reverse": "fedcba",
+        "sum10": "55"
+      },
+      "continuation_reuse_path": "restore_turn_checkpoint",
+      "identity": "qwen3.8-27b/nvfp4"
+    }
+  },
+  "version": 1
+}
