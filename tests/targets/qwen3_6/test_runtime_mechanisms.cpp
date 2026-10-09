@@ -5,7 +5,9 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
+#include "runtime/prefix_cache/block_hash.h"
 #include "targets/qwen3_6/impl/runtime/identity.h"
+#include "targets/qwen3_6/impl/runtime/block_keys.h"
 #include "targets/qwen3_6/impl/runtime/identity_tag.h"
 #include "targets/qwen3_6/impl/runtime/prefix_digests.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -310,6 +312,78 @@ void test_prefix_identity() {
 }
 
 
+q36::PreparedPromptData block_prompt(std::size_t tokens, std::uint8_t digest_byte,
+                                     bool with_vision) {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids.resize(tokens);
+    for (std::size_t index = 0; index < tokens; ++index) {
+        prompt.token_ids[index] = static_cast<ninfer::TokenId>(1000 + index);
+    }
+    prompt.token_types.assign(tokens, 0);
+    prompt.positions.resize(3 * tokens);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t index = 0; index < tokens; ++index) {
+            prompt.positions[axis * tokens + index] = static_cast<std::int32_t>(index);
+        }
+    }
+    if (with_vision) {
+        q36::VisionItem item{.modality    = q36::PromptModality::Image,
+                             .grid        = {.temporal = 1, .height = 4, .width = 4},
+                             .patch_begin = 0,
+                             .patch_count = 16,
+                             .token_spans = {{.begin = 70, .count = 30}}};
+        item.content_digest.fill(digest_byte);
+        prompt.vision_items.push_back(std::move(item));
+    }
+    return prompt;
+}
+
+void test_block_keys() {
+    namespace pc                 = ninfer::runtime::prefix_cache;
+    const q36::PreparedPromptData prompt = block_prompt(192, 1, true);
+    std::vector<std::uint64_t> hashes;
+    std::vector<std::uint64_t> extras;
+    q36::detail::prompt_block_keys(prompt, hashes, extras);
+    expect(hashes.size() == 3, "three full blocks produce three hashes");
+    expect(extras.size() == 3, "a media prompt carries one extra per full block");
+    expect(hashes == pc::block_lookup_hashes(prompt.token_ids, extras),
+           "prompt_block_keys agrees with the raw chain");
+    expect(extras[0] == 0 && extras[1] != 0 && extras[2] != 0,
+           "the Vision key starts at the block its token range opens in");
+
+    const std::vector<q36::detail::VisionTokenRange> ranges = q36::detail::vision_ranges(prompt);
+    expect(ranges.size() == 1 && ranges[0].begin == 70 && ranges[0].end == 100,
+           "a Vision range runs from its first token to its last span end");
+
+    std::vector<std::uint64_t> text_hashes;
+    std::vector<std::uint64_t> text_extras;
+    q36::detail::prompt_block_keys(block_prompt(192, 1, false), text_hashes, text_extras);
+    expect(text_extras.empty(), "a text-only prompt carries no extras");
+    expect(text_hashes[0] == hashes[0], "media opening in a later block leaves an earlier hash");
+    expect(text_hashes[1] != hashes[1], "media identity enters the block it opens in");
+
+    std::vector<std::uint64_t> other_hashes;
+    std::vector<std::uint64_t> other_extras;
+    q36::detail::prompt_block_keys(block_prompt(192, 2, true), other_hashes, other_extras);
+    expect(other_extras[1] != extras[1], "different media content yields a different block key");
+    expect(other_hashes[1] != hashes[1], "different media content changes the chained hash");
+
+    const std::uint64_t first_key  = q36::detail::accumulate_vision(0, 7U);
+    const std::uint64_t second_key = q36::detail::accumulate_vision(first_key, 9U);
+    expect(first_key != 0 && first_key != 7U, "the cumulative Vision key is seeded");
+    expect(second_key != first_key, "each Vision item shifts the cumulative key");
+
+    bool threw = false;
+    try {
+        q36::PreparedPromptData broken = block_prompt(64, 1, false);
+        broken.vision_items.push_back(q36::VisionItem{});
+        (void)q36::detail::vision_ranges(broken);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    expect(threw, "a Vision item without a token span is rejected");
+}
+
 void test_prefix_digests() {
     const q36::PreparedPromptData prompt = identity_prompt();
     q36::detail::PrefixDigests digests;
@@ -466,6 +540,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_prefix_digests();
+    test_block_keys();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
