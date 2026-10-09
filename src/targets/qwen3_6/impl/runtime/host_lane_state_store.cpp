@@ -16,8 +16,8 @@ HostLaneStateStore::HostLaneStateStore(std::vector<HostKVPageLayout> kv_layouts,
     if (lane_count == 0) {
         throw std::invalid_argument("Host lane state store needs at least one lane");
     }
-    if (rank_count == 0 || rank_count > lane_count) {
-        throw std::invalid_argument("Host lane state store needs one linear image per rank");
+    if (rank_count == 0) {
+        throw std::invalid_argument("Host lane state store needs at least one rank");
     }
     if (hidden_bytes == 0) {
         throw std::invalid_argument("Host lane state store needs a positive hidden width");
