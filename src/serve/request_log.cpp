@@ -113,6 +113,19 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    // Planner-selected source path (materialization catalog); not produced by the Engine yet.
+    case ninfer::PrefixReusePath::Root:
+        return "root";
+    case ninfer::PrefixReusePath::PrivateEndpoint:
+        return "private_endpoint";
+    case ninfer::PrefixReusePath::PrivateTurnClosure:
+        return "private_turn_closure";
+    case ninfer::PrefixReusePath::PrivateResponseReplay:
+        return "private_response_replay";
+    case ninfer::PrefixReusePath::PrivateLongAnchor:
+        return "private_long_anchor";
+    case ninfer::PrefixReusePath::SharedStablePrefix:
+        return "shared_stable_prefix";
     }
     return "unknown";
 }

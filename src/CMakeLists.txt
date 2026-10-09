@@ -27,6 +27,8 @@ add_library(ninfer_core STATIC
   core/tensor.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
+  runtime/engine/context_cost.cpp
+  runtime/engine/context_cost_defaults.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp)
