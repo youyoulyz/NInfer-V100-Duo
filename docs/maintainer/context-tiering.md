@@ -821,7 +821,7 @@ Linux 上留 `false` 即可，代码零改动。
 （上游 `ProgramImpl::disk_identity`，`tag = capture_identity_tag()`）。**修正本计划原先的
 误判**：上游另有一条 64-token 分块链 `runtime::prefix_cache::block_hash`
 （`h(b) = xxh3_64(h(b-1) || tokens || extra)`，命中还要精确比 tokens），那是 Hybrid 常驻
-索引的判据，**不是**磁盘 key，这一步用不到。本树已落：
+索引的判据，**不是**磁盘 key。本树已落：
 
 - `src/targets/qwen3_6/impl/runtime/prefix_digests.{h,cpp}`：`PrefixDigests`，与上游
   `PrefixShortlistDigests` 同算术、同域分隔、同顺序（rewrite checkpoint 在它关闭的
@@ -834,10 +834,33 @@ Linux 上留 `false` 即可，代码零改动。
   wire-format golden）。它仍是**短名单**：真正复用判据是逐 token 的 `ResidentPrefixIdentity`，
   摘要碰撞只退化为一次比较，绝不产生假命中。
 
+**块级索引层已落地（本轮 · 按 B 走）**。T2 粒度选 B：按 64-token 块索引，命中比整条 lane
+镜像更细。已落：
+
+- `src/runtime/prefix_cache/block_hash.{h,cpp}`：`kBlockTokens` / `kRootLookupHash` /
+  `block_lookup_hash` / `block_lookup_hashes`，自上游**逐字节照抄**（只依赖 `ninfer/types.h`）。
+- `src/runtime/prefix_cache/block_index.{h,cpp}`：`BlockIndex`，取自上游 `PrefixCacheIndex`
+  节点树的可分核——`child_key` 把父节点混进 key、扁平 multimap 选桶、命中永远精确比
+  `parent/hash/extra/tokens`、句柄带 generation、`remove_subtree` 让整棵失效；另加
+  `BlockCopy{Device,Host,Disk}` 记录块字节在哪一层。**索引只持有身份与拓扑**，字节的搬运与
+  驻留由 tier 负责。
+- `src/targets/qwen3_6/impl/runtime/block_keys.{h,cpp}`：`vision_ranges` /
+  `accumulate_vision` / `prompt_block_keys`，自上游 `block_keys` 适配到本树
+  `PreparedPromptData`（同 key 算术与顺序）。
+- 测试：`ninfer_block_index_test`（链式哈希的前缀纯度、extras 覆盖、强制同哈希不假命中、
+  同 tokens 异 extra 必 miss、句柄 generation、子树删除）；
+  `test_runtime_mechanisms.cpp` 的 `test_block_keys`（Vision key 在它开启的块起效、异内容异
+  key、文本 prompt 无 extras）。
+
+**没抄的部分（明确不做）**：上游 `prefix_index.cpp`（1637 行）里的 snapshot / tap /
+GDSF / host slab / device slot / 持久化，是 Hybrid 模式（HPC）专门的概念；本树没有这些对象，
+也超出"前缀指引的 chunk 存储管理"的范围。
+
 **引擎接线（P6 剩余）**。上游 `models/qwen3_5/program/storage/disk_tier.cpp`（~600 行）是它们
 `ProgramImpl` 的成员，接的是它们 Hybrid 的 storage（`physical_pool()`、
 `LogicalKVPageHandle`、snapshot 模型、`context_cache.disk_kv_path`）。本树落点是
-`ProgramImplCore::park_lane/restore_lane` + 三块 host arena。
+`ProgramImplCore::park_lane/restore_lane` + 三块 host arena，并把 `BlockIndex` 的 `copies`
+接到 device/host/disk 三层。
 
 ### 7.9 P7 — 文档与 CLI
 
