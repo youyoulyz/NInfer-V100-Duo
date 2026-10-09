@@ -5,10 +5,17 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
+#include "targets/qwen3_6/impl/runtime/identity.h"
+#include "targets/qwen3_6/impl/runtime/identity_tag.h"
+#include "targets/qwen3_6/impl/runtime/prefix_digests.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <utility>
 #include <iostream>
 #include <string_view>
 #include <vector>
@@ -302,6 +309,153 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+
+void test_prefix_digests() {
+    const q36::PreparedPromptData prompt = identity_prompt();
+    q36::detail::PrefixDigests digests;
+    digests.assign(prompt);
+    expect(digests.size() == prompt.token_ids.size(), "digest has one entry per frontier");
+    expect(digests.at(0) == (std::array<std::uint64_t, 2>{1469598103934665603ULL,
+                                                          7809847782465536322ULL}),
+           "digest frontier zero is the seed");
+
+    // A fixed wire format: the golden below was produced by an independent transcription of the
+    // sibling line's algorithm, so a refactor that silently rekeys every stored page fails here.
+    const std::array<std::array<std::uint64_t, 2>, 5> golden{{
+        {0x14650fb0739d0383ULL, 0x6c62272e07bb0142ULL},
+        {0x262fc1d227b27188ULL, 0x87481bd9956012d5ULL},
+        {0x7e8c2767f8b60e3aULL, 0x7660bc00fa1210cfULL},
+        {0x8f2e57777ab77754ULL, 0xd3531877496f52f0ULL},
+        {0x5f39c6bfb181be25ULL, 0x7cb0d137e01b17abULL},
+    }};
+    for (std::size_t frontier = 0; frontier < golden.size(); ++frontier) {
+        expect(digests.at(frontier) == golden[frontier], "digest wire-format golden");
+    }
+
+    q36::detail::PrefixDigests repeat;
+    repeat.assign(identity_prompt());
+    expect(repeat.image() == digests.image(), "digest is a pure function of the prompt");
+
+    // Only the prefix may reach a frontier: a different fourth token leaves frontier 3 intact.
+    q36::PreparedPromptData changed_suffix = identity_prompt();
+    changed_suffix.token_ids[3] = 12;
+    q36::detail::PrefixDigests suffix_digests;
+    suffix_digests.assign(changed_suffix);
+    expect(suffix_digests.at(3) == digests.at(3),
+           "a later token does not disturb an earlier frontier");
+    expect(suffix_digests.at(4) != digests.at(4), "a different token changes its frontier");
+
+    q36::PreparedPromptData changed_type = identity_prompt();
+    changed_type.token_types[0] = 1;
+    q36::detail::PrefixDigests type_digests;
+    type_digests.assign(changed_type);
+    expect(type_digests.at(1) != digests.at(1), "token type is part of the digest");
+
+    q36::PreparedPromptData changed_position = identity_prompt();
+    changed_position.positions[0] += 1;
+    q36::detail::PrefixDigests position_digests;
+    position_digests.assign(changed_position);
+    expect(position_digests.at(1) != digests.at(1), "MRoPE position is part of the digest");
+
+    // A Vision item enters at the frontier its last span closes, not at its first token.
+    q36::detail::PrefixDigests media_digests;
+    media_digests.assign(identity_prompt(2));
+    expect(media_digests.at(2) == digests.at(2), "media folds in only at its span end");
+    expect(media_digests.at(3) != digests.at(3), "media content is part of the digest");
+
+    // A rewrite checkpoint keys the frontier it closes, so a replay still shortlists under it.
+    q36::PreparedPromptData checkpointed = identity_prompt();
+    checkpointed.identity.rewrite_checkpoint =
+        q36::RewriteCheckpointSpec{.kind = q36::RewriteCheckpointKind::TurnClosure, .frontier = 2};
+    q36::detail::PrefixDigests checkpoint_digests;
+    checkpoint_digests.assign(checkpointed);
+    expect(checkpoint_digests.at(1) == digests.at(1),
+           "a checkpoint does not key an earlier frontier");
+    expect(checkpoint_digests.at(2) != digests.at(2), "a rewrite checkpoint keys its frontier");
+    expect(checkpoint_digests.at(3) != digests.at(3), "a rewrite checkpoint carries forward");
+
+    // Generated tokens extend the image the same way a rebuilt prompt would.
+    q36::detail::PrefixDigests appended;
+    appended.assign(prompt);
+    const std::array<ninfer::TokenId, 2> generated{7, 8};
+    appended.append_generated(generated, 0);
+    q36::PreparedPromptData extended = identity_prompt();
+    append_text_token(extended, 7, 4);
+    append_text_token(extended, 8, 5);
+    q36::detail::PrefixDigests rebuilt;
+    rebuilt.assign(extended);
+    expect(appended.image() == rebuilt.image(), "generated append matches a rebuilt prompt");
+
+    q36::detail::PrefixDigests truncated;
+    truncated.assign(extended);
+    truncated.truncate(prompt.token_ids.size());
+    expect(truncated.image() == digests.image(), "truncate returns to the prompt frontier");
+
+    q36::detail::PrefixDigests restored;
+    restored.restore(digests.image());
+    for (std::size_t frontier = 0; frontier <= digests.size(); ++frontier) {
+        expect(restored.at(frontier) == digests.at(frontier), "restore round-trips every frontier");
+    }
+
+    q36::detail::PrefixDigests swapped;
+    swapped.assign(prompt);
+    q36::detail::PrefixDigests emptied;
+    swapped.swap(emptied);
+    expect(swapped.size() == 0, "swap moves the image out");
+    expect(emptied.image() == digests.image(), "swap moves the image in");
+    emptied.clear();
+    expect(emptied.size() == 0, "clear drops the resident prefix");
+
+    // Malformed images and out-of-range frontiers are rejected, never silently trusted.
+    const auto expect_throws = [](auto&& body, const char* label) {
+        bool threw = false;
+        try {
+            body();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        expect(threw, label);
+    };
+    expect_throws([&] { q36::detail::PrefixDigests empty; (void)empty.at(0); },
+                  "at rejects an absent image");
+    expect_throws([&] { (void)digests.at(digests.size() + 1); },
+                  "at rejects a frontier past the resident prefix");
+    expect_throws([&] { q36::detail::PrefixDigests shallow; shallow.truncate(digests.size() + 1); },
+                  "truncate cannot extend");
+    expect_throws([&] {
+        std::vector<std::array<std::uint64_t, 2>> image = digests.image();
+        image.front() = {1U, 2U};
+        q36::detail::PrefixDigests bad;
+        bad.restore(std::move(image));
+    }, "restore rejects a missing seed");
+    expect_throws([&] {
+        std::vector<std::array<std::uint64_t, 2>> image = digests.image();
+        image[1][0] = 0;
+        q36::detail::PrefixDigests bad;
+        bad.restore(std::move(image));
+    }, "restore rejects a zero lane");
+    expect_throws([&] {
+        const std::array<ninfer::TokenId, 1> fresh_tokens{1};
+        q36::detail::PrefixDigests fresh;
+        fresh.append_generated(fresh_tokens, 0);
+    }, "append requires a resident prefix");
+
+    // The profile tag decides which bytes a key names, so it must pack the three fields exactly.
+    const std::uint32_t tag =
+        q36::detail::identity_tag(ninfer::SpeculativeBackend::DFlash,
+                                  ninfer::ProposalHead::Optimized,
+                                  ninfer::KvCacheStorage::Int8Group64);
+    expect(tag == (static_cast<std::uint32_t>(ninfer::SpeculativeBackend::DFlash) |
+                   (static_cast<std::uint32_t>(ninfer::ProposalHead::Optimized) << 8U) |
+                   (static_cast<std::uint32_t>(ninfer::KvCacheStorage::Int8Group64) << 16U)),
+           "identity tag packs backend | head << 8 | storage << 16");
+
+    const ninfer::DiskKVIdentity identity = q36::detail::make_identity(digests, tag, 3);
+    expect(identity.lo == digests.at(3)[0] && identity.hi == digests.at(3)[1] &&
+               identity.tag == tag && identity.frontier == 3,
+           "make_identity keys on the frontier digest and the profile tag");
+}
+
 } // namespace
 
 int main() {
@@ -311,6 +465,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_prefix_digests();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
