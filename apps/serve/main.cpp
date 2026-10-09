@@ -91,6 +91,13 @@ int main(int argc, char** argv) {
             capacity << " graph-peer=" << format_bytes(memory.cuda_graph_peer_observed_bytes)
                      << " graph-nodes=" << memory.cuda_graph_node_count;
         }
+        if (memory.host_tier_capacity_bytes != 0 || memory.disk_tier_capacity_bytes != 0) {
+            capacity << " host-tier=" << format_bytes(memory.host_tier_capacity_bytes)
+                     << " parked=" << format_bytes(memory.host_tier_parked_bytes)
+                     << " disk-tier=" << format_bytes(memory.disk_tier_capacity_bytes)
+                     << " live=" << format_bytes(memory.disk_tier_used_bytes)
+                     << " restores=" << memory.disk_tier_restores;
+        }
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads

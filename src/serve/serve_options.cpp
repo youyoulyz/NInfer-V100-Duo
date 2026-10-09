@@ -114,7 +114,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
+           "[--prefill-chunk N] [--host-kv-mib N] [--disk-kv-path DIR] [--disk-kv-mib N] "
+           "[--log-stats-interval-ms N] [--device N] [--tp 1|2] "
            "[--devices N,N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -142,6 +143,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768)\n"
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
+           "       --host-kv-mib N sizes the pinned host lane tier and --disk-kv-path DIR opens\n"
+           "       the content-addressed NVMe tier under it (--disk-kv-mib N, 0 for the engine\n"
+           "       default). A prefix displaced from the paged KV pool is stored instead of\n"
+           "       discarded, so a later request that reaches it resumes with no prefill.\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -294,6 +299,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--devices") {
             options.devices  = parse_devices(require_value("--devices"));
             devices_explicit = true;
+        } else if (arg == "--host-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-kv-mib is out of range");
+            }
+            options.host_kv_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--disk-kv-path") {
+            options.disk_kv_path = require_value("--disk-kv-path");
+        } else if (arg == "--disk-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--disk-kv-mib"), "disk-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--disk-kv-mib is out of range");
+            }
+            options.disk_kv_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

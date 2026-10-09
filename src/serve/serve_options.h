@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -49,6 +50,15 @@ struct ServeOptions {
     // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
     // --devices, or synthesized as {device} when --devices is omitted).
     std::vector<int> devices;
+    // Retained-prefix tiers. Both are host resources, so neither changes the device budget:
+    // `host_kv_bytes` sizes the pinned host lane tier (0 disables it, and the NVMe tier with it)
+    // and `disk_kv_path` names the content-addressed NVMe tier's directory, `disk_kv_bytes` its
+    // budget (0 selects the engine default). A prefix displaced from the paged KV pool is then
+    // stored rather than discarded, so a later request that reaches it resumes instead of
+    // re-prefilling, and with `disk_kv_path` the record also survives a restart.
+    std::size_t host_kv_bytes = 0;
+    std::filesystem::path disk_kv_path;
+    std::size_t disk_kv_bytes = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;

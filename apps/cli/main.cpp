@@ -302,6 +302,9 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
+        engine_options.host_context_bytes = cli.host_kv_mib << 20;
+        engine_options.disk_kv_path   = cli.disk_kv_path;
+        engine_options.disk_kv_bytes  = cli.disk_kv_mib << 20;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.vision_max_tokens = cli.vision_max_tokens;

@@ -127,6 +127,7 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
+           "       [--host-kv-mib N] [--disk-kv-path DIR] [--disk-kv-mib N]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
            "       [--no-cuda-graph]\n"
@@ -137,6 +138,10 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
            "independently of text context; smaller budgets reduce reserved Vision memory.\n"
+           "--host-kv-mib N sizes the pinned host lane tier and --disk-kv-path DIR opens the\n"
+           "content-addressed NVMe tier under it (--disk-kv-mib N, 0 for the engine default). A\n"
+           "prefix displaced from the paged KV pool is stored instead of discarded, so re-sending\n"
+           "it resumes with no prefill; with --disk-kv-path the record also survives a restart.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -209,6 +214,12 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--devices") {
             options.devices  = parse_devices(value(arg));
             devices_explicit = true;
+        } else if (arg == "--host-kv-mib") {
+            options.host_kv_mib = parse_u64(value(arg), "host-kv-mib");
+        } else if (arg == "--disk-kv-path") {
+            options.disk_kv_path = value(arg);
+        } else if (arg == "--disk-kv-mib") {
+            options.disk_kv_mib = parse_u64(value(arg), "disk-kv-mib");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

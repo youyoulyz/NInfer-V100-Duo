@@ -34,6 +34,15 @@ struct Options {
     // EngineOptions::devices.
     std::vector<int> devices;
 
+    // Retained-prefix tiers. Both are host resources, so neither changes the device budget:
+    // `host_kv_mib` sizes the pinned host lane tier (0 disables it, and the NVMe tier with it) and
+    // `disk_kv_path` names the content-addressed NVMe tier's directory, `disk_kv_mib` its budget
+    // (0 selects the engine default). With them, a prefix displaced from the paged KV pool is
+    // stored rather than discarded, so re-sending it is a transfer instead of a re-prefill.
+    std::size_t host_kv_mib = 0;
+    std::filesystem::path disk_kv_path;
+    std::size_t disk_kv_mib = 0;
+
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
