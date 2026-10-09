@@ -117,6 +117,12 @@ ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
+ninfer_add_test(ninfer_host_kv_arena_test
+  SOURCES test_host_kv_arena.cpp
+  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_context_tier_probe_test
+  SOURCES test_context_tier_probe.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)

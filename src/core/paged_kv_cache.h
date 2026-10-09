@@ -57,6 +57,8 @@ struct PagedKVPlaneSpec {
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+
+    friend bool operator==(const PagedKVPlaneSpec&, const PagedKVPlaneSpec&) = default;
 };
 
 enum class PagedKVPlaneOrder : std::uint8_t {
