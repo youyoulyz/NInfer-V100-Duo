@@ -46,6 +46,29 @@ Recorded with eight sessions at 192000 target tokens (194950 counted), `--max-co
 The per-session tier cost follows from the INT8 G64 KV layout (17952 B per token per device) plus
 the GDN state; size `--disk-kv-mib` for the whole pool.
 
+## Batch decode
+
+`batch_decode.py` measures the decode batch of already-resident prefixes: each shape `NxLENGTH`
+warms N prefixes, then times one round of N simultaneous requests with 64 decode tokens.
+`run-ladder.sh` restarts the server between shapes, because one server cannot host the whole
+ladder (see its header).
+
+Recorded on 2 x V100-SXM2-16GB, `--tp 2 --spec mtp --draft-tokens 3`, INT8 KV, one round per shape,
+prompt lengths as counted by `/v1/messages/count_tokens`:
+
+| Shape | Per-stream tok/s (min-max) | Aggregate tok/s (wall) | Aggregate tok/s (lockstep) | 1 stream tok/s | Uplift |
+|---|---|---|---|---|---|
+| 8 x 9983 | 36.9 (35-39) | 221.1 | 281.2 | 95.8 | 2.31x |
+| 8 x 20007 | 40.8 (40-43) | 228.6 | 316.5 | 104.8 | 2.18x |
+| 5 x 29975 | 43.9 (42-45) | 176.7 | 212.1 | 88.4 | 2.00x |
+| 4 x 39999 | 50.5 (49-53) | 167.9 | 195.5 | 84.8 | 1.98x |
+| 2 x 79624 | 76.4 (76-77) | 124.7 | 152.8 | 80.6 | 1.55x |
+
+Every measured request resumed its own prefix -- `reuse=restore_turn_checkpoint`, two-token
+prefill -- so no timed round paid a re-prefill. Aggregate decode is flat near 220 tok/s for eight
+lanes whatever the context length, while the per-stream rate falls as streams are added: decode is
+bandwidth-bound, so the batch buys about 2.3x over one stream rather than 8x.
+
 ## Reuse probe
 
 `reuse_probe.py` is the regression check for lane admission. It warms one retained prefix per lane
