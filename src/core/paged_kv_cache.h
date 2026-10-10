@@ -120,6 +120,12 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
+    // Copies one page group's bytes to another within every storage plane, in the given order. Used
+    // to privatize the last partial page of an adopted prefix, which a lane may then write into
+    // while the owner's copy keeps its own valid frontier. Ownership is the caller's business.
+    void copy_pages(std::span<const std::int32_t> destination,
+                    std::span<const std::int32_t> source, cudaStream_t stream = nullptr);
+
     // A read-only mapping of pages another allocation owns, published into a row of this pool's
     // block table. The owner keeps ownership; the pool only guarantees those page groups are not
     // handed to another allocation until every borrower has released them. A borrowed allocation

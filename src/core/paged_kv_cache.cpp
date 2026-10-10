@@ -204,6 +204,47 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
     }
 }
 
+void PagedKVPool::copy_pages(std::span<const std::int32_t> destination,
+                             std::span<const std::int32_t> source, cudaStream_t stream) {
+    if (destination.size() != source.size()) {
+        throw std::invalid_argument("Paged KV page copy extents differ");
+    }
+    if (destination.empty()) { return; }
+    const auto in_range = [&](std::span<const std::int32_t> pages) {
+        for (const std::int32_t page : pages) {
+            if (page < 0 || page >= static_cast<std::int32_t>(page_group_count())) { return false; }
+        }
+        return true;
+    };
+    if (!in_range(destination) || !in_range(source)) {
+        throw std::out_of_range("Paged KV copy page is out of range");
+    }
+
+    // Same addressing as zero_pages: a page occupies one contiguous nb[3] run when page-major, and
+    // one nb[2]-wide column per head when head-major.
+    for (std::size_t index = 0; index < destination.size(); ++index) {
+        for (const Tensor& plane : planes_) {
+            if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
+                auto* to = static_cast<unsigned char*>(plane.data) +
+                           static_cast<std::int64_t>(destination[index]) * plane.nb[3];
+                const auto* from = static_cast<const unsigned char*>(plane.data) +
+                                   static_cast<std::int64_t>(source[index]) * plane.nb[3];
+                CUDA_CHECK(cudaMemcpyAsync(to, from, static_cast<std::size_t>(plane.nb[3]),
+                                           cudaMemcpyDeviceToDevice, stream));
+            } else {
+                auto* to = static_cast<unsigned char*>(plane.data) +
+                           static_cast<std::int64_t>(destination[index]) * plane.nb[2];
+                const auto* from = static_cast<const unsigned char*>(plane.data) +
+                                   static_cast<std::int64_t>(source[index]) * plane.nb[2];
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    to, static_cast<std::size_t>(plane.nb[3]), from,
+                    static_cast<std::size_t>(plane.nb[3]), static_cast<std::size_t>(plane.nb[2]),
+                    static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+}
+
 std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
                                                   std::int32_t preferred_first) {
     if (count == 0) { return {}; }
@@ -542,8 +583,14 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
         if (change.allocation == nullptr || !change.allocation->valid()) {
             throw std::invalid_argument("Paged KV resize must name a live allocation");
         }
+        // A mapping that adopted a prefix may legitimately exceed its own entitlement: the pages
+        // below `owned_begin_` are charged to the allocation that still owns them. Only the region
+        // this allocation owns has to fit the new entitlement.
+        const std::uint32_t adopted = change.allocation->mapped_page_count() -
+                                      change.allocation->owned_page_count();
         if (change.mapped_pages > change.allocation->mapped_page_count() ||
-            change.mapped_pages > change.page_entitlement) {
+            change.mapped_pages < adopted ||
+            change.mapped_pages - adopted > change.page_entitlement) {
             throw std::invalid_argument("Paged KV resize extents are inconsistent");
         }
         for (std::size_t j = 0; j < i; ++j) {

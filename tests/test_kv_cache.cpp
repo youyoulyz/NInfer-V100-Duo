@@ -123,6 +123,78 @@ int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder ord
     return 1;
 }
 
+
+// Fills plane 0 with an offset-derived pattern, copies `source` onto `destination`, and then
+// compares every byte against the same pattern with only the destination runs overwritten. The
+// pattern makes an untouched byte, a stale byte, or a shifted copy all distinguishable.
+int expect_copied_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder order,
+                        std::initializer_list<std::int32_t> destination,
+                        std::initializer_list<std::int32_t> source, cudaStream_t stream,
+                        const char* label) {
+    const ninfer::Tensor& plane = pool.plane(0);
+    // A hash of the whole byte offset, not a small linear ramp: every page-aligned run of the pool
+    // has to be distinguishable from every other one, and a pattern whose period divides the page
+    // stride would make a misdirected copy compare equal.
+    std::vector<unsigned char> pattern(plane.bytes());
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = static_cast<unsigned char>(((i ^ (i >> 11)) * 2654435761ULL) >> 24);
+    }
+    cudaError_t err = cudaMemcpyAsync(plane.data, pattern.data(), pattern.size(),
+                                      cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " setup failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    pool.copy_pages(destination, source, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " synchronization failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    const auto runs = [&](std::int32_t page) {
+        std::vector<std::pair<std::size_t, std::size_t>> out;
+        if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
+            out.emplace_back(static_cast<std::size_t>(page * plane.nb[3]),
+                             static_cast<std::size_t>(plane.nb[3]));
+        } else {
+            for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                out.emplace_back(
+                    static_cast<std::size_t>(head * plane.nb[3] + page * plane.nb[2]),
+                    static_cast<std::size_t>(plane.nb[2]));
+            }
+        }
+        return out;
+    };
+
+    std::vector<unsigned char> expected = pattern;
+    const std::vector<std::int32_t> to_pages(destination);
+    const std::vector<std::int32_t> from_pages(source);
+    for (std::size_t index = 0; index < to_pages.size(); ++index) {
+        const auto to   = runs(to_pages[index]);
+        const auto from = runs(from_pages[index]);
+        if (to.size() != from.size()) {
+            std::cerr << label << " run geometry differs between planes\n";
+            return 1;
+        }
+        for (std::size_t run = 0; run < to.size(); ++run) {
+            std::copy_n(pattern.begin() + static_cast<std::ptrdiff_t>(from[run].first),
+                        static_cast<std::ptrdiff_t>(to[run].second),
+                        expected.begin() + static_cast<std::ptrdiff_t>(to[run].first));
+        }
+    }
+
+    std::vector<unsigned char> actual(pattern.size());
+    err = cudaMemcpy(actual.data(), plane.data, actual.size(), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << label << " copy failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    if (actual == expected) { return 0; }
+    std::cerr << label << " page copy did not land exactly on the destination pages\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -175,6 +247,13 @@ int main() {
     failures += check_shape(head_major_pool.plane(0), {128, 64, 10, 8}, "head-major paged plane");
     failures += expect_zeroed_pages(head_major_pool, ninfer::PagedKVPlaneOrder::HeadMajor,
                                     selected_pages, ctx.stream, "head-major selective zero");
+
+    // A page group can be relocated byte-for-byte inside the pool, in either plane order. This is
+    // what privatizes the one page an adopted prefix shares with its owner.
+    failures += expect_copied_pages(paged_pool, ninfer::PagedKVPlaneOrder::PageMajor, {0, 4}, {1, 5},
+                                    ctx.stream, "page-major page copy");
+    failures += expect_copied_pages(head_major_pool, ninfer::PagedKVPlaneOrder::HeadMajor, {0, 4},
+                                    {1, 5}, ctx.stream, "head-major page copy");
 
     auto allocation_a = paged_pool.reserve(3);
     auto allocation_b = paged_pool.reserve(3);
@@ -336,6 +415,40 @@ int main() {
     hybrid.trim_pages(3);
     failures += expect_size(hybrid.owned_page_count(), 1, "hybrid after trimming its suffix");
     failures += expect_size(hybrid_pool.free_pages(), 5, "free pages with the hybrid mapped");
+
+    // The owner's prefix is longer than the borrower's own entitlement: a resize may name a
+    // mapping that outruns the pages this allocation owns, as long as the owned region fits.
+    auto wide_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena wide_arena(wide_plan.bytes);
+    ninfer::PagedKVPool wide_pool({wide_arena.base(), wide_arena.capacity()}, wide_plan.layout);
+    auto wide_owner = wide_pool.reserve(4);
+    wide_owner.materialize_pages(4);
+    wide_owner.bind_row(0);
+    const std::vector<std::int32_t> borrowed(wide_owner.page_ids().begin(),
+                                             wide_owner.page_ids().end());
+    auto wide_borrower = wide_pool.reserve(1);
+    wide_borrower.adopt_prefix(borrowed);
+    wide_borrower.materialize_pages(5);
+    wide_borrower.bind_row(1);
+    failures += expect_size(wide_borrower.owned_page_count(), 1, "wide borrower owned pages");
+    failures += expect_size(wide_borrower.mapped_page_count(), 5, "wide borrower mapping");
+    failures += expect_device_page_ids(wide_borrower.block_table(), {0, 1, 2, 3, 4},
+                                       "wide borrower block table");
+    try {
+        wide_borrower.trim_pages(3);
+        ++failures;
+        std::cerr << "A wide adopted prefix was trimmed\n";
+    } catch (const std::logic_error&) {}
+    const ninfer::PagedKVResize wide_claim[] = {
+        {.allocation = &wide_borrower, .mapped_pages = 5, .page_entitlement = 1}};
+    ninfer::resize_paged_kv_bundle(wide_claim);
+    failures += expect_size(wide_borrower.page_entitlement(), 1, "wide borrower entitlement");
+    failures += expect_size(wide_borrower.mapped_page_count(), 5, "wide borrower resize");
+    failures += expect_size(wide_pool.borrowed_pages(), 4, "wide borrower borrows");
+    wide_borrower.release();
+    failures += expect_size(wide_pool.borrowed_pages(), 0, "wide borrower dropped its borrows");
+    wide_owner.release();
+    failures += expect_size(wide_pool.free_pages(), 8, "wide pool fully returned");
 
     prefix_owner.release();
     failures += expect_size(hybrid_pool.free_pages(), 5, "the adopted prefix stays mapped");
