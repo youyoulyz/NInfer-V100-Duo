@@ -21,47 +21,20 @@ if [[ $# -eq 0 ]]; then
 fi
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=server-control.sh
+source "${here}/server-control.sh"
+
 workdir=${CONTEXT_LAB_WORKDIR:-$PWD}
 mkdir -p "${workdir}/logs" "${workdir}/results"
 
-readonly port="${CONTEXT_LAB_PORT:-8080}"
 readonly request_log="${workdir}/logs/ladder.jsonl"
 readonly serve_log="${workdir}/logs/ladder-serve.log"
-
-server_pids() { pgrep -x ninfer-serve || true; }
-
-stop_server() {
-    local pids
-    pids=$(server_pids)
-    [[ -n "${pids}" ]] && kill ${pids} 2>/dev/null
-    for _ in $(seq 1 60); do
-        [[ -z "$(server_pids)" ]] && return 0
-        sleep 1
-    done
-    echo "ninfer-serve did not exit" >&2
-    return 1
-}
-
-wait_ready() {
-    local deadline=$((SECONDS + 900))
-    while ((SECONDS < deadline)); do
-        if curl -fsS -m 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 3
-    done
-    echo "server did not become ready on port ${port}" >&2
-    return 1
-}
 
 trap 'stop_server >/dev/null 2>&1 || true' EXIT
 
 for shape in "$@"; do
     echo "=== ${shape}: starting a fresh server ==="
-    stop_server
-    CONTEXT_LAB_REQUEST_LOG="${request_log}" \
-        setsid nohup "${here}/serve-batch-decode.sh" >>"${serve_log}" 2>&1 </dev/null &
-    wait_ready
+    start_server "${request_log}" "${serve_log}"
 
     python3 "${here}/batch_decode.py" "${shape}" \
         --request-log "${request_log}" \
