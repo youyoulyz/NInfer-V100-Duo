@@ -152,7 +152,9 @@ P1 分两半，进度如下：
 - **store 半边（已落地）**：`PagedKVPool::adopt_shared()` 让一个 allocation 把 owner 的物理页发布
   进自己的 block-table row；borrow count 保证这些页在最后一个 borrower 释放前不回 free set，
   即使 owner 先释放自己的前缀；borrowed allocation 没有自己的 entitlement，不能 grow / trim /
-  resize。验证：`tests/test_kv_cache.cpp`。
+  resize。`adopt_prefix()` 补上真正的形状：**借用的前缀 + 自有的后缀**在同一 allocation 里，
+  `owned_page_count()` 区分两者，entitlement / materialize 只算自有部分，trim 不能切进借用部分。
+  验证：`tests/test_kv_cache.cpp`。
 - **Program/admission 半边（待做）**：`adopt_retained_prefix(dst_lane, src_lane, frontier)` ——
   借页 + 用 `LinearAttentionStatePool::copy_slot()` 把 src 的 GDN state 拷进 dst 的私有 slot +
   搬 ledger/identity/frontier 元数据；以及让 `plan_request_for_lane` 的"在 lane O 命中"能够落到
