@@ -772,16 +772,27 @@ private:
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
-        std::uint32_t selected_reuse = 0;
+        std::uint32_t selected_reuse    = 0;
+        bool selected_discards_retained = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
-                selected       = LaneChoice{.lane = lane};
-                selected_reuse = reuse;
+            if (!instance_.program->can_admit_lane(lane, plan)) { continue; }
+            // Admitting a lane whose resident prefix this plan cannot continue overwrites that
+            // prefix: without the lane tier its device bytes are discarded and the next request
+            // that reaches them pays a full re-prefill, and with the tier they are spilled and
+            // restored through the host. An idle lane costs neither, so an equal reuse prefers it.
+            // Without this, a fresh prompt landing on the lowest-numbered lane drops a cached
+            // prefix that a later request still needs while seven lanes sit idle.
+            const bool discards_retained =
+                reuse == 0 && instance_.program->has_retained_lane(lane);
+            if (!selected || reuse > selected_reuse ||
+                (reuse == selected_reuse && selected_discards_retained && !discards_retained)) {
+                selected                   = LaneChoice{.lane = lane};
+                selected_reuse             = reuse;
+                selected_discards_retained = discards_retained;
             }
         }
         // With the host lane tier enabled, a directly admissible lane is no longer automatically
