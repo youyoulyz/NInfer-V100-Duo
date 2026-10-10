@@ -271,7 +271,7 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     mapped_pages_ -= static_cast<std::uint32_t>(pages.size());
 }
 
-PagedKVAllocation PagedKVPool::adopt_shared(std::span<const std::int32_t> page_ids) {
+void PagedKVPool::borrow_pages(std::span<const std::int32_t> page_ids) {
     if (page_ids.empty()) {
         throw std::invalid_argument("Paged KV shared mapping must name pages");
     }
@@ -287,10 +287,12 @@ PagedKVAllocation PagedKVPool::adopt_shared(std::span<const std::int32_t> page_i
         ++borrow_counts_[static_cast<std::size_t>(page)];
         ++borrowed_pages_;
     }
-    PagedKVAllocation allocation(*this, static_cast<std::uint32_t>(sorted.size()));
-    allocation.page_ids_         = std::move(sorted);
-    allocation.page_entitlement_ = static_cast<std::uint32_t>(allocation.page_ids_.size());
-    allocation.borrowed_         = true;
+}
+
+PagedKVAllocation PagedKVPool::adopt_shared(std::span<const std::int32_t> page_ids) {
+    PagedKVAllocation allocation(*this, 0);
+    allocation.adopt_prefix(page_ids);
+    allocation.borrowed_ = true;
     return allocation;
 }
 
@@ -347,10 +349,11 @@ PagedKVAllocation::~PagedKVAllocation() { release(); }
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
       page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_),
-      borrowed_(other.borrowed_) {
+      borrowed_(other.borrowed_), owned_begin_(other.owned_begin_) {
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
+    other.owned_begin_      = 0;
 }
 
 PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexcept {
@@ -361,10 +364,12 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
     borrowed_               = other.borrowed_;
+    owned_begin_            = other.owned_begin_;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
     other.borrowed_         = false;
+    other.owned_begin_      = 0;
     return *this;
 }
 
@@ -390,12 +395,26 @@ bool PagedKVAllocation::belongs_to(const PagedKVPool& pool) const noexcept {
 
 bool PagedKVAllocation::borrowed() const noexcept { return borrowed_; }
 
+std::uint32_t PagedKVAllocation::owned_page_count() const noexcept {
+    return static_cast<std::uint32_t>(page_ids_.size() - owned_begin_);
+}
+
+void PagedKVAllocation::adopt_prefix(std::span<const std::int32_t> page_ids) {
+    if (!valid()) { throw std::logic_error("Cannot adopt a prefix into an empty allocation"); }
+    if (!page_ids_.empty()) {
+        throw std::logic_error("Paged KV prefix adoption requires an unmapped allocation");
+    }
+    pool_->borrow_pages(page_ids); // validates the ids and takes the borrows
+    page_ids_.assign(page_ids.begin(), page_ids.end());
+    owned_begin_ = page_ids_.size();
+}
+
 void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
     if (borrowed_) {
         throw std::logic_error("A borrowed Paged KV mapping has no entitlement to set");
     }
-    if (!valid() || pages < mapped_page_count()) {
-        throw std::invalid_argument("Paged KV entitlement is smaller than mapped pages");
+    if (!valid() || pages < owned_page_count()) {
+        throw std::invalid_argument("Paged KV entitlement is smaller than the owned pages");
     }
     if (!pool_->can_replace_entitlement(page_entitlement_, pages)) { throw std::bad_alloc(); }
     page_ids_.reserve(pages);
@@ -405,13 +424,14 @@ void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
 
 void PagedKVAllocation::cancel_unmapped_entitlement() noexcept {
     if (!valid() || borrowed_) { return; }
-    const std::uint32_t mapped = mapped_page_count();
+    const std::uint32_t mapped = owned_page_count();
     pool_->replace_entitlement(page_entitlement_, mapped);
     page_entitlement_ = mapped;
 }
 
 void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stream) {
-    if (!valid() || pages < mapped_page_count() || pages > page_entitlement_) {
+    if (!valid() || pages < mapped_page_count() ||
+        static_cast<std::size_t>(pages) - owned_begin_ > page_entitlement_) {
         throw std::invalid_argument("Paged KV materialize extent is outside entitlement");
     }
     const std::uint32_t old_count = mapped_page_count();
@@ -429,10 +449,10 @@ void PagedKVAllocation::materialize_tokens(std::uint32_t tokens, cudaStream_t st
 }
 
 void PagedKVAllocation::trim_pages(std::uint32_t pages) {
-    if (borrowed_) {
-        throw std::logic_error("A borrowed Paged KV mapping cannot be trimmed");
-    }
     if (!valid()) { throw std::logic_error("Cannot trim an empty Paged KV allocation"); }
+    if (static_cast<std::size_t>(pages) < owned_begin_) {
+        throw std::logic_error("Cannot trim an adopted Paged KV prefix");
+    }
     if (pages > mapped_page_count()) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
     }
@@ -482,15 +502,20 @@ Tensor PagedKVAllocation::block_table() const {
 void PagedKVAllocation::release() noexcept {
     if (!valid()) { return; }
     unbind_row();
-    if (borrowed_) {
-        pool_->release_borrowed_pages(page_ids_);
-    } else {
-        pool_->return_pages(page_ids_);
-        pool_->replace_entitlement(page_entitlement_, 0);
+    const std::size_t adopted = owned_begin_;
+    if (adopted != 0) {
+        pool_->release_borrowed_pages(
+            std::span<const std::int32_t>(page_ids_.data(), adopted));
     }
+    if (page_ids_.size() != adopted) {
+        pool_->return_pages(std::span<const std::int32_t>(page_ids_.data() + adopted,
+                                                         page_ids_.size() - adopted));
+    }
+    pool_->replace_entitlement(page_entitlement_, 0);
     page_ids_.clear();
     page_entitlement_ = 0;
     borrowed_         = false;
+    owned_begin_      = 0;
     pool_             = nullptr;
 }
 

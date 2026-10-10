@@ -283,7 +283,7 @@ int main() {
     borrower_b.bind_row(2);
     failures += expect_device_page_ids(borrower_a.block_table(), {0, 1}, "borrower A row");
     failures += expect_device_page_ids(borrower_b.block_table(), {0, 1}, "borrower B row");
-    failures += expect_size(borrower_a.page_entitlement(), 2, "borrower entitlement");
+    failures += expect_size(borrower_a.page_entitlement(), 0, "a pure borrow owns no pages");
     failures += expect_size(shared_pool.borrowed_pages(), 4, "outstanding borrows");
     failures += expect_size(shared_pool.borrow_count(0), 2, "page 0 borrow count");
     failures += expect_size(shared_pool.free_pages(), 6, "borrowing takes no page from the owner");
@@ -304,6 +304,45 @@ int main() {
     failures += expect_size(shared_pool.free_pages(), 8, "pages return after the last release");
     failures += expect_size(shared_pool.borrowed_pages(), 0, "no outstanding borrows");
     failures += expect_size(shared_pool.entitled_pages(), 0, "borrowing owns no entitlement");
+
+    // A lane that continues an adopted prefix owns only its suffix: its mapping is the adopted
+    // pages followed by its own, trimming cannot cut into the adopted part, and releasing returns
+    // only what it owns while dropping its borrows.
+    auto hybrid_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena hybrid_arena(hybrid_plan.bytes);
+    ninfer::PagedKVPool hybrid_pool({hybrid_arena.base(), hybrid_arena.capacity()},
+                                    hybrid_plan.layout);
+    auto prefix_owner = hybrid_pool.reserve(2);
+    prefix_owner.materialize_pages(2);
+    prefix_owner.bind_row(0);
+    const std::vector<std::int32_t> owned_prefix(prefix_owner.page_ids().begin(),
+                                                 prefix_owner.page_ids().end());
+
+    auto hybrid = hybrid_pool.reserve(4);
+    hybrid.adopt_prefix(owned_prefix);
+    failures += expect_size(hybrid.owned_page_count(), 0, "hybrid owns nothing before it grows");
+    failures += expect_size(hybrid.mapped_page_count(), 2, "hybrid maps the adopted prefix");
+    failures += expect_size(hybrid.page_entitlement(), 4, "hybrid entitlement is unchanged");
+    hybrid.materialize_pages(4);
+    hybrid.bind_row(1);
+    failures += expect_size(hybrid.owned_page_count(), 2, "hybrid owned suffix pages");
+    failures += expect_page_ids(hybrid.page_ids(), {0, 1, 2, 3}, "hybrid mapping order");
+    failures += expect_device_page_ids(hybrid.block_table(), {0, 1, 2, 3}, "hybrid block table");
+    try {
+        hybrid.trim_pages(1);
+        ++failures;
+        std::cerr << "An adopted prefix was trimmed\n";
+    } catch (const std::logic_error&) {}
+    hybrid.trim_pages(3);
+    failures += expect_size(hybrid.owned_page_count(), 1, "hybrid after trimming its suffix");
+    failures += expect_size(hybrid_pool.free_pages(), 5, "free pages with the hybrid mapped");
+
+    prefix_owner.release();
+    failures += expect_size(hybrid_pool.free_pages(), 5, "the adopted prefix stays mapped");
+    hybrid.release();
+    failures += expect_size(hybrid_pool.free_pages(), 8, "hybrid release frees prefix and suffix");
+    failures += expect_size(hybrid_pool.borrowed_pages(), 0, "hybrid dropped its borrows");
+    failures += expect_size(hybrid_pool.entitled_pages(), 0, "hybrid owns no entitlement");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

@@ -140,6 +140,7 @@ private:
                                                std::uint32_t new_pages) const noexcept;
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
                                                        std::int32_t preferred_first);
+    void borrow_pages(std::span<const std::int32_t> page_ids);
     void return_pages(std::span<const std::int32_t> pages) noexcept;
     void add_entitlement(std::uint32_t pages) noexcept;
     void replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages) noexcept;
@@ -179,6 +180,14 @@ public:
     [[nodiscard]] bool belongs_to(const PagedKVPool& pool) const noexcept;
     // True when this allocation maps another allocation's pages instead of owning them.
     [[nodiscard]] bool borrowed() const noexcept;
+    // Pages this allocation owns; the leading `mapped_page_count() - owned_page_count()` of its
+    // mapping belong to another allocation and were adopted read-only.
+    [[nodiscard]] std::uint32_t owned_page_count() const noexcept;
+
+    // Maps `page_ids` read-only ahead of the pages this allocation owns, for a sequence that
+    // continues an adopted prefix and materializes its own suffix after it. Only legal on an empty
+    // mapping; the pool is told so those pages cannot be recycled until this allocation releases.
+    void adopt_prefix(std::span<const std::int32_t> page_ids);
 
     void set_page_entitlement(std::uint32_t pages);
     void cancel_unmapped_entitlement() noexcept;
@@ -207,6 +216,8 @@ private:
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
     bool borrowed_                  = false;
+    // page_ids_[0, owned_begin_) belong to another allocation; [owned_begin_, size) are owned.
+    std::size_t owned_begin_        = 0;
 };
 
 struct PagedKVReservation {
