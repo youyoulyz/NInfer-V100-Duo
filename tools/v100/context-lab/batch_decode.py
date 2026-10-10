@@ -12,8 +12,10 @@ For every shape ``N x LENGTH`` (N concurrent streams, each LENGTH prompt tokens)
 
 Reported per shape: every stream's own decode rate, the aggregate decode rate of the window,
 and -- with ``--baseline`` -- the same numbers for one stream at the same prompt length, which is
-the batch uplift.  The server must run tools/v100/context-lab/serve-batch-decode.sh with
-``CONTEXT_LAB_REQUEST_LOG`` pointing at ``--request-log``.
+the batch uplift.  With ``--shared-prefix`` every stream sends the same prompt text, so the pool
+holds one copy of that prefix per lane instead of one distinct prefix per lane.  The server must
+run tools/v100/context-lab/serve-batch-decode.sh with ``CONTEXT_LAB_REQUEST_LOG`` pointing at
+``--request-log``.
 
     tools/v100/context-lab/batch_decode.py 8x10000 8x20000 6x30000 4x40000 2x80000 \
         --request-log logs/requests.jsonl --out results/batch_decode.json --baseline
@@ -173,7 +175,11 @@ def summarize_done(records, window_seconds, throughput):
 
 def run_shape(client, log, tag, streams, target, args, warm_tokens):
     lines = calibrate(client, f"{tag}0", target)
-    prompts = [body_text(f"{tag}{stream}", lines) for stream in range(streams)]
+    # A shared prefix gives every stream byte-identical text; the distinct default gives each
+    # stream its own text, so its lane holds a prefix no other lane can reuse.
+    prompt_tags = ([f"{tag}0"] * streams if args.shared_prefix
+                   else [f"{tag}{stream}" for stream in range(streams)])
+    prompts = [body_text(prompt_tag, lines) for prompt_tag in prompt_tags]
     counted = [client.count_tokens(prompt) for prompt in prompts]
     if max(counted) - min(counted) > 1:
         raise SystemExit(f"prompt token counts diverge: {counted}")
@@ -182,7 +188,11 @@ def run_shape(client, log, tag, streams, target, args, warm_tokens):
 
     mark = log.offset()
     warmed = send_all(client, prompts, warm_tokens)
-    log.wait_for_done(mark, streams, args.timeout_seconds)
+    warm_records = log.wait_for_done(mark, streams, args.timeout_seconds)
+    warm_prefill = max(record["result"]["computed_prefill_tokens"] for record in warm_records)
+    warm_paths = sorted({record["result"]["prefix_reuse_path"] for record in warm_records})
+    print(f"[{tag}] warm reuse={warm_paths} prefill={warm_prefill} "
+          f"wall={[round(elapsed, 2) for elapsed, _ in warmed]}", flush=True)
 
     rounds = []
     for repeat in range(args.repeat):
@@ -201,6 +211,9 @@ def run_shape(client, log, tag, streams, target, args, warm_tokens):
         ]
         summary = summarize_done(done, window, throughput)
         summary["repeat"] = repeat
+        summary["shared_prefix"] = args.shared_prefix
+        summary["warm_prefix_reuse_paths"] = warm_paths
+        summary["warm_max_computed_prefill_tokens"] = warm_prefill
         summary["prompt_wall_seconds"] = [
             round(elapsed, 2) for elapsed, _ in warmed] if repeat == 0 else None
         summary["client_window_seconds"] = window
@@ -230,6 +243,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--warm-tokens", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--shared-prefix", action="store_true",
+                        help="give every stream the same prompt text instead of one text per lane")
     parser.add_argument("--baseline", action="store_true",
                         help="also time one stream at each prompt length")
     parser.add_argument("--timeout-seconds", type=float, default=7200.0)
@@ -248,9 +263,11 @@ def main():
     client = Client(args.base_url, args.model_id, args.timeout_seconds)
     log = RequestLog(args.request_log)
     results = {"label": args.label, "max_tokens": args.max_tokens,
-               "warm_tokens": args.warm_tokens, "repeat": args.repeat, "shapes": []}
+               "warm_tokens": args.warm_tokens, "repeat": args.repeat,
+               "shared_prefix": args.shared_prefix, "shapes": []}
     for index, (streams, target) in enumerate(shapes):
-        shape = run_shape(client, log, f"s{index}x{streams}", streams, target, args,
+        variant = "-shared" if args.shared_prefix else ""
+        shape = run_shape(client, log, f"s{index}x{streams}{variant}", streams, target, args,
                           args.warm_tokens)
         if args.baseline:
             shape["baseline"] = run_shape(client, log, f"b{index}", 1, target, args,
