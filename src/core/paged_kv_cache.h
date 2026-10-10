@@ -138,6 +138,13 @@ public:
     [[nodiscard]] std::uint32_t borrowed_pages() const noexcept;
     void release_borrowed_pages(std::span<const std::int32_t> pages) noexcept;
 
+    // Keeps one page group out of the free set until the matching release, without mapping it into
+    // any row. The shared prefix store takes a hold per block it owns, so a content-addressed chain
+    // outlives the allocation that produced it: the owner may release its bundle, and the pages wait
+    // in `pending_returns_` until the store drops the block instead of being handed to a stranger.
+    void hold_page(std::int32_t page_id);
+    void release_held_page(std::int32_t page_id) noexcept;
+
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);

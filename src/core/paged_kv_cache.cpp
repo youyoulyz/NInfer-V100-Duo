@@ -360,6 +360,16 @@ void PagedKVPool::release_borrowed_pages(std::span<const std::int32_t> pages) no
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
 }
 
+void PagedKVPool::hold_page(std::int32_t page_id) {
+    const std::span<const std::int32_t> pages(&page_id, 1);
+    borrow_pages(pages);
+}
+
+void PagedKVPool::release_held_page(std::int32_t page_id) noexcept {
+    const std::span<const std::int32_t> pages(&page_id, 1);
+    release_borrowed_pages(pages);
+}
+
 void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept { entitled_pages_ += pages; }
 
 void PagedKVPool::replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages) noexcept {

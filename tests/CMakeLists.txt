@@ -135,6 +135,9 @@ ninfer_add_test(ninfer_disk_kv_store_test
 ninfer_add_test(ninfer_block_index_test
   SOURCES test_block_index.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_shared_block_store_test
+  SOURCES test_shared_block_store.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_qwen3_6_lane_disk_tier_test
   SOURCES targets/qwen3_6/test_lane_disk_tier.cpp
   LIBRARIES ninfer_engine ninfer_core)

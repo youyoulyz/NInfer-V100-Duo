@@ -61,6 +61,9 @@ struct BlockView {
     std::span<const TokenId> tokens; // exactly kBlockTokens
     std::uint8_t copies       = 0;
     std::uint32_t pins        = 0;
+    // Children of this node. A node with none is a leaf: the whole branch below a node ends here,
+    // which is what makes it the only node a drop can take without orphaning a longer chain.
+    std::uint32_t children = 0;
 };
 
 struct BlockInsert {

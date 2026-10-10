@@ -135,6 +135,7 @@ BlockView BlockIndex::view(BlockRef node) const {
         .tokens      = entry.tokens,
         .copies      = entry.copies,
         .pins        = entry.pins,
+        .children    = static_cast<std::uint32_t>(entry.children.size()),
     };
 }
 
