@@ -1,0 +1,46 @@
+# V100 long-context lab
+
+Two launcher + driver pairs for the two-card V100 build, used to characterise the retained-context
+tiers and the decode batch of `qwen3.8-27b/nvfp4` at long context. They are run from a scratch
+directory (`~/v100/ninfer-context-lab/{pool,batch}`), which symlinks the scripts and keeps the
+server and driver logs; everything needed to reproduce a measurement lives here.
+
+| Profile | Launcher | Driver | Shape |
+|---|---|---|---|
+| Session pool | [`serve-pool.sh`](serve-pool.sh) | [`pool_driver.py`](pool_driver.py) | Several full-length conversations retained across restarts, one request at a time |
+| Batch decode | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`batch_decode.py`](batch_decode.py) | N concurrent streams decoding already-resident prefixes |
+
+Both launchers take `CONTEXT_LAB_ARTIFACT` (default `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer`)
+and `CONTEXT_LAB_PORT` (default 8080), and require a build in `build-v100-duo/`.
+
+## Session pool
+
+`serve-pool.sh` runs one lane with the pinned host tier and a 96 GiB NVMe tier under
+`CONTEXT_LAB_TIER_DIR`, at `--max-context 200000 --kv-capacity 200000`: a prefix displaced from
+the paged KV pool is parked instead of discarded, so a conversation that comes back -- or a server
+that restarts -- resumes it with no re-prefill.
+
+```bash
+cd ~/v100/ninfer-context-lab/pool
+CONTEXT_LAB_TIER_DIR=/var/tmp/ninfer-context-lab-pool ./serve.sh > logs/cold.log 2>&1 &
+python3 pool.py cold 8 192000 --serve-log logs/cold.log --state sessions.json
+kill $(pgrep -x ninfer-serve)
+CONTEXT_LAB_TIER_DIR=/var/tmp/ninfer-context-lab-pool ./serve.sh > logs/resume.log 2>&1 &
+python3 pool.py resume 8 192000 --serve-log logs/resume.log --state sessions.json
+```
+
+`cold` builds the pool and `resume` replays it; the state file carries the calibrated line count so
+both phases build byte-identical prompts, and `resume` exits non-zero unless every session resumed
+with `reuse=append_frontier` and at most a two-token prefill.
+
+Recorded with eight sessions at 192000 target tokens (194950 counted), `--max-concurrency 1`,
+`--tp 2 --spec mtp --draft-tokens 3`, INT8 KV on 2 x V100-SXM2-16GB (logs in
+`~/v100/ninfer-context-lab/pool/logs`):
+
+| Phase | Result |
+|---|---|
+| Cold pool build | TTFT 298.7-327.8 s per session, 595-653 tok/s prefill, about 7 GiB per session in the tier |
+| Two process restarts later | 8/8 resumed: `cache=194948/194950`, `reuse=append_frontier`, two-token append, no re-prefill, TTFT 5.2-6.2 s |
+
+The per-session tier cost follows from the INT8 G64 KV layout (17952 B per token per device) plus
+the GDN state; size `--disk-kv-mib` for the whole pool.
