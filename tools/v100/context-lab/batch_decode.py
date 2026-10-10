@@ -247,12 +247,6 @@ def main():
 
     client = Client(args.base_url, args.model_id, args.timeout_seconds)
     log = RequestLog(args.request_log)
-    missing = [record["request_id"] for record in log.records_after(0)
-               if record.get("event") != "request_done"]
-    if missing:
-        print(f"note: {len(missing)} non-request_done records already in {args.request_log}",
-              file=sys.stderr)
-
     results = {"label": args.label, "max_tokens": args.max_tokens,
                "warm_tokens": args.warm_tokens, "repeat": args.repeat, "shapes": []}
     for index, (streams, target) in enumerate(shapes):
