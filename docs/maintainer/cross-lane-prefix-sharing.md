@@ -1,6 +1,7 @@
 # 跨 lane 前缀共享（block 级 refcount）
 
-**状态**：**计划，未落地**。P0（本文 + 契约修订）已完成；P1 起为实现。本文是这项能力的当前权威：
+**状态**：**进行中**。P0（本文 + 契约修订）与 P1 的 store 半边（页组 read-only borrow +
+refcount）已落地；P1 的 Program/admission 接线与 §9 其余阶段待做。本文是这项能力的当前权威：
 目标、物理约束、数据结构、refcount 语义、COW 边界、分阶段验收。实现完成后 §1–§8 仍是契约，
 §9 的阶段表按实际完成情况改写。
 
@@ -145,6 +146,17 @@ host 层按节点而不是按 lane 存 image。收益：同一 checkpoint 被 N 
 | **P4** | tier 按节点化 + 观测（`--log-stats` 出 shared pages / hits / refcount） | 端到端 + `docs/serving.md` / README 更新 |
 
 P1 单独即可消除 §6 的第一个缺陷，且不引入新算法；P2 起才真正使用 radix 树。
+
+P1 分两半，进度如下：
+
+- **store 半边（已落地）**：`PagedKVPool::adopt_shared()` 让一个 allocation 把 owner 的物理页发布
+  进自己的 block-table row；borrow count 保证这些页在最后一个 borrower 释放前不回 free set，
+  即使 owner 先释放自己的前缀；borrowed allocation 没有自己的 entitlement，不能 grow / trim /
+  resize。验证：`tests/test_kv_cache.cpp`。
+- **Program/admission 半边（待做）**：`adopt_retained_prefix(dst_lane, src_lane, frontier)` ——
+  借页 + 用 `LinearAttentionStatePool::copy_slot()` 把 src 的 GDN state 拷进 dst 的私有 slot +
+  搬 ledger/identity/frontier 元数据；以及让 `plan_request_for_lane` 的"在 lane O 命中"能够落到
+  lane L 执行。**在这半边落地前，跨 lane 共享对产品行为没有任何影响。**
 
 ## 10. 不改变的东西
 
