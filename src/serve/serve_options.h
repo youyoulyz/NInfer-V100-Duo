@@ -57,6 +57,10 @@ struct ServeOptions {
     // stored rather than discarded, so a later request that reaches it resumes instead of
     // re-prefilling, and with `disk_kv_path` the record also survives a restart.
     std::size_t host_kv_bytes = 0;
+    // Lane-free shared checkpoints held as pinned host state images (0 disables them).
+    std::uint32_t shared_state_images = 0;
+    // Pinned host budget for one KV image per shared checkpoint (0 keeps the KV on the device).
+    std::size_t shared_kv_bytes = 0;
     std::filesystem::path disk_kv_path;
     std::size_t disk_kv_bytes = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;

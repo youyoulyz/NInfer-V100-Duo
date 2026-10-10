@@ -555,6 +555,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--host-kv-mib N` | pinned host lane tier; a prefix displaced from the paged KV pool is parked there instead of discarded. `0` disables the tier, and the NVMe tier with it | `0` |
+| `--shared-kv-mib N` | pinned host budget for one KV image per lane-free shared checkpoint: a captured prefix parks its KV per node and releases its device pages, so displaced conversations stop competing for the pool. A park that does not fit falls back to holding the page groups; `0` keeps the KV on the device | `0` |
 | `--disk-kv-path DIR` | content-addressed NVMe tier directory, under which displaced prefixes survive a process restart. Requires `--host-kv-mib` | unset |
 | `--disk-kv-mib N` | NVMe tier budget; `0` selects the engine default | `0` |
 | `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
@@ -564,7 +565,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
+| `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it. Each report also carries the shared prefix index (`shared_nodes` / `shared_owners` / `shared_ownerless` / `shared_hits=HITS/LOOKUPS` / `shared_pruned`) | `5000` |
+| `--shared-state-images N` | lane-free shared checkpoints held as pinned host state images: a prefix whose lane was displaced stays claimable by any later request. About 294 MiB per image at the 27B TP2 profile; `0` disables it | `0` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
 | `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |

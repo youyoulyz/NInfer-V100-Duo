@@ -147,6 +147,12 @@ std::string serve_usage_text(const char* argv0) {
            "       the content-addressed NVMe tier under it (--disk-kv-mib N, 0 for the engine\n"
            "       default). A prefix displaced from the paged KV pool is stored instead of\n"
            "       discarded, so a later request that reaches it resumes with no prefill.\n"
+           "       --shared-state-images N holds N lane-free shared checkpoints as pinned host\n"
+           "       state images (~294 MiB each at the 27B profile; 0 disables them): a prefix\n"
+           "       whose lane was displaced stays claimable by any later request.\n"
+           "       --shared-kv-mib N gives those checkpoints a per-node KV budget in pinned host\n"
+           "       RAM, so a captured prefix releases its device pages instead of holding them\n"
+           "       (0 keeps the KV on the device).\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -241,6 +247,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--shared-state-images") {
+            options.shared_state_images = static_cast<std::uint32_t>(
+                parse_u64(require_value("--shared-state-images"), "shared-state-images"));
+        } else if (arg == "--shared-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--shared-kv-mib"), "shared-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--shared-kv-mib is out of range");
+            }
+            options.shared_kv_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));

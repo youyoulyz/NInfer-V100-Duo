@@ -442,6 +442,12 @@ std::string format_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
+    // Cross-lane prefix sharing: how the content-addressed index answered, and what it holds now.
+    const ninfer::SharedPrefixStats& shared = report.scheduler.shared_prefix;
+    out << " shared_nodes=" << shared.nodes << " shared_owners=" << shared.owners
+        << " shared_ownerless=" << shared.ownerless << " shared_payloads=" << shared.payloads
+        << " shared_hits=" << shared.hits << "/" << shared.lookups
+        << " shared_pruned=" << shared.pruned;
     return out.str();
 }
 
@@ -629,6 +635,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};
+    // Cross-lane prefix sharing: the content-addressed index's usage and current census.
+    record["shared_prefix"] = Json{{"nodes", report.scheduler.shared_prefix.nodes},
+                                   {"owners", report.scheduler.shared_prefix.owners},
+                                   {"ownerless", report.scheduler.shared_prefix.ownerless},
+                                   {"payloads", report.scheduler.shared_prefix.payloads},
+                                   {"hits", report.scheduler.shared_prefix.hits},
+                                   {"lookups", report.scheduler.shared_prefix.lookups},
+                                   {"pruned", report.scheduler.shared_prefix.pruned}};
     return record.dump();
 }
 

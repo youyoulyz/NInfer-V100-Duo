@@ -91,6 +91,10 @@ struct SequencePlanningInputs {
     // Pinned host RAM budget for the host lane tier; zero disables it. Layout-neutral: it sizes
     // host arenas the Program owns outside the planned device arenas.
     std::size_t host_context_bytes = 0;
+    // Shared prefix state images; layout-neutral like the host budget. Zero disables them.
+    std::uint32_t shared_state_images = 0;
+    // Per-node KV host budget for those images. See EngineOptions::shared_kv_bytes.
+    std::size_t shared_kv_bytes = 0;
     // NVMe lane tier; layout-neutral like the host budget. See EngineOptions::disk_kv_path.
     std::string disk_kv_path;
     std::size_t disk_kv_bytes = 0;
@@ -129,6 +133,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     int tp              = 1;
     // Pinned host RAM budget for the host lane tier; zero disables it. See SequencePlanningInputs.
     std::size_t host_context_bytes = 0;
+    // Shared prefix state images. See SequencePlanningInputs.
+    std::uint32_t shared_state_images = 0;
+    std::size_t shared_kv_bytes = 0;
     // NVMe lane tier. See SequencePlanningInputs.
     std::string disk_kv_path;
     std::size_t disk_kv_bytes = 0;

@@ -214,6 +214,21 @@ struct EngineOptions {
     // linear-attention mirror is sized separately (one image per lane per rank) and is NOT part of
     // this budget, because it frees no device memory.
     std::size_t host_context_bytes = 0;
+    // Shared prefix state images: how many lane-free, content-addressed checkpoints the engine may
+    // hold pinned in host RAM. Zero (the default) disables them, and a prefix whose lane is gone can
+    // then only be reached again through the host or NVMe tier. Each image is the whole GDN
+    // linear-attention state of both ranks plus rank 0's two hidden rows -- about 294 MiB per image
+    // at the 27B profile -- so this is the budget that bounds how many displaced prefixes stay
+    // claimable. The device pages of those prefixes are held by the engine's block index, not by
+    // this budget.
+    std::uint32_t shared_state_images = 0;
+    // Pinned host RAM budget for one KV image per lane-free shared checkpoint. Zero (the default)
+    // keeps the payload's KV on the device: the engine then holds the chain's page groups so the
+    // bytes survive the lane, at the cost of that many device pages. With a budget, a captured
+    // prefix parks its KV in host RAM per node and releases the device pages, so displaced
+    // conversations stop competing for the pool; a park that does not fit falls back to the device
+    // hold. The image is sized by the prefix, not by a per-conversation ceiling.
+    std::size_t shared_kv_bytes = 0;
     // NVMe (L3) tier: a directory of content-addressed 64-token KV blocks and state images. A
     // resolved lane whose prefix cannot stay on the device (or in host RAM) is mirrored there as
     // it is displaced, and the NEXT request whose prompt reaches that prefix -- any lane, any
@@ -920,6 +935,19 @@ struct RuntimeHostWorkStats {
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
 // interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+// Cross-lane prefix sharing: how the content-addressed block index is being used. Cumulative
+// counters reset with the engine; the node/owner gauges describe the index right now.
+struct SharedPrefixStats {
+    std::uint64_t lookups = 0;    // plans that asked the index for their prompt
+    std::uint64_t hits    = 0;    // of those, the ones a resident chain answered
+    std::uint64_t pruned  = 0;    // blocks reclaimed once no lane served them
+    std::uint32_t nodes      = 0; // 64-token blocks currently indexed
+    std::uint32_t owners     = 0; // live lane promises attached to those blocks
+    std::uint32_t ownerless  = 0; // indexed blocks no lane serves any more
+    std::uint32_t payloads   = 0; // blocks that hold a state image of their own
+    std::uint32_t held_pages = 0; // page groups the index keeps out of the pools for those payloads
+};
+
 struct RuntimeStats {
     // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -998,6 +1026,7 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+    SharedPrefixStats shared_prefix;
 };
 
 [[nodiscard]] inline constexpr const char*

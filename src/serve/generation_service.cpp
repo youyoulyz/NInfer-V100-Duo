@@ -241,6 +241,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.host_context_bytes       = options_.host_kv_bytes;
+    engine_options.shared_state_images      = options_.shared_state_images;
+    engine_options.shared_kv_bytes          = options_.shared_kv_bytes;
     engine_options.disk_kv_path             = options_.disk_kv_path;
     engine_options.disk_kv_bytes            = options_.disk_kv_bytes;
     engine_options.enable_vision            = options_.enable_vision;

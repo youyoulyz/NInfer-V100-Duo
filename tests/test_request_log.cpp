@@ -368,6 +368,10 @@ int main() {
     throughput.scheduler.prefilling_requests   = 1;
     throughput.scheduler.decode_ready_requests = 1;
     throughput.scheduler.waiting_requests      = 3;
+    throughput.scheduler.shared_prefix.nodes   = 16;
+    throughput.scheduler.shared_prefix.owners  = 64;
+    throughput.scheduler.shared_prefix.hits    = 7;
+    throughput.scheduler.shared_prefix.lookups = 9;
     const std::string human_throughput         = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
@@ -379,6 +383,11 @@ int main() {
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
+    failures += check(throughput_json.at("shared_prefix").at("nodes") == 16 &&
+                          throughput_json.at("shared_prefix").at("owners") == 64 &&
+                          throughput_json.at("shared_prefix").at("hits") == 7 &&
+                          throughput_json.at("shared_prefix").at("lookups") == 9,
+                      "shared prefix stats mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
 
