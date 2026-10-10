@@ -64,6 +64,10 @@ Artifact and model references:
 
 Pending implementation work:
 
+- [Cross-lane prefix sharing](maintainer/cross-lane-prefix-sharing.md) is the contract for letting N
+  active lanes reuse one prefix through a refcounted block index; P1 is in flight, so the exclusive
+  bundle ownership described in [paged-kv-cache.md](maintainer/paged-kv-cache.md) still governs the
+  current implementation.
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.

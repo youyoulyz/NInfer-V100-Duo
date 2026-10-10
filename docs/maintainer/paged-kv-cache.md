@@ -31,8 +31,12 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
   non-goal 里**：它由 [上下文两层寄存](context-tiering.md) 定义契约（host RAM + NVMe 两层、
   搬迁而非预留、image 必须含 GDN state），本文只规定它复用的 page ownership 与 reservation
   accounting；
-- active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
-- arbitrary longest-common-prefix reuse；
+- **跨 lane 共享同一 prefix**（page reference counting、copy-on-write branching、同一 retained
+  entry 被多条 active request 分叉）不在本节的 non-goal 里：它由
+  [跨 lane 前缀共享](cross-lane-prefix-sharing.md) 定义契约（块级 refcount，且可恢复位置仍由完整
+  continuation state checkpoint 决定），本文只规定它复用的 page ownership 与 reservation
+  accounting；
+- 落在完整 checkpoint 之外的 arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
 - 为 bounded cyclic KV 或 operator transient K/V 强行提供同一种 paging；
 - 在 serving 期间改变 pool layout 或 page size；
@@ -802,6 +806,10 @@ pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuati
 多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
 连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
 可继续的 sequence state。
+
+> **进行中**：[跨 lane 前缀共享](cross-lane-prefix-sharing.md) 正在把上面这条独占契约改成
+> "一个 retained bundle 可被多条 active request 同时 claim、页组按 refcount 共享"。P1 落地前，
+> 本节描述的独占所有权仍是当前实现的行为。
 
 ---
 
