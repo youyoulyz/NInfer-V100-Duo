@@ -69,6 +69,35 @@ prefill -- so no timed round paid a re-prefill. Aggregate decode is flat near 22
 lanes whatever the context length, while the per-stream rate falls as streams are added: decode is
 bandwidth-bound, so the batch buys about 2.3x over one stream rather than 8x.
 
+## Shared prefix versus one prefix per lane
+
+`run-prefix-compare.sh LENGTH N...` times N streams at one prompt length twice: once with N
+distinct prompts (a different cached prefix in every lane) and once with N byte-identical prompts
+(`--shared-prefix`), with a fresh server per run.
+
+Recorded on the same profile at about 10000 prompt tokens, 64 decode tokens, one round:
+
+| N | Variant | Streams that re-prefilled | Window | Aggregate tok/s (wall) | Per-stream tok/s |
+|---|---|---|---|---|---|
+| 2 | distinct | 0/2 | 0.79 s | 160.5 | 91.5 |
+| 2 | shared | 1/2 | 26.31 s | 4.8 | 101.6 |
+| 4 | distinct | 0/4 | 1.29 s | 195.0 | 58.2 |
+| 4 | shared | 2/4 | 52.09 s | 4.8 | 92.5 |
+| 5 | distinct | 0/5 | 1.63 s | 193.0 | 47.9 |
+| 5 | shared | 2/5 | 52.00 s | 6.1 | 100.3 |
+| 8 | distinct | 0/8 | 2.27 s | 222.5 | 36.8 |
+| 8 | shared | 3/8 | 78.43 s | 6.4 | 76.7 |
+
+A repeated prompt does not fill the lanes. The admission pass prefers the lane that already holds
+the prefix, so the shared variant's warm phase serialises every stream onto one lane and leaves a
+single cached copy. A concurrent burst then finds exactly one lane with the cache; the rest land on
+empty lanes and pay a full prefill, one at a time. A second round does not fix it: eight shared
+streams re-prefilled 1/8 again and still took 27.8 s (18.1 tok/s), because the copy-holding lanes
+are occupied by the earlier streams of the same round. Per-stream decode looks *faster* in the
+shared case (76.7 vs 36.8 tok/s at N=8) precisely because the streams never batch -- they stagger,
+so each runs near single-stream speed while the wall clock accumulates. The KV content does not
+change the kernels; what collapses is whether the batch forms at all.
+
 ## Reuse probe
 
 `reuse_probe.py` is the regression check for lane admission. It warms one retained prefix per lane
