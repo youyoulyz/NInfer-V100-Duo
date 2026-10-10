@@ -264,5 +264,46 @@ int main() {
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
 
+    // A retained prefix can be mapped read-only by several lanes at once. The owner keeps
+    // ownership, every borrower publishes the same physical pages into its own block-table row, and
+    // the pages only rejoin the free set after the owner and the last borrower have both released.
+    auto shared_plan = plan_paged_cache(8, 8, 4, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena shared_arena(shared_plan.bytes);
+    ninfer::PagedKVPool shared_pool({shared_arena.base(), shared_arena.capacity()},
+                                    shared_plan.layout);
+    auto retained = shared_pool.reserve(2);
+    retained.materialize_pages(2);
+    retained.bind_row(0);
+    failures += expect_size(shared_pool.free_pages(), 6, "free pages with a retained prefix");
+    const std::vector<std::int32_t> prefix(retained.page_ids().begin(), retained.page_ids().end());
+
+    auto borrower_a = shared_pool.adopt_shared(prefix);
+    auto borrower_b = shared_pool.adopt_shared(prefix);
+    borrower_a.bind_row(1);
+    borrower_b.bind_row(2);
+    failures += expect_device_page_ids(borrower_a.block_table(), {0, 1}, "borrower A row");
+    failures += expect_device_page_ids(borrower_b.block_table(), {0, 1}, "borrower B row");
+    failures += expect_size(borrower_a.page_entitlement(), 2, "borrower entitlement");
+    failures += expect_size(shared_pool.borrowed_pages(), 4, "outstanding borrows");
+    failures += expect_size(shared_pool.borrow_count(0), 2, "page 0 borrow count");
+    failures += expect_size(shared_pool.free_pages(), 6, "borrowing takes no page from the owner");
+    try {
+        borrower_a.trim_pages(1);
+        ++failures;
+        std::cerr << "A borrowed mapping was trimmed\n";
+    } catch (const std::logic_error&) {}
+
+    retained.release();
+    failures += expect_size(shared_pool.free_pages(), 6, "borrowed pages stay out of the free set");
+    failures += expect_device_page_ids(borrower_a.block_table(), {0, 1},
+                                       "borrower A survives the owner's release");
+    borrower_a.release();
+    failures += expect_size(shared_pool.free_pages(), 6, "pages wait for the last borrower");
+    failures += expect_device_page_ids(borrower_b.block_table(), {0, 1}, "borrower B row is intact");
+    borrower_b.release();
+    failures += expect_size(shared_pool.free_pages(), 8, "pages return after the last release");
+    failures += expect_size(shared_pool.borrowed_pages(), 0, "no outstanding borrows");
+    failures += expect_size(shared_pool.entitled_pages(), 0, "borrowing owns no entitlement");
+
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

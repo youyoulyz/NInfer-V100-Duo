@@ -120,6 +120,18 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
+    // A read-only mapping of pages another allocation owns, published into a row of this pool's
+    // block table. The owner keeps ownership; the pool only guarantees those page groups are not
+    // handed to another allocation until every borrower has released them. A borrowed allocation
+    // carries no entitlement of its own: it cannot be grown, trimmed or resized, and releasing it
+    // drops the mapping instead of returning the pages.
+    [[nodiscard]] PagedKVAllocation adopt_shared(std::span<const std::int32_t> page_ids);
+
+    // Outstanding borrows of one physical page group, and the pool-wide total.
+    [[nodiscard]] std::uint32_t borrow_count(std::int32_t page_id) const noexcept;
+    [[nodiscard]] std::uint32_t borrowed_pages() const noexcept;
+    void release_borrowed_pages(std::span<const std::int32_t> pages) noexcept;
+
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
@@ -138,9 +150,14 @@ private:
     std::vector<Tensor> planes_;
     Tensor block_tables_;
     std::vector<std::int32_t> free_page_ids_;
+    std::vector<std::uint32_t> borrow_counts_;
+    // Pages an owner returned while a borrower still mapped them. They rejoin the free set only
+    // when the last borrow drops, so a retained page group cannot be recycled under a live row.
+    std::vector<std::uint32_t> pending_returns_;
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    std::uint32_t borrowed_pages_ = 0;
 };
 
 class PagedKVAllocation {
@@ -160,6 +177,8 @@ public:
     [[nodiscard]] std::int32_t bound_row() const noexcept;
     [[nodiscard]] std::span<const std::int32_t> page_ids() const noexcept;
     [[nodiscard]] bool belongs_to(const PagedKVPool& pool) const noexcept;
+    // True when this allocation maps another allocation's pages instead of owning them.
+    [[nodiscard]] bool borrowed() const noexcept;
 
     void set_page_entitlement(std::uint32_t pages);
     void cancel_unmapped_entitlement() noexcept;
@@ -187,6 +206,7 @@ private:
     std::vector<std::int32_t> page_ids_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
+    bool borrowed_                  = false;
 };
 
 struct PagedKVReservation {
