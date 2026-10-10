@@ -155,10 +155,23 @@ P1 分两半，进度如下：
   resize。`adopt_prefix()` 补上真正的形状：**借用的前缀 + 自有的后缀**在同一 allocation 里，
   `owned_page_count()` 区分两者，entitlement / materialize 只算自有部分，trim 不能切进借用部分。
   验证：`tests/test_kv_cache.cpp`。
-- **Program/admission 半边（待做）**：`adopt_retained_prefix(dst_lane, src_lane, frontier)` ——
-  借页 + 用 `LinearAttentionStatePool::copy_slot()` 把 src 的 GDN state 拷进 dst 的私有 slot +
-  搬 ledger/identity/frontier 元数据；以及让 `plan_request_for_lane` 的"在 lane O 命中"能够落到
-  lane L 执行。**在这半边落地前，跨 lane 共享对产品行为没有任何影响。**
+- **Program/admission 半边（待做）**：让"在 lane O 命中"的复用路径落到 lane L 执行。落点已定位，
+  读代码时确认了三处互锁，接线时必须一起处理：
+
+  1. `adopt_lane_prefix(dst, src, prompt)`（新）要一次填齐：bundle（借用的前缀 pages + 自有后缀的
+     entitlement，含 `text_peer` / `backend` / `backend_peer`）、`text_kv_valid`、`mtp_kv_valid`、
+     `ledger`、`prefix_identity`、`prefix_digests`、`tail_hidden`(+valid)、`rewrite_checkpoint`、
+     `execution_frontier`，并把 src 的 GDN state 用 `LinearAttentionStatePool::copy_slot()` 拷进 dst 的
+     `current_state_slot`（必要时要连 `rewrite_checkpoint_state_slot` 一起，两个 rank 都要）。
+  2. `plan_request_for_lane(lane, ...)` 的复用判定与 MTP/DFlash readiness 门必须改成对 **donor 的
+     sequence** 求值，而不是 dst 的；并且 `text_kv_page_entitlement` / `backend_kv_page_entitlement`
+     要减去 donor 已映射的页数，否则 `can_admit_lane` 的容量账会把同一批页算两遍。
+  3. `start_prefill_lane` 的 append 分支会执行 `trim_sequence_kv(sequence, base, ...)`，即
+     `trim_pages(ceil(base/64))`；adopted 前缀的页数必须正好等于这个值，否则 `trim_pages` 的
+     "不能切进借用部分" 守卫会拒绝。要么让 donor 的前缀恰好整页对齐，要么让 trim 对 adopted 段特判。
+
+  失败必须回退到 plan 已经计价的冷 prefill（adoption 是纯增益路径），这样任何不完全匹配都只损失收益
+  而不是正确性。**在这半边落地前，跨 lane 共享对产品行为没有任何影响。**
 
 ## 10. 不改变的东西
 
