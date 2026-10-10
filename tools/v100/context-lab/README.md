@@ -10,6 +10,7 @@ server and driver logs; everything needed to reproduce a measurement lives here.
 | Session pool | [`serve-pool.sh`](serve-pool.sh) | [`pool_driver.py`](pool_driver.py) | Several full-length conversations retained across restarts, one request at a time |
 | Batch decode | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`batch_decode.py`](batch_decode.py) | N concurrent streams decoding already-resident prefixes |
 | Reuse probe | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`reuse_probe.py`](reuse_probe.py) | S retained prefixes replayed serially and concurrently |
+| Adoption gate | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`adopt_probe.py`](adopt_probe.py) | One prompt decoded cold, then twice concurrently; the second stream can only reach the prefix by adopting it, and both must reproduce the cold text byte for byte |
 
 Both launchers take `CONTEXT_LAB_ARTIFACT` (default `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer`)
 and `CONTEXT_LAB_PORT` (default 8080), and require a build in `build-v100-duo/`.

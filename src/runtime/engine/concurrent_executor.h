@@ -246,6 +246,7 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        snapshot.shared_prefix       = instance_.program->shared_prefix_stats();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -759,8 +760,13 @@ private:
 
     void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
         if (slots_[lane] != nullptr) { return; }
+        // A cached plan is reused while the LANE it was computed for is unchanged, but an adopting
+        // plan also depends on a DIFFERENT lane -- the one whose prefix it maps -- and that lane can
+        // be admitted, evicted or re-retained without touching this one's version. Such a plan is
+        // therefore recomputed on every attempt; everything else keeps the cache.
         if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
-            request->lane_plans[lane]) {
+            request->lane_plans[lane] &&
+            !instance_.program->plan_adopted_lane(*request->lane_plans[lane]).has_value()) {
             return;
         }
         request->lane_plans[lane].reset();
@@ -774,6 +780,7 @@ private:
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse    = 0;
         bool selected_discards_retained = false;
+        bool selected_adopting          = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
@@ -786,13 +793,27 @@ private:
             // restored through the host. An idle lane costs neither, so an equal reuse prefers it.
             // Without this, a fresh prompt landing on the lowest-numbered lane drops a cached
             // prefix that a later request still needs while seven lanes sit idle.
+            //
+            // A lane that maps a SIBLING's prefix reports the same reuse as the lane that owns it,
+            // so this comparison is also what decides whether a request takes the owner's own lane
+            // or a copy of it. Taking the owner consumes it: the prefix becomes a running request's
+            // and every sibling that then wants it has to claim a lane that is writing instead of
+            // one that is idle. An equal reuse therefore prefers the adopter, which leaves the
+            // owner resident and its claim stable for the rest of the burst.
+            const bool adopting = instance_.program->plan_adopted_lane(plan).has_value();
+            // A plan that adopts a sibling's prefix abandons whatever this lane held, exactly as a
+            // plan with nothing to continue does; one that continues this lane's own prefix never
+            // discards it. Both facts matter for the tie-break below.
             const bool discards_retained =
-                reuse == 0 && instance_.program->has_retained_lane(lane);
+                instance_.program->has_retained_lane(lane) && (adopting || reuse == 0);
             if (!selected || reuse > selected_reuse ||
-                (reuse == selected_reuse && selected_discards_retained && !discards_retained)) {
+                (reuse == selected_reuse && selected_discards_retained && !discards_retained) ||
+                (reuse == selected_reuse && discards_retained == selected_discards_retained &&
+                 adopting && !selected_adopting)) {
                 selected                   = LaneChoice{.lane = lane};
                 selected_reuse             = reuse;
                 selected_discards_retained = discards_retained;
+                selected_adopting          = adopting;
             }
         }
         // With the host lane tier enabled, a directly admissible lane is no longer automatically
@@ -852,15 +873,26 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
-            for (std::uint32_t retained_lane = 0;
-                 retained_lane < max_concurrency_ &&
-                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
-                 ++retained_lane) {
-                if (retained_lane != lane && slots_[retained_lane] == nullptr &&
-                    instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
-                    invalidate_lane_plans(retained_lane);
+            // Retained lanes are conversations the process is holding, and which one to give up is a
+            // value question: the Program answers with the cheapest prefix to rebuild first (the
+            // shortest frontier only that lane serves, least recently retained on a tie). Walking
+            // lane numbers instead would take whatever sits lowest, which is exactly the behaviour
+            // that dropped the longest prefix while seven lanes sat idle. The lane this plan already
+            // depends on is never a victim -- that would destroy the reuse being admitted for.
+            const std::optional<std::uint32_t> donor =
+                instance_.program->plan_adopted_lane(*request->lane_plans[lane]);
+            for (const std::uint32_t victim :
+                 instance_.program->retained_lane_eviction_order()) {
+                if (instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) { break; }
+                // A lane-free shared payload is an opportunistic copy of a prefix: its page groups
+                // are held out of the pools, and giving one up is cheaper than eating a conversation
+                // the process is still holding. Only when none is left does a retained lane go.
+                if (instance_.program->drop_shared_payloads(1) != 0) { continue; }
+                if (victim == lane || (donor && victim == *donor) || slots_[victim] != nullptr) {
+                    continue;
                 }
+                instance_.program->evict_retained_lane(victim);
+                invalidate_lane_plans(victim);
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 throw std::logic_error("retained eviction did not make admission feasible");

@@ -3,6 +3,8 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/shared_block_store.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_offload.h"
 #include "core/host_linear_state.h"
@@ -29,6 +31,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include <string>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
@@ -99,6 +102,20 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     // Set when this lane's prefix comes from the NVMe tier instead of from the lane itself: the
     // lane starts empty and the restore fills it, falling back to a cold prefill on a miss.
     std::uint32_t disk_restore_frontier = 0;
+    // Set when this lane continues a SIBLING's retained prefix rather than one of its own: the lane
+    // whose device pages this plan maps read-only, instead of recomputing the same prompt. Those
+    // pages stay charged to the donor's entitlement, so `*_page_entitlement` above covers only the
+    // region this lane owns, and the cold footprint the plan can still fall back to is the one in
+    // `summary.admission`.
+    std::optional<std::uint32_t> adopt_lane;
+    // Set when this lane continues a chain the shared index owns on its own: the node whose page
+    // groups it maps read-only and whose state image it restores. Unlike `adopt_lane`, no lane has
+    // to still hold the prefix, so the claim survives the conversation that produced it.
+    std::optional<runtime::prefix_cache::BlockRef> adopt_node;
+    // The service quanta the same request would need to prefill the whole prompt, which is what the
+    // base plan priced and what an adoption that loses its lender falls back to. Adopting is a pure
+    // gain over that plan, so the fallback has to charge it again rather than the suffix it priced.
+    std::uint64_t cold_service_work_quanta = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -180,6 +197,33 @@ struct LaneStateImage {
     LaneStateMetadata metadata;
 };
 
+// One node's self-contained continuation: the GDN state of every rank, rank 0's two hidden rows and
+// the prefix metadata a claim re-checks. The KV pages are NOT here -- the store owns those in device
+// memory -- so this is a state image, not a lane image, and it is what lets a prefix outlive the
+// lane that produced it.
+struct SharedPayloadImage {
+    LaneStateMetadata metadata;
+    std::optional<HostLinearStateImage> linear;      // rank 0, both slot roles
+    std::optional<HostLinearStateImage> linear_peer; // rank 1
+    // Rank 0's hidden rows: the tail row then the rewrite-checkpoint row, `hidden_bytes` each.
+    std::vector<std::byte> hidden;
+    // The chain's KV, one image per pool and rank, when the payload has a host budget to park into.
+    // Empty means the store holds the device page groups instead; either way a claim restores the
+    // same bytes.
+    std::optional<HostKVImage> text;
+    std::optional<HostKVImage> text_peer;
+    std::optional<HostKVImage> backend;
+    std::optional<HostKVImage> backend_peer;
+    std::uint64_t last_use = 0;
+};
+
+// Page-group slots of one shared block: Main Text on rank 0 and rank 1, then the speculative backend
+// on both. The store moves ids; these names say which pool has to hold them.
+inline constexpr std::uint32_t kSharedSlotText        = 0;
+inline constexpr std::uint32_t kSharedSlotTextPeer    = 1;
+inline constexpr std::uint32_t kSharedSlotBackend     = 2;
+inline constexpr std::uint32_t kSharedSlotBackendPeer = 3;
+
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
     std::uint32_t min_execution_frontier = 0;
@@ -228,6 +272,11 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    // The request that produced this chain licensed prefix reuse and carried no media, so the
+    // chain may be published to the shared block index. A chain that may not stay resident for a
+    // sibling must not appear there either: the index is what a later request looks its prompt up
+    // in, and a promise from a chain nobody may continue is a false hit waiting to be verified.
+    bool shareable = false;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -312,6 +361,18 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] std::optional<std::uint32_t>
+    plan_adopted_lane(const RequestPlan& plan) const noexcept;
+    // The order in which retained lanes may give way to make room for an admission: the shortest
+    // resumable prefix first, least recently retained on a tie. A retained lane is a conversation
+    // the process is holding, and dropping the longest one costs the most to rebuild, so capacity
+    // pressure must not walk lane numbers and take whatever sits lowest.
+    [[nodiscard]] std::vector<std::uint32_t> retained_lane_eviction_order() const;
+    [[nodiscard]] SharedPrefixStats shared_prefix_stats() const;
+    // Drops the least recently used lane-free payloads, giving their page groups and image slots
+    // back. Capacity pressure prefers this to eating a retained conversation: a payload is an
+    // opportunistic copy of a prefix, while a retained lane is a conversation the process holds.
+    std::uint32_t drop_shared_payloads(std::uint32_t count) noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
@@ -587,6 +648,134 @@ private:
     // Packs one lane's resumable state image into the disk tier's staging buffer.
     [[nodiscard]] bool stage_tier_state(std::uint32_t lane, bool checkpoint) noexcept;
     [[nodiscard]] std::uint32_t program_identity_tag() const noexcept;
+
+    // Deepest frontier one resident sequence can continue `prompt` from, by the rule a lane's own
+    // plan has always used: the committed frontier when the target state and its append readiness
+    // agree, otherwise the rewrite checkpoint its prefill captured. `resume` is the sequence the
+    // plan would continue, which is a sibling lane's when this plan adopts a shared prefix.
+    struct ResidentReuse {
+        ReusePath path = ReusePath::FullReset;
+        std::uint32_t base = 0;
+    };
+    [[nodiscard]] ResidentReuse deepest_resident_reuse(const SequenceState& resume,
+                                                       const PreparedPromptData& prompt) const;
+    // The frontier a lane that is STILL RUNNING its own request can hand to a sibling. Its live
+    // frontier and its live GDN state move every round, so neither can be lent; what it can hand
+    // over is the rewrite checkpoint its request resumed from. The pages below that frontier are
+    // already written and a lane that only appends never touches them again, and its state image
+    // sits in a slot the request keeps until a later capture -- which updates this metadata first,
+    // so a claim that a re-capture invalidated fails the check instead of being trusted.
+    [[nodiscard]] ResidentReuse checkpoint_claim(const SequenceState& sibling,
+                                                 const PreparedPromptData& prompt) const;
+    // Clones the donor's continuable state into `lane` up to `plan.reuse_base`: its KV pages are
+    // mapped read-only below the frontier and the page the frontier sits inside is copied, and both
+    // ranks' GDN state, hidden rows, ledger and identity come across. False leaves `lane` untouched,
+    // so the plan falls back to the cold prefill it also priced.
+    [[nodiscard]] bool adopt_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                         const RequestPlanImpl& plan);
+    // Maps one plane of a donor's prefix into a freshly reserved allocation up to `frontier`: every
+    // page the frontier fully covers is borrowed read-only, and the page the frontier sits inside is
+    // copied into a page this allocation owns, because both lanes continue by writing inside it.
+    void adopt_kv_plane(PagedKVPool& pool, PagedKVAllocation& destination,
+                        const PagedKVAllocation& source, std::uint32_t frontier,
+                        std::uint32_t owned_pages, cudaStream_t stream);
+    // The same mapping from raw page ids instead of a source allocation, which is what a node
+    // payload offers: `prefix` is the chain's page group per block and `tail` the page the frontier
+    // sits inside (absent when the frontier ends on a block boundary).
+    void adopt_kv_plane_ids(PagedKVPool& pool, PagedKVAllocation& destination,
+                            std::span<const std::int32_t> prefix, std::int32_t tail,
+                            std::uint32_t frontier, std::uint32_t owned_pages, cudaStream_t stream);
+
+    // The offload that parks one pool slot's KV, or nullptr when the node KV budget is off.
+    [[nodiscard]] HostKVOffload* shared_kv_offload_for(std::uint32_t slot) noexcept;
+    // Parks the chain's KV into pinned host RAM, one image per pool and rank. False leaves the
+    // images empty and the caller keeps the device page groups instead.
+    [[nodiscard]] bool park_payload_kv(std::uint32_t lane, std::uint32_t frontier,
+                                       SharedPayloadImage& image);
+
+    // The pool behind a shared page slot, or nullptr when this profile has no such pool.
+    [[nodiscard]] PagedKVPool* shared_page_pool(std::uint32_t slot) noexcept;
+    [[nodiscard]] const PagedKVPool* shared_page_pool(std::uint32_t slot) const noexcept;
+    // Records the page groups a lane's bundle maps for the chain ending at `tip`.
+    void attach_chain_pages(runtime::prefix_cache::BlockRef tip, const SequenceKVBundle& bundle);
+
+    // --- Shared block index (P2) -------------------------------------------------------------
+    //
+    // Every lane that holds a shareable prefix publishes its chain here, keyed by content. A lane
+    // that cannot continue its own state then looks its prompt up in the tree and adopts the
+    // deepest chain a sibling still serves, instead of scanning every lane and comparing every
+    // resident prefix by hand. The promise a node carries is only a candidate: `lane_serves`
+    // re-derives the continuation from the named lane's live state before a plan may use it.
+
+    // Publishes `frontier` tokens of a lane's committed chain. A no-op unless the request that
+    // produced the chain licensed reuse and this lane still maps its pages.
+    void publish_lane_chain(std::uint32_t lane, std::span<const TokenId> tokens,
+                            std::uint32_t frontier,
+                            runtime::prefix_cache::SharedRole role, std::uint32_t kind);
+
+    // Captures the lane's checkpoint state into a node payload before the lane is displaced, and
+    // takes the holds that keep the chain's page groups alive. False leaves the index as it was, so
+    // the prefix simply stops being shared and falls back to the cold or disk path it always had.
+    [[nodiscard]] bool capture_node_payload(std::uint32_t lane);
+
+    // Continues `lane` from a node payload: maps the chain's page groups read-only (copying the page
+    // the frontier sits inside), restores the captured state into the lane's private slots and
+    // rebuilds the sequence metadata. False leaves `lane` untouched for the cold fallback.
+    [[nodiscard]] bool adopt_node_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                         const RequestPlanImpl& plan);
+
+    void release_shared_payload(std::uint32_t slot) noexcept;
+
+    // Whether the payload's captured prefix is exactly the first `frontier` tokens of `prompt`,
+    // identity axes included: the index matched whole blocks, this is the authoritative check.
+    [[nodiscard]] bool shared_payload_matches(std::uint32_t slot,
+                                              const PreparedPromptData& prompt,
+                                              std::uint32_t frontier) const;
+    [[nodiscard]] bool shared_payload_tail_hidden(std::uint32_t slot) const noexcept;
+    [[nodiscard]] std::uint32_t shared_payload_mtp_frontier(std::uint32_t slot) const noexcept;
+    [[nodiscard]] RewriteCheckpoint shared_payload_checkpoint(std::uint32_t slot) const noexcept;
+    // Best-effort capture on a displacement path: a prefix that could not be captured simply stops
+    // being shared, and nothing about admitting the replacement request changes.
+    void try_capture_node_payload(std::uint32_t lane) noexcept;
+    // Drops lane-free payloads until both pools can hand out the given page counts. Best effort: a
+    // payload that cannot be dropped leaves the pool exactly as it was.
+    void reclaim_payload_pages(std::uint32_t text_pages, std::uint32_t backend_pages) noexcept;
+
+    // Forgets every promise a lane made. Called before its chain can be replaced, so a promise for
+    // a prefix the lane no longer holds cannot outlive it.
+    void forget_lane_chain(std::uint32_t lane) noexcept;
+
+
+    // Content-addressed index of resident prefixes. Its nodes are promises from lanes, so it is
+    // sized from the device pages those lanes can ever hold.
+    std::unique_ptr<runtime::prefix_cache::SharedBlockStore> shared_blocks_;
+    // State images for the nodes the index owns. The arena is the scarce resource -- one image per
+    // restorable node, each the whole GDN state of both ranks -- so its capacity is what bounds how
+    // many lane-free prefixes the process can hold, and the least recently used image is the one a
+    // new capture evicts.
+    std::unique_ptr<HostLinearStateArena> shared_linear_arena_;
+    // The per-node KV host tier: one byte arena shared by the pool geometries, exactly like the lane
+    // tier's, so the budget bounds every parked chain together.
+    std::unique_ptr<HostKVArena> shared_kv_arena_;
+    std::vector<std::unique_ptr<HostKVOffload>> shared_kv_offloads_;
+    std::unique_ptr<PinnedHostBuffer> shared_hidden_;
+    std::vector<std::optional<SharedPayloadImage>> shared_payloads_;
+    // The node each image slot belongs to, so a drop can take the node's payload with it.
+    std::vector<std::optional<runtime::prefix_cache::BlockRef>> shared_payload_nodes_;
+    std::size_t shared_hidden_row_bytes_ = 0;
+    // Page groups the store holds out of the pools on a payload's behalf, per pool family. They are
+    // what makes the bytes outlive their lane, and what has to come back before a pool can promise
+    // that capacity again.
+    std::uint32_t shared_held_text_pages_    = 0;
+    std::uint32_t shared_held_backend_pages_ = 0;
+    // Monotonic stamp ordering owner promises and retained-lane eviction.
+    std::uint64_t shared_epoch_ = 0;
+    std::array<std::uint64_t, kMaximumConcurrency> retained_epoch_{};
+    // Index usage counters: one lookup per plan that asks the tree where a prompt is resident, one
+    // hit per plan the tree answered, and the blocks reclaimed when no lane served them any more.
+    mutable std::uint64_t shared_lookups_ = 0;
+    mutable std::uint64_t shared_hits_    = 0;
+    mutable std::uint64_t shared_pruned_  = 0;
 
     void drop_parked_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] KVPageGeometry text_kv_geometry() const;

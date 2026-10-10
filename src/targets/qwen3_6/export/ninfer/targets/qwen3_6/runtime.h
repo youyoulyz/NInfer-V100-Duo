@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ninfer {
 struct DeviceContext;
@@ -156,6 +157,21 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // The lane whose retained prefix this plan maps read-only, or nullopt when the plan continues
+    // that lane's own state. An adopting plan depends on the lender's bytes staying where they are
+    // until the request lands, so its plan is never reused across control steps.
+    [[nodiscard]] std::optional<std::uint32_t>
+    plan_adopted_lane(const RequestPlan<Variant>& plan) const noexcept;
+    // Retained lanes in the order capacity pressure may release them: the cheapest conversation to
+    // rebuild first (the shortest frontier only it serves), least recently retained on a tie.
+    [[nodiscard]] std::vector<std::uint32_t> retained_lane_eviction_order() const;
+    // How the shared block index is being used: lookups, hits, reclaimed blocks and the current
+    // node/owner census. Reported through the Engine's periodic runtime stats.
+    [[nodiscard]] SharedPrefixStats shared_prefix_stats() const;
+    // Gives up `count` lane-free shared payloads, least recently used first, returning how many went.
+    // Capacity pressure prefers this to evicting a retained conversation; the prefix stops being
+    // claimable without a lane and falls back to the colder path it always had.
+    std::uint32_t drop_shared_payloads(std::uint32_t count) noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,

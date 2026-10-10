@@ -240,6 +240,14 @@ set_tests_properties(ninfer_qwen3_6_27b_host_tier_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # NVMe lane tier end to end: evict two retained lanes, destroy the engine, and resume both prefixes
 # out of the disk records alone with a greedy-identical continuation and zero prefill tokens.
+# Lane-free shared prefixes end to end: a displaced conversation is captured into the block index
+# (page groups held, GDN state in host RAM) and a later request claims it without any lane holding it.
+ninfer_add_test(ninfer_qwen3_6_27b_shared_payload_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_shared_payload_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_shared_payload_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_shared_payload_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 ninfer_add_test(ninfer_qwen3_6_27b_disk_tier_real_test
   SOURCES targets/qwen3_6_27b/test_engine_disk_tier_real.cpp
   LIBRARIES ninfer_engine)

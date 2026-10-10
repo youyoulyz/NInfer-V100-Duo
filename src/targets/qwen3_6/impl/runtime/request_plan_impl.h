@@ -181,6 +181,63 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+// The deepest frontier one resident sequence can continue `prompt` from. This is the rule a lane
+// has always applied to its own state, lifted out so a sibling lane's state is priced identically:
+// the committed frontier when the target backend's append readiness agrees, otherwise the rewrite
+// checkpoint the prefill captured, which is the frontier a re-sent prompt resumes from.
+ProgramImplCore::ResidentReuse
+ProgramImplCore::deepest_resident_reuse(const SequenceState& resume,
+                                        const PreparedPromptData& prompt) const {
+    ResidentReuse best;
+    if (!resume.retained) { return best; }
+    const bool dflash_append_ready =
+        speculative_backend != SpeculativeBackend::DFlash ||
+        resume.dflash_context_frontier == resume.execution_frontier;
+    if (resume.execution_frontier != 0 && dflash_append_ready &&
+        qwen3_6::detail::prefix_matches(prompt, resume.ledger, resume.prefix_identity,
+                                        resume.execution_frontier)) {
+        best.path = ReusePath::AppendAtFrontier;
+        best.base = resume.execution_frontier;
+        return best;
+    }
+    if (resume.rewrite_checkpoint.valid && resume.rewrite_checkpoint.frontier != 0 &&
+        resume.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
+        qwen3_6::detail::prefix_matches(prompt, resume.ledger, resume.prefix_identity,
+                                        resume.rewrite_checkpoint.frontier)) {
+        best.path = restore_path(resume.rewrite_checkpoint.kind);
+        best.base = resume.rewrite_checkpoint.frontier;
+    }
+    return best;
+}
+
+// The frontier a RUNNING lane can hand to a sibling: the rewrite checkpoint its request resumed
+// from, and nothing else. Its live frontier, its live pages above that frontier and its `current`
+// GDN slot all move every round, but a lane that only appends never writes below the frontier it
+// resumed from, and the checkpoint's own state slot is left alone until a later capture replaces
+// it -- which lands in this metadata first, so the re-verification at admission sees it.
+ProgramImplCore::ResidentReuse
+ProgramImplCore::checkpoint_claim(const SequenceState& sibling,
+                                  const PreparedPromptData& prompt) const {
+    ResidentReuse best;
+    const RewriteCheckpoint& checkpoint = sibling.rewrite_checkpoint;
+    if (!sibling.kv || !checkpoint.valid || checkpoint.frontier == 0 ||
+        checkpoint.frontier > prompt.token_ids.size() ||
+        checkpoint.frontier > sibling.text_kv_valid) {
+        return best;
+    }
+    if (speculative_backend == SpeculativeBackend::Mtp &&
+        sibling.mtp_kv_valid + 1 < checkpoint.frontier) {
+        return best;
+    }
+    if (!qwen3_6::detail::prefix_matches(prompt, sibling.ledger, sibling.prefix_identity,
+                                         checkpoint.frontier)) {
+        return best;
+    }
+    best.path = restore_path(checkpoint.kind);
+    best.base = checkpoint.frontier;
+    return best;
+}
+
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
@@ -199,34 +256,179 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->cold_service_work_quanta    = base.summary.service_work_quanta;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
-        const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
-            sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
-            plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+        const ResidentReuse own = deepest_resident_reuse(sequence, prompt);
+        plan->reuse             = own.path;
+        plan->reuse_base        = own.base;
+    }
+
+    // Nothing of this lane's own continues the prompt. A sibling lane may still hold it: a caller
+    // that repeats one long prompt reaches the pool through whichever lane the last request ran on,
+    // so the bytes are there while that lane lives -- idle after its request, or still draining the
+    // one that is using it. Adopting them maps the sibling's pages read-only and copies its state
+    // instead of paying the same prefill again, which is the whole point of the shared prefix.
+    //
+    // The shared block index is how that sibling is found. Every lane publishes the chains it holds
+    // when it commits them, and a prompt is answered with the deepest chain of its own that any
+    // lane still serves -- content addressing instead of scanning every resident prefix. The claim
+    // itself is unchanged: a prefix whose KV pages are already written and whose complete
+    // linear-attention snapshot exists. For an idle lane that is its resident frontier or the
+    // rewrite checkpoint its last turn captured; for a lane still running a request, only the
+    // checkpoint qualifies -- its live frontier and its live state move every round, while the
+    // checkpoint slot its request resumed from is left alone until that request finishes (and a
+    // re-capture, which does move it, updates the metadata the claim is re-verified against).
+    //
+    // Vision stays out of it: an adopted plan drops the media spans it no longer has to encode, and
+    // a fallback that has to encode them again would need to rebuild that planning step. DFlash
+    // keeps per-lane context outside the KV bundle, which this path does not clone.
+    if (base.allow_prefix_reuse && prompt.identity.reusable && !prompt.has_media() &&
+        plan->reuse == ReusePath::FullReset &&
+        speculative_backend != SpeculativeBackend::DFlash &&
+        speculative_backend != SpeculativeBackend::DFlash2 && shared_blocks_ != nullptr) {
+        // The content index holds a promise for every block of every shareable chain a lane has
+        // published. Asking it for this prompt's chain names the lanes that can serve it -- and only
+        // those -- instead of grading every resident prefix in the pool. What comes back is a
+        // candidate, never an answer: the continuation is re-derived from the named lane's live
+        // state below, exactly as the lane's own plan always has.
+        //
+        // That check compares whole prefixes, so it is memoized per lane; the walk asks about the
+        // same handful of lanes at every block of the chain.
+        const std::vector<std::uint64_t> hashes =
+            runtime::prefix_cache::block_lookup_hashes(prompt.token_ids, {});
+        std::array<ResidentReuse, kMaximumConcurrency> candidate_reuse{};
+        std::array<std::uint8_t, kMaximumConcurrency> candidate_state{};
+        const auto evaluate = [&](std::uint32_t other) -> const ResidentReuse& {
+            static const ResidentReuse kNotACandidate{};
+            if (other >= max_concurrency) { return kNotACandidate; }
+            if (candidate_state[other] != 0) { return candidate_reuse[other]; }
+            candidate_state[other] = 3; // "checked, not a candidate" until proven otherwise
+            if (other == lane || !sequences[other].kv) { return candidate_reuse[other]; }
+            const bool idle = sequences[other].retained;
+            const bool busy = requests[other].lifecycle == Lifecycle::Prefilling ||
+                              requests[other].lifecycle == Lifecycle::Active ||
+                              requests[other].lifecycle == Lifecycle::Pending;
+            if (idle) {
+                candidate_reuse[other] = deepest_resident_reuse(sequences[other], prompt);
+            } else if (busy) {
+                candidate_reuse[other] = checkpoint_claim(sequences[other], prompt);
+            }
+            if (candidate_reuse[other].path != ReusePath::FullReset) {
+                candidate_state[other] = idle ? 1U : 2U;
+            }
+            return candidate_reuse[other];
+        };
+        ++shared_lookups_;
+        const runtime::prefix_cache::SharedBlockLookup lookup = shared_blocks_->lookup(
+            prompt.token_ids, hashes, {},
+            [&evaluate](const runtime::prefix_cache::SharedBlockOwner& owner,
+                        std::uint32_t tokens) {
+                const ResidentReuse& reuse = evaluate(owner.lane);
+                return reuse.path != ReusePath::FullReset && reuse.base >= tokens;
+            });
+        bool have           = false;
+        bool best_idle      = false;
+        bool best_owner     = false;
+        bool from_payload   = false;
+        std::uint32_t donor = 0;
+        ResidentReuse best;
+        if (lookup.owner.has_value()) {
+            ++shared_hits_;
+            const runtime::prefix_cache::SharedBlockHit& hit = *lookup.owner;
+            for (std::uint32_t index = 0; index < hit.owner_count; ++index) {
+                const std::uint32_t other = hit.owners[index].lane;
+                if (other >= max_concurrency || other == lane || !sequences[other].kv) { continue; }
+                const SequenceState& sibling = sequences[other];
+                const ResidentReuse reuse    = evaluate(other);
+                if (reuse.path == ReusePath::FullReset || reuse.base < hit.tokens) { continue; }
+                // Deepest wins; on a tie an idle lender beats a running one (the claim does not
+                // have to share a lane that is writing), and a lender that owns its pages beats one
+                // that is itself borrowing them, so claims do not chain.
+                const bool idle  = candidate_state[other] == 1U;
+                const bool owner = !sibling.kv->text.borrowed();
+                const bool better =
+                    !have || reuse.base > best.base ||
+                    (reuse.base == best.base &&
+                     (idle != best_idle ? idle : (owner && !best_owner)));
+                if (!better) { continue; }
+                have        = true;
+                best        = reuse;
+                donor       = other;
+                best_idle   = idle;
+                best_owner  = owner;
+            }
+        }
+        // The other way the index can answer: a node payload, where the store owns the page groups
+        // and a captured state image restores the continuation, so no lane has to hold the prefix at
+        // all. It is only worth taking when it reaches deeper than a live lane -- a lane is cheaper
+        // and fresher -- and only when the captured prefix really is this prompt's, which the tree's
+        // whole-block match cannot decide on its own.
+        if (lookup.payload.has_value()) {
+            const runtime::prefix_cache::SharedBlockPayloadView& view = *lookup.payload;
+            const std::uint32_t frontier = view.payload.frontier;
+            if (view.payload.role == runtime::prefix_cache::SharedRole::Checkpoint &&
+                frontier != 0 && frontier <= prompt.token_ids.size() && !have &&
+                frontier >= plan->disk_restore_frontier &&
+                shared_payload_matches(view.payload.image, prompt, frontier)) {
+                ++shared_hits_;
+                have         = true;
+                from_payload = true;
+                best         = ResidentReuse{
+                    .path = restore_path(static_cast<RewriteCheckpointKind>(view.payload.kind)),
+                    .base = frontier};
+            }
+        }
+        // A resident claim is worth taking only when it reaches at least as deep as the NVMe record
+        // this plan may also be carrying: the bytes are already in device memory, so a tie goes to
+        // the resident one, and a shallower one would trade a longer reuse for a shorter one. Taking
+        // it makes the plan a resident plan, so the disk record it was built on stops being one.
+        if (have && best.base >= plan->disk_restore_frontier) {
+            plan->reuse                 = best.path;
+            plan->reuse_base            = best.base;
+            plan->adopt_lane            = from_payload ? std::nullopt
+                                                       : std::optional<std::uint32_t>(donor);
+            plan->adopt_node            = from_payload
+                                              ? std::optional<runtime::prefix_cache::BlockRef>(
+                                                    lookup.payload->node)
+                                              : std::nullopt;
+            plan->disk_restore_frontier = 0;
         }
     }
 
+    // Everything below is a property of the state the plan continues, whichever holder serves it:
+    // the lane this plan adopts from, a node payload that outlived its lane, or this lane's own
+    // state. A payload has no sequence left to read, so its captured image stands in for one.
+    const bool adopting = plan->adopt_lane.has_value() || plan->adopt_node.has_value();
+    const SequenceState& resume =
+        plan->adopt_lane.has_value() ? sequences[*plan->adopt_lane] : sequence;
+    bool resume_tail_hidden_valid    = resume.tail_hidden_valid;
+    std::uint32_t resume_mtp_kv_valid = resume.mtp_kv_valid;
+    RewriteCheckpoint resume_checkpoint = resume.rewrite_checkpoint;
+    if (plan->adopt_node.has_value()) {
+        const std::uint32_t image = shared_blocks_->payload(*plan->adopt_node).image;
+        resume_tail_hidden_valid = shared_payload_tail_hidden(image);
+        resume_mtp_kv_valid      = shared_payload_mtp_frontier(image);
+        resume_checkpoint        = shared_payload_checkpoint(image);
+    }
+    // Whether the first `count` tokens of the prompt really continue the plan's reuse point, identity
+    // axes included. A payload answers from its image; a lane from its live ledger.
+    const auto prefix_serves = [&](std::uint32_t count) {
+        if (plan->adopt_node.has_value()) {
+            return shared_payload_matches(shared_blocks_->payload(*plan->adopt_node).image, prompt,
+                                          count);
+        }
+        return qwen3_6::detail::prefix_matches(prompt, resume.ledger, resume.prefix_identity, count);
+    };
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
-            plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
+            plan->reuse == ReusePath::AppendAtFrontier && resume_tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
-            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+            (plan->reuse_base == 0 || resume_mtp_kv_valid >= plan->reuse_base - 1);
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
-                                      sequence.mtp_kv_valid >= plan->reuse_base - 1;
+                                      resume_mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
@@ -235,10 +437,59 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
-        (!dflash || !sequence.kv || !sequence.kv->backend ||
-         sequence.dflash_context_frontier < plan->reuse_base)) {
+        (!dflash || !resume.kv || !resume.kv->backend ||
+         resume.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
+    }
+
+    // A plan that lost its reuse -- the MTP gate above, or the DFlash one -- is no longer an
+    // adoption, and nothing below may keep charging it as one.
+    if (plan->reuse == ReusePath::FullReset &&
+        (plan->adopt_lane.has_value() || plan->adopt_node.has_value())) {
+        plan->adopt_lane.reset();
+        plan->adopt_node.reset();
+        plan->reuse_base = 0;
+    }
+
+    // The donor's pages are already covered by its own entitlement, so this lane reserves only the
+    // region above `reuse_base` it will actually own, and the pages below that frontier are mapped
+    // read-only. Charging the borrowed pages again would double-count the same physical memory,
+    // which is what makes an N-lane shared prefix fit where N cold reservations would not.
+    // A payload whose KV lives in host RAM does not borrow anything: the claim restores every page
+    // into the lane's own allocation, so its entitlement is the cold footprint unchanged.
+    const bool payload_owns_pages =
+        plan->adopt_node.has_value() && shared_blocks_->payload(*plan->adopt_node).kv_in_host();
+    if ((plan->adopt_lane.has_value() || plan->adopt_node.has_value()) && !payload_owns_pages) {
+        // The MTP bridge continues one token behind the text frontier, exactly as its own lane
+        // would: the backend plane is adopted to the same rule, one token lower.
+        const std::uint32_t backend_frontier =
+            plan->reuse_base == 0 ? 0 : plan->reuse_base - 1;
+        const std::uint32_t adopted_text_pages =
+            plan->reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t adopted_backend_pages =
+            speculative_backend == SpeculativeBackend::Mtp
+                ? backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize)
+                : 0;
+        const std::uint32_t owned_text =
+            plan->text_kv_page_entitlement - adopted_text_pages;
+        const std::uint32_t owned_backend =
+            plan->backend_kv_page_entitlement - adopted_backend_pages;
+        const bool owns_nothing =
+            owned_text == 0 ||
+            (speculative_backend == SpeculativeBackend::Mtp && owned_backend == 0);
+        if (owns_nothing) {
+            // The adopted prefix already covers the lane's whole reservation, so the lane would own
+            // no page at all -- and a mapping with no entitlement of its own cannot grow. There is
+            // nothing to gain over the cold start the base plan priced, so take that one.
+            plan->adopt_lane.reset();
+            plan->adopt_node.reset();
+            plan->reuse      = ReusePath::FullReset;
+            plan->reuse_base = 0;
+        } else {
+            plan->text_kv_page_entitlement    = owned_text;
+            plan->backend_kv_page_entitlement = owned_backend;
+        }
     }
 
     // Nothing resident matches, but the prompt's own content may still be on the NVMe tier. The
@@ -264,10 +515,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // resident hit past that boundary already does.
     const bool existing_checkpoint_matches =
         desired && plan->reuse != ReusePath::FullReset && plan->disk_restore_frontier == 0 &&
-        sequence.rewrite_checkpoint.valid &&
-        sequence.rewrite_checkpoint.frontier == desired->frontier &&
-        qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                        desired->frontier);
+        resume_checkpoint.valid && resume_checkpoint.frontier == desired->frontier &&
+        prefix_serves(desired->frontier);
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {

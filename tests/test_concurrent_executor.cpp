@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -215,6 +216,19 @@ public:
     }
 
     [[nodiscard]] bool lane_tier_enabled() const noexcept { return false; }
+
+    // This scripted program never shares a prefix across lanes, so an adopting plan is never
+    // produced, no lane is ever retained for eviction to order, and the shared index is inert.
+    [[nodiscard]] std::optional<std::uint32_t> plan_adopted_lane(const ScriptedPlan&) const noexcept {
+        return std::nullopt;
+    }
+    [[nodiscard]] std::vector<std::uint32_t> retained_lane_eviction_order() const {
+        std::vector<std::uint32_t> order;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { order.push_back(lane); }
+        return order;
+    }
+    [[nodiscard]] ninfer::SharedPrefixStats shared_prefix_stats() const { return {}; }
+    std::uint32_t drop_shared_payloads(std::uint32_t) noexcept { return 0; }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
                                              ScriptedPlan&& plan, rt::TransientRegion) {

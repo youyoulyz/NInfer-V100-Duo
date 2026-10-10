@@ -153,6 +153,27 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
+std::optional<std::uint32_t>
+Program<Variant>::plan_adopted_lane(const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->plan_adopted_lane(plan);
+}
+
+template <>
+std::vector<std::uint32_t> Program<Variant>::retained_lane_eviction_order() const {
+    return impl_->retained_lane_eviction_order();
+}
+
+template <>
+SharedPrefixStats Program<Variant>::shared_prefix_stats() const {
+    return impl_->shared_prefix_stats();
+}
+
+template <>
+std::uint32_t Program<Variant>::drop_shared_payloads(std::uint32_t count) noexcept {
+    return impl_->drop_shared_payloads(count);
+}
+
+template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,

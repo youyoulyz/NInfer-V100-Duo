@@ -401,6 +401,80 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
+    {
+        // The shared block index holds a promise per 64-token block of a resident prefix, and every
+        // promise comes from a lane that had to map a page group for that block. Its budget is
+        // therefore the device page groups the two pools can hand out, plus a margin for blocks a
+        // lane published just before capacity pressure rewound it.
+        const std::uint32_t text_pages = decoder->text_kv.pool().page_group_count();
+        const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        const std::uint32_t backend_pages =
+            backend != nullptr ? backend->pool().page_group_count() : 0U;
+        shared_blocks_ = std::make_unique<runtime::prefix_cache::SharedBlockStore>(
+            text_pages + backend_pages + 64U);
+        // Payload state images are opt-in: without them the index still shares live prefixes, but a
+        // prefix whose lane is displaced stops being reachable, exactly as before.
+        if (plan.shared_state_images != 0) {
+            const std::array<std::int32_t, 2> slots{
+                LinearStateSlots::current_state_slot(0, max_concurrency),
+                LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)};
+            const HostLinearStateLayout layout =
+                plan_host_linear_state_layout(decoder->linear_attention.spec, slots);
+            // One image per rank per payload, and the two hidden rows rank 0 keeps per payload.
+            const std::size_t ranks = tp == 2 ? 2U : 1U;
+            shared_linear_arena_ = std::make_unique<HostLinearStateArena>(
+                static_cast<std::size_t>(plan.shared_state_images) * ranks * layout.total_bytes);
+            shared_hidden_row_bytes_ = static_cast<std::size_t>(TextConfig::hidden) * 2ULL;
+            shared_hidden_ = std::make_unique<PinnedHostBuffer>(
+                static_cast<std::size_t>(plan.shared_state_images) * 2ULL * shared_hidden_row_bytes_);
+            shared_payloads_.resize(plan.shared_state_images);
+            shared_payload_nodes_.resize(plan.shared_state_images);
+            if (plan.shared_kv_bytes != 0) {
+                // One arena for every pool geometry, so the budget bounds all parked chains
+                // together; each offload only accepts a pool whose layout matches its own.
+                std::vector<HostKVPageLayout> layouts;
+                layouts.push_back(plan_host_kv_page_layout(text_kv_geometry()));
+                if (backend_kv_cache() != nullptr) {
+                    layouts.push_back(plan_host_kv_page_layout(backend_kv_geometry()));
+                }
+                shared_kv_arena_ =
+                    std::make_unique<HostKVArena>(plan.shared_kv_bytes, layouts);
+                shared_kv_offloads_.push_back(std::make_unique<HostKVOffload>(
+                    *shared_kv_arena_, text_kv_geometry()));
+                if (backend_kv_cache() != nullptr) {
+                    shared_kv_offloads_.push_back(std::make_unique<HostKVOffload>(
+                        *shared_kv_arena_, backend_kv_geometry()));
+                }
+            }
+        }
+        // The store cannot touch a pool or an arena itself; these hooks are how it holds the page
+        // groups and the image slots of the nodes it owns, and how it gives them back when a node is
+        // dropped.
+        runtime::prefix_cache::SharedBlockStoreHooks hooks;
+        hooks.hold_page = [this](std::uint32_t slot, std::int32_t page) {
+            PagedKVPool* pool = shared_page_pool(slot);
+            if (pool == nullptr) { throw std::logic_error("shared prefix page slot has no pool"); }
+            pool->hold_page(page);
+            if (slot == kSharedSlotText || slot == kSharedSlotTextPeer) {
+                ++shared_held_text_pages_;
+            } else {
+                ++shared_held_backend_pages_;
+            }
+        };
+        hooks.release_page = [this](std::uint32_t slot, std::int32_t page) noexcept {
+            PagedKVPool* pool = shared_page_pool(slot);
+            if (pool == nullptr) { return; }
+            pool->release_held_page(page);
+            std::uint32_t& counter = (slot == kSharedSlotText || slot == kSharedSlotTextPeer)
+                                         ? shared_held_text_pages_
+                                         : shared_held_backend_pages_;
+            if (counter != 0) { --counter; }
+        };
+        hooks.release_image = [this](std::uint32_t slot) noexcept {
+            release_shared_payload(slot);
+        };
+        shared_blocks_->set_hooks(std::move(hooks));
+    }
 
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
@@ -561,6 +635,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    // An adopting plan maps pages a retained sibling still owns, and the reclaimable capacity this
+    // pass offers is computed from exactly those entitlements. Making room for it by evicting
+    // retained lanes could take the lender's bytes with them, so it is only ever admitted where it
+    // already fits (`can_admit_lane`); where it does not, the request waits as it does today.
+    if (plan.impl_->adopt_lane.has_value()) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -612,6 +691,791 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     };
 }
 
+std::optional<std::uint32_t>
+ProgramImplCore::plan_adopted_lane(const RequestPlan& plan) const noexcept {
+    if (plan.impl_ == nullptr) { return std::nullopt; }
+    return plan.impl_->adopt_lane;
+}
+
+// Publishes a lane's committed chain to the shared block index. The promise is (lane, frontier,
+// role): the lane holds a continuation state at `frontier` and its KV covers every block below it.
+// A later request looks its own prompt up by content and re-derives that continuation from the
+// lane's live state, so a promise that outlived its chain is a failed check, never a wrong hit.
+//
+// The page groups of every block the chain covers are recorded with it -- held out of their pools --
+// so a claim can map them even after this lane's bundle is gone.
+void ProgramImplCore::publish_lane_chain(std::uint32_t lane, std::span<const TokenId> tokens,
+                                         std::uint32_t frontier,
+                                         runtime::prefix_cache::SharedRole role,
+                                         std::uint32_t kind) {
+    if (shared_blocks_ == nullptr || lane >= max_concurrency || frontier == 0) { return; }
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.shareable || !sequence.kv.has_value()) { return; }
+    // DFlash keeps its per-lane context outside the KV bundle this path clones, and a vision prompt
+    // carries media spans a claim could not re-derive, so neither publishes.
+    if (speculative_backend == SpeculativeBackend::DFlash ||
+        speculative_backend == SpeculativeBackend::DFlash2) {
+        return;
+    }
+    const std::size_t tokens_of_frontier = std::min<std::size_t>(frontier, tokens.size());
+    const std::size_t blocks = tokens_of_frontier / runtime::prefix_cache::kBlockTokens;
+    if (blocks == 0) { return; }
+    const std::span<const TokenId> chain(tokens.data(), tokens_of_frontier);
+    const std::vector<std::uint64_t> hashes =
+        runtime::prefix_cache::block_lookup_hashes(chain, {});
+    const std::uint64_t epoch = ++shared_epoch_;
+    if (role == runtime::prefix_cache::SharedRole::Append) { retained_epoch_[lane] = epoch; }
+    (void)shared_blocks_->intern(
+        chain, hashes, {},
+        runtime::prefix_cache::SharedBlockOwner{.lane = lane,
+                                                .frontier = frontier,
+                                                .kind = kind,
+                                                .role = role,
+                                                .last_use = epoch});
+    // No page groups are held here: while this lane lives its own allocation keeps them, and a hold
+    // would only take them out of the pool's accounting early. The hold is taken at capture, when
+    // the lane is about to give the bytes up.
+}
+
+std::int32_t block_page_of(const PagedKVAllocation* allocation, std::size_t block) noexcept {
+    if (allocation == nullptr || block >= allocation->mapped_page_count()) {
+        return runtime::prefix_cache::kNoSharedPage;
+    }
+    return allocation->page_ids()[block];
+}
+
+// Records the page groups a lane's bundle maps for the chain ending at `tip`: one page group per
+// 64-token block, per pool and rank.
+void ProgramImplCore::attach_chain_pages(runtime::prefix_cache::BlockRef tip,
+                                         const SequenceKVBundle& bundle) {
+    std::vector<runtime::prefix_cache::BlockRef> chain;
+    for (runtime::prefix_cache::BlockRef cursor = tip;
+         shared_blocks_->view(cursor).has_value();) {
+        chain.push_back(cursor);
+        const std::optional<runtime::prefix_cache::BlockView> view = shared_blocks_->view(cursor);
+        cursor = view->parent;
+    }
+    std::reverse(chain.begin(), chain.end());
+    const PagedKVAllocation* text_peer =
+        bundle.text_peer.has_value() ? &*bundle.text_peer : nullptr;
+    const PagedKVAllocation* backend = bundle.backend.has_value() ? &*bundle.backend : nullptr;
+    const PagedKVAllocation* backend_peer =
+        bundle.backend_peer.has_value() ? &*bundle.backend_peer : nullptr;
+    for (std::size_t block = 0; block < chain.size(); ++block) {
+        runtime::prefix_cache::SharedBlockPages pages;
+        pages.page[kSharedSlotText]        = block_page_of(&bundle.text, block);
+        pages.page[kSharedSlotTextPeer]    = block_page_of(text_peer, block);
+        pages.page[kSharedSlotBackend]     = block_page_of(backend, block);
+        pages.page[kSharedSlotBackendPeer] = block_page_of(backend_peer, block);
+        if (pages.any()) { shared_blocks_->attach_pages(chain[block], pages); }
+    }
+}
+
+PagedKVPool* ProgramImplCore::shared_page_pool(std::uint32_t slot) noexcept {
+    switch (slot) {
+    case kSharedSlotText: return &decoder->text_kv.pool();
+    case kSharedSlotTextPeer: return peer.has_value() ? &peer->decoder->text_kv.pool() : nullptr;
+    case kSharedSlotBackend: {
+        qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        return backend != nullptr ? &backend->pool() : nullptr;
+    }
+    case kSharedSlotBackendPeer: {
+        if (!peer.has_value()) { return nullptr; }
+        qwen3_6::PagedKVCache* backend = peer->decoder->mtp_cache();
+        return backend != nullptr ? &backend->pool() : nullptr;
+    }
+    default: return nullptr;
+    }
+}
+
+const PagedKVPool* ProgramImplCore::shared_page_pool(std::uint32_t slot) const noexcept {
+    return const_cast<ProgramImplCore*>(this)->shared_page_pool(slot);
+}
+
+
+// Captures the lane's checkpoint continuation into a node payload before the lane is displaced: the
+// GDN state of both ranks, rank 0's hidden rows and the prefix metadata. The page groups are already
+// held (every published chain records them), so what is left is the state, which is what makes the
+// prefix restorable without any lane. False leaves the index exactly as it was.
+bool ProgramImplCore::capture_node_payload(std::uint32_t lane) {
+    if (shared_blocks_ == nullptr || shared_payloads_.empty() || lane >= max_concurrency) {
+        return false;
+    }
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.shareable || !sequence.kv.has_value()) { return false; }
+    if (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0) {
+        return false;
+    }
+    const std::uint32_t frontier = sequence.rewrite_checkpoint.frontier;
+    if (frontier > sequence.text_kv_valid || frontier > sequence.ledger.size()) { return false; }
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if (mtp && sequence.mtp_kv_valid + 1U < frontier) { return false; }
+    const std::vector<TokenId> chain(sequence.ledger.begin(),
+                                     sequence.ledger.begin() + frontier);
+    const std::vector<std::uint64_t> hashes =
+        runtime::prefix_cache::block_lookup_hashes(chain, {});
+    const std::optional<runtime::prefix_cache::BlockRef> node =
+        shared_blocks_->find(chain, hashes, {});
+    if (!node.has_value() || shared_blocks_->has_payload(*node)) { return false; }
+
+    std::uint32_t slot = runtime::prefix_cache::kNoSharedImage;
+    for (std::uint32_t index = 0; index < shared_payloads_.size(); ++index) {
+        if (!shared_payloads_[index]) { slot = index; break; }
+    }
+    if (slot == runtime::prefix_cache::kNoSharedImage) {
+        // Every image slot is taken. The least recently used payload is the cheapest to give up:
+        // dropping it also reclaims the page groups it was holding for the pool.
+        if (drop_shared_payloads(1) == 0) { return false; }
+        for (std::uint32_t index = 0; index < shared_payloads_.size(); ++index) {
+            if (!shared_payloads_[index]) { slot = index; break; }
+        }
+        if (slot == runtime::prefix_cache::kNoSharedImage) { return false; }
+    }
+
+    SharedPayloadImage image;
+    image.metadata.ledger.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
+    image.metadata.prefix_identity = sequence.prefix_identity;
+    // The checkpoint branch of the admission truncates the digest image to the frontier before the
+    // request's own prompt replaces it, so the captured image has to carry one that reaches it.
+    image.metadata.prefix_digests = sequence.prefix_digests;
+    image.metadata.rewrite_checkpoint =
+        RewriteCheckpoint{.valid = true,
+                          .kind = sequence.rewrite_checkpoint.kind,
+                          .frontier = frontier};
+    image.metadata.execution_frontier = frontier;
+    image.metadata.ledger_frontier    = frontier;
+    image.metadata.text_kv_valid      = frontier;
+    image.metadata.mtp_kv_valid       = mtp ? frontier - 1U : 0U;
+    image.metadata.mtp_draft_count    = 0;
+    image.metadata.rope_delta         = sequence.rope_delta;
+    image.metadata.tail_hidden_valid  = sequence.tail_hidden_valid;
+    const std::array<std::int32_t, 2> slots{
+        LinearStateSlots::current_state_slot(lane, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency)};
+    image.linear = park_linear_state(*shared_linear_arena_, decoder->linear_attention, slots,
+                                     device.stream);
+    if (!image.linear) { return false; }
+    if (peer.has_value()) {
+        const ScopedDevice scope(peer->device.device);
+        image.linear_peer = park_linear_state(*shared_linear_arena_, peer->decoder->linear_attention,
+                                              slots, peer->device.stream);
+        if (!image.linear_peer) { return false; }
+    }
+    auto* const hidden = static_cast<std::byte*>(shared_hidden_->data()) +
+                         static_cast<std::size_t>(slot) * 2ULL * shared_hidden_row_bytes_;
+    CUDA_CHECK(cudaMemcpyAsync(hidden, sequence.tail_hidden.data, sequence.tail_hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(hidden + shared_hidden_row_bytes_,
+                               sequence.rewrite_checkpoint_hidden.data,
+                               sequence.rewrite_checkpoint_hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    image.last_use = ++shared_epoch_;
+
+    runtime::prefix_cache::SharedBlockPayload payload;
+    payload.frontier = frontier;
+    payload.kind     = static_cast<std::uint32_t>(sequence.rewrite_checkpoint.kind);
+    payload.role     = runtime::prefix_cache::SharedRole::Checkpoint;
+    payload.image    = slot;
+    payload.last_use = image.last_use;
+    // The page groups the frontier sits inside, one per pool. A frontier that ends on a block
+    // boundary needs none: the chain's own last page already covers it.
+    if (frontier % kPagedKVPageSize != 0) {
+        const std::size_t tail = frontier / kPagedKVPageSize;
+        payload.tail.page[kSharedSlotText] = block_page_of(&sequence.kv->text, tail);
+        payload.tail.page[kSharedSlotTextPeer] =
+            block_page_of(sequence.kv->text_peer ? &*sequence.kv->text_peer : nullptr, tail);
+    }
+    if (mtp && (frontier - 1U) % kPagedKVPageSize != 0) {
+        const std::size_t tail = (frontier - 1U) / kPagedKVPageSize;
+        payload.tail.page[kSharedSlotBackend] =
+            block_page_of(sequence.kv->backend ? &*sequence.kv->backend : nullptr, tail);
+        payload.tail.page[kSharedSlotBackendPeer] =
+            block_page_of(sequence.kv->backend_peer ? &*sequence.kv->backend_peer : nullptr, tail);
+    }
+    // Where the bytes are going to live. A per-node host copy releases the device pages, so a
+    // displaced conversation no longer competes for the pool; when it does not fit, the store holds
+    // the page groups instead and the prefix keeps its place on the device.
+    if (park_payload_kv(lane, frontier, image)) {
+        payload.copies = static_cast<std::uint8_t>(runtime::prefix_cache::BlockCopy::Host);
+    } else {
+        attach_chain_pages(*node, *sequence.kv);
+        if (!shared_blocks_->chain_has_pages(*node)) { return false; }
+        payload.copies = static_cast<std::uint8_t>(runtime::prefix_cache::BlockCopy::Device);
+    }
+    shared_payloads_[slot]       = std::move(image);
+    shared_payload_nodes_[slot]  = *node;
+    shared_blocks_->attach_payload(*node, payload);
+    return true;
+}
+
+void ProgramImplCore::release_shared_payload(std::uint32_t slot) noexcept {
+    if (slot >= shared_payloads_.size()) { return; }
+    // The images are RAII: dropping them returns their extents to the arena. The node is the
+    // caller's business -- a drop goes through the store so the node stops advertising a payload.
+    shared_payloads_[slot].reset();
+    if (slot < shared_payload_nodes_.size()) { shared_payload_nodes_[slot].reset(); }
+}
+
+
+std::uint32_t ProgramImplCore::drop_shared_payloads(std::uint32_t count) noexcept {
+    std::uint32_t dropped = 0;
+    while (dropped < count) {
+        std::optional<std::uint32_t> victim;
+        std::uint64_t oldest = 0;
+        for (std::uint32_t slot = 0; slot < shared_payloads_.size(); ++slot) {
+            if (!shared_payloads_[slot]) { continue; }
+            if (!victim.has_value() || shared_payloads_[slot]->last_use < oldest) {
+                victim = slot;
+                oldest = shared_payloads_[slot]->last_use;
+            }
+        }
+        if (!victim.has_value()) { break; }
+        const std::optional<runtime::prefix_cache::BlockRef> node =
+            victim < shared_payload_nodes_.size() ? shared_payload_nodes_[*victim] : std::nullopt;
+        if (node.has_value()) {
+            // Dropping the payload through the store fires the image hook and lets the next prune
+            // reclaim every page group the chain was holding.
+            shared_blocks_->drop_payload(*node);
+            (void)shared_blocks_->prune();
+        } else {
+            release_shared_payload(*victim);
+        }
+        ++dropped;
+    }
+    return dropped;
+}
+
+bool ProgramImplCore::shared_payload_matches(std::uint32_t slot, const PreparedPromptData& prompt,
+                                             std::uint32_t frontier) const {
+    if (slot >= shared_payloads_.size() || !shared_payloads_[slot]) { return false; }
+    const SharedPayloadImage& image = *shared_payloads_[slot];
+    if (frontier == 0 || image.metadata.ledger.size() != frontier) { return false; }
+    if (prompt.token_ids.size() < frontier) { return false; }
+    if (!std::equal(prompt.token_ids.begin(), prompt.token_ids.begin() + frontier,
+                    image.metadata.ledger.begin())) {
+        return false;
+    }
+    // The identity axes decide the positions and the token types the captured state was built for.
+    return image.metadata.prefix_identity.matches(prompt, frontier);
+}
+
+HostKVOffload* ProgramImplCore::shared_kv_offload_for(std::uint32_t slot) noexcept {
+    if (shared_kv_offloads_.empty()) { return nullptr; }
+    const bool backend = slot == kSharedSlotBackend || slot == kSharedSlotBackendPeer;
+    const std::size_t index = backend ? (shared_kv_offloads_.size() - 1U) : 0U;
+    HostKVOffload* offload = shared_kv_offloads_[index].get();
+    PagedKVPool* pool      = shared_page_pool(slot);
+    return pool != nullptr && offload->accepts(*pool) ? offload : nullptr;
+}
+
+// Copies the chain's KV into the payload's host images: one image per pool and rank, covering every
+// page the frontier needs. This is what lets a captured prefix release its device pages instead of
+// holding them, so displaced conversations stop competing for the pool. False leaves the images
+// empty and the caller falls back to holding the page groups.
+bool ProgramImplCore::park_payload_kv(std::uint32_t lane, std::uint32_t frontier,
+                                      SharedPayloadImage& image) {
+    if (shared_kv_arena_ == nullptr || lane >= max_concurrency) { return false; }
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.kv.has_value()) { return false; }
+    const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t text_pages = frontier == 0 ? 0U : 1U + (frontier - 1U) / page;
+    const std::uint32_t backend_tokens = frontier == 0 ? 0U : frontier - 1U;
+    const std::uint32_t backend_pages =
+        backend_tokens == 0 ? 0U : 1U + (backend_tokens - 1U) / page;
+    const auto park_one = [](HostKVOffload* offload, const PagedKVPool& pool,
+                             const PagedKVAllocation* source, std::uint32_t pages,
+                             std::optional<HostKVImage>& out, cudaStream_t stream) {
+        if (pages == 0) { return true; }
+        if (offload == nullptr || source == nullptr || source->mapped_page_count() < pages) {
+            return false;
+        }
+        std::optional<HostKVImage> candidate = offload->allocate(pages);
+        if (!candidate.has_value()) { return false; }
+        offload->park_range(pool, *source, 0, pages, *candidate, 0, stream);
+        out = std::move(candidate);
+        return true;
+    };
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    bool ok = park_one(shared_kv_offload_for(kSharedSlotText), decoder->text_kv.pool(),
+                       &sequence.kv->text, text_pages, image.text, device.stream);
+    if (ok && mtp) {
+        ok = park_one(shared_kv_offload_for(kSharedSlotBackend), backend_kv_cache()->pool(),
+                      sequence.kv->backend ? &*sequence.kv->backend : nullptr, backend_pages,
+                      image.backend, device.stream);
+    }
+    if (ok && peer.has_value()) {
+        const ScopedDevice scope(peer->device.device);
+        ok = park_one(shared_kv_offload_for(kSharedSlotTextPeer), peer->decoder->text_kv.pool(),
+                      sequence.kv->text_peer ? &*sequence.kv->text_peer : nullptr, text_pages,
+                      image.text_peer, peer->device.stream);
+        if (ok && mtp) {
+            ok = park_one(shared_kv_offload_for(kSharedSlotBackendPeer),
+                          peer->decoder->mtp_cache()->pool(),
+                          sequence.kv->backend_peer ? &*sequence.kv->backend_peer : nullptr,
+                          backend_pages, image.backend_peer, peer->device.stream);
+        }
+    }
+    if (!ok) {
+        image.text.reset();
+        image.text_peer.reset();
+        image.backend.reset();
+        image.backend_peer.reset();
+        return false;
+    }
+    // The lane's bundle is released as soon as this returns, so every copy has to be complete.
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    if (peer.has_value()) {
+        const ScopedDevice scope(peer->device.device);
+        CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+    }
+    return true;
+}
+
+bool ProgramImplCore::shared_payload_tail_hidden(std::uint32_t slot) const noexcept {
+    return slot < shared_payloads_.size() && shared_payloads_[slot].has_value() &&
+           shared_payloads_[slot]->metadata.tail_hidden_valid;
+}
+
+std::uint32_t ProgramImplCore::shared_payload_mtp_frontier(std::uint32_t slot) const noexcept {
+    return slot < shared_payloads_.size() && shared_payloads_[slot].has_value()
+               ? shared_payloads_[slot]->metadata.mtp_kv_valid
+               : 0U;
+}
+
+RewriteCheckpoint ProgramImplCore::shared_payload_checkpoint(std::uint32_t slot) const noexcept {
+    if (slot >= shared_payloads_.size() || !shared_payloads_[slot].has_value()) { return {}; }
+    return shared_payloads_[slot]->metadata.rewrite_checkpoint;
+}
+
+// Gives up lane-free payloads until both pools can hand out what a lane is about to own. A payload
+// holds real page groups out of the pool, so an admission that needs room has to take them back:
+// they are opportunistic copies of prefixes whose lane is already gone, and the newest capture is
+// the last one the LRU order reaches.
+void ProgramImplCore::reclaim_payload_pages(std::uint32_t text_pages,
+                                            std::uint32_t backend_pages) noexcept {
+    if (shared_blocks_ == nullptr || shared_payloads_.empty()) { return; }
+    const auto short_of_pages = [&] {
+        if (decoder->text_kv.pool().free_pages() < text_pages) { return true; }
+        const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        return backend != nullptr && backend->pool().free_pages() < backend_pages;
+    };
+    while (short_of_pages() && drop_shared_payloads(1) != 0) {}
+}
+
+void ProgramImplCore::try_capture_node_payload(std::uint32_t lane) noexcept {
+    try {
+        (void)capture_node_payload(lane);
+    } catch (...) {
+        // Capturing is opportunistic: a prefix that cannot be captured falls back to the disk or
+        // cold path it always had, and the request that displaced it must not fail for that.
+    }
+}
+
+// Reserves one plane of a claim: the pages the frontier fully covers are borrowed read-only from
+// `prefix`, and the page the frontier sits inside is copied from `tail` into a page this allocation
+// owns, because the claimant continues by writing inside it.
+void ProgramImplCore::adopt_kv_plane_ids(PagedKVPool& pool, PagedKVAllocation& destination,
+                                        std::span<const std::int32_t> prefix, std::int32_t tail,
+                                        std::uint32_t frontier, std::uint32_t owned_pages,
+                                        cudaStream_t stream) {
+    const std::uint32_t page    = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t adopted = frontier / page;
+    const std::uint32_t covered = frontier == 0 ? 0U : 1U + (frontier - 1U) / page;
+    // `prefix` holds the fully covered pages only; the page the frontier sits inside comes from
+    // `tail`, so the chain is long enough when it covers the adopted part.
+    if (adopted > prefix.size() || covered - adopted > owned_pages) {
+        throw std::logic_error("shared prefix claim does not fit the stored chain");
+    }
+    if (covered != adopted && tail < 0) {
+        throw std::logic_error("shared prefix claim has no page for its partial block");
+    }
+    destination = pool.reserve(owned_pages);
+    if (adopted != 0) { destination.adopt_prefix(prefix.first(adopted)); }
+    if (covered == adopted) { return; }
+    destination.materialize_pages(adopted + 1, stream);
+    pool.copy_pages(destination.page_ids().subspan(adopted, 1),
+                    std::span<const std::int32_t>(&tail, 1), stream);
+}
+
+// Continues `lane` from a node payload: no lane has to hold the prefix, the store's page groups and
+// the captured state image are enough. False leaves `lane` untouched, so the caller falls back to
+// the cold prefill the plan also priced.
+bool ProgramImplCore::adopt_node_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                        const RequestPlanImpl& plan) {
+    if (!plan.adopt_node.has_value() || lane >= max_concurrency || shared_blocks_ == nullptr) {
+        return false;
+    }
+    const runtime::prefix_cache::SharedBlockPayload payload =
+        shared_blocks_->payload(*plan.adopt_node);
+    if (!payload.valid() || payload.role != runtime::prefix_cache::SharedRole::Checkpoint ||
+        payload.frontier != plan.reuse_base || payload.frontier == 0) {
+        return false;
+    }
+    if (!shared_payload_matches(payload.image, prompt, payload.frontier)) { return false; }
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    const std::uint32_t frontier         = payload.frontier;
+    const std::uint32_t backend_frontier = mtp ? frontier - 1U : 0U;
+    const bool host_kv = payload.kv_in_host();
+    const std::uint32_t text_blocks    = frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t backend_blocks =
+        mtp ? backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize) : 0U;
+    const bool text_tail    = frontier % kPagedKVPageSize != 0;
+    const bool backend_tail = mtp && backend_frontier % kPagedKVPageSize != 0;
+    // Where the KV comes from decides what the lane has to own: a device-held chain is mapped
+    // read-only below the frontier (and the frontier's page copied), while a host image is restored
+    // into fresh pages the lane owns outright.
+    const std::vector<runtime::prefix_cache::SharedBlockPages> chain =
+        host_kv ? std::vector<runtime::prefix_cache::SharedBlockPages>{}
+                : shared_blocks_->chain_pages(*plan.adopt_node);
+    if (!host_kv) {
+        // Every page the claim maps has to exist, per pool: a chain that covers a block without a
+        // page group in one of the pools cannot be remapped at all.
+        if (chain.empty() || text_blocks > chain.size() ||
+            (mtp && backend_blocks > chain.size())) {
+            return false;
+        }
+        const auto usable = [&](std::uint32_t slot, std::uint32_t blocks, bool tail_needed) {
+            for (std::uint32_t block = 0; block < blocks; ++block) {
+                if (chain[block].page[slot] < 0) { return false; }
+            }
+            return !tail_needed || payload.tail.page[slot] >= 0;
+        };
+        if (!usable(kSharedSlotText, text_blocks, text_tail)) { return false; }
+        if (peer.has_value() && !usable(kSharedSlotTextPeer, text_blocks, text_tail)) { return false; }
+        if (mtp && !usable(kSharedSlotBackend, backend_blocks, backend_tail)) { return false; }
+        if (mtp && peer.has_value() &&
+            !usable(kSharedSlotBackendPeer, backend_blocks, backend_tail)) {
+            return false;
+        }
+    }
+
+    SequenceState& sequence = sequences[lane];
+    if (sequences[lane].lane != lane) { return false; }
+    // This lane's own chain is replaced by the stored one, exactly as an adoption from a sibling
+    // replaces it: keep it in the index first if it was resumable, then drop it.
+    try_capture_node_payload(lane);
+    forget_lane_chain(lane);
+    drop_parked_lane(lane);
+    sequence.kv.reset();
+    ordered_reset(sequence);
+    sequence.ledger.clear();
+    sequence.prefix_identity.clear();
+    sequence.prefix_digests.clear();
+    sequence.text_kv_valid = 0;
+    sequence.mtp_kv_valid  = 0;
+
+    const SharedPayloadImage& image = *shared_payloads_[payload.image];
+    SequenceKVBundle bundle;
+    if (host_kv) {
+        // Every page is the lane's own, and the image lands in exactly the pages the frontier needs.
+        if (!image.text.has_value() || (mtp && !image.backend.has_value()) ||
+            (peer.has_value() && !image.text_peer.has_value()) ||
+            (mtp && peer.has_value() && !image.backend_peer.has_value())) {
+            return false;
+        }
+        const std::uint32_t text_pages    = text_blocks + (text_tail ? 1U : 0U);
+        const std::uint32_t backend_pages = backend_blocks + (backend_tail ? 1U : 0U);
+        bundle.text = decoder->text_kv.pool().reserve(plan.text_kv_page_entitlement);
+        bundle.text.materialize_pages(text_pages, device.stream);
+        shared_kv_offload_for(kSharedSlotText)
+            ->restore(*image.text, decoder->text_kv.pool(), bundle.text, device.stream);
+        if (mtp) {
+            bundle.backend.emplace(
+                backend_kv_cache()->pool().reserve(plan.backend_kv_page_entitlement));
+            bundle.backend->materialize_pages(backend_pages, device.stream);
+            shared_kv_offload_for(kSharedSlotBackend)
+                ->restore(*image.backend, backend_kv_cache()->pool(), *bundle.backend,
+                          device.stream);
+        }
+        if (peer.has_value()) {
+            const ScopedDevice scope(peer->device.device);
+            bundle.text_peer.emplace(
+                peer->decoder->text_kv.pool().reserve(plan.text_kv_page_entitlement));
+            bundle.text_peer->materialize_pages(text_pages, peer->device.stream);
+            shared_kv_offload_for(kSharedSlotTextPeer)
+                ->restore(*image.text_peer, peer->decoder->text_kv.pool(), *bundle.text_peer,
+                          peer->device.stream);
+            if (mtp) {
+                bundle.backend_peer.emplace(
+                    peer->decoder->mtp_cache()->pool().reserve(plan.backend_kv_page_entitlement));
+                bundle.backend_peer->materialize_pages(backend_pages, peer->device.stream);
+                shared_kv_offload_for(kSharedSlotBackendPeer)
+                    ->restore(*image.backend_peer, peer->decoder->mtp_cache()->pool(),
+                              *bundle.backend_peer, peer->device.stream);
+            }
+        }
+    } else {
+        std::vector<std::int32_t> text_ids;
+        std::vector<std::int32_t> text_peer_ids;
+        std::vector<std::int32_t> backend_ids;
+        std::vector<std::int32_t> backend_peer_ids;
+        text_ids.reserve(chain.size());
+        text_peer_ids.reserve(chain.size());
+        backend_ids.reserve(chain.size());
+        backend_peer_ids.reserve(chain.size());
+        for (const runtime::prefix_cache::SharedBlockPages& block : chain) {
+            text_ids.push_back(block.page[kSharedSlotText]);
+            text_peer_ids.push_back(block.page[kSharedSlotTextPeer]);
+            backend_ids.push_back(block.page[kSharedSlotBackend]);
+            backend_peer_ids.push_back(block.page[kSharedSlotBackendPeer]);
+        }
+        adopt_kv_plane_ids(decoder->text_kv.pool(), bundle.text, text_ids,
+                           payload.tail.page[kSharedSlotText], frontier,
+                           plan.text_kv_page_entitlement, device.stream);
+        if (mtp) {
+            adopt_kv_plane_ids(backend_kv_cache()->pool(), bundle.backend.emplace(), backend_ids,
+                               payload.tail.page[kSharedSlotBackend], backend_frontier,
+                               plan.backend_kv_page_entitlement, device.stream);
+        }
+        if (peer.has_value()) {
+            const ScopedDevice scope(peer->device.device);
+            adopt_kv_plane_ids(peer->decoder->text_kv.pool(), bundle.text_peer.emplace(),
+                               text_peer_ids, payload.tail.page[kSharedSlotTextPeer], frontier,
+                               plan.text_kv_page_entitlement, peer->device.stream);
+            if (mtp) {
+                adopt_kv_plane_ids(peer->decoder->mtp_cache()->pool(),
+                                   bundle.backend_peer.emplace(), backend_peer_ids,
+                                   payload.tail.page[kSharedSlotBackendPeer], backend_frontier,
+                                   plan.backend_kv_page_entitlement, peer->device.stream);
+            }
+        }
+    }
+
+    // The captured state lands in the lane's private slots. Both roles come across: a checkpoint
+    // restore copies the checkpoint slot into `current` a few steps below, exactly as a resident
+    // rollback does, and the append path reads `current` directly.
+    const std::array<std::int32_t, 2> slots{
+        LinearStateSlots::current_state_slot(lane, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency)};
+    restore_linear_state_to(*image.linear, decoder->linear_attention, slots, device.stream);
+    if (image.linear_peer.has_value() && peer.has_value()) {
+        const ScopedDevice scope(peer->device.device);
+        restore_linear_state_to(*image.linear_peer, peer->decoder->linear_attention, slots,
+                                peer->device.stream);
+    }
+    auto* const hidden = static_cast<std::byte*>(shared_hidden_->data()) +
+                         static_cast<std::size_t>(payload.image) * 2ULL * shared_hidden_row_bytes_;
+    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, hidden, sequence.tail_hidden.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data,
+                               hidden + shared_hidden_row_bytes_,
+                               sequence.rewrite_checkpoint_hidden.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+
+    sequence.ledger                  = image.metadata.ledger;
+    sequence.prefix_identity         = image.metadata.prefix_identity;
+    sequence.prefix_digests          = image.metadata.prefix_digests;
+    sequence.rope_delta              = image.metadata.rope_delta;
+    sequence.execution_frontier      = image.metadata.execution_frontier;
+    sequence.ledger_frontier         = image.metadata.ledger_frontier;
+    sequence.text_kv_valid           = image.metadata.text_kv_valid;
+    sequence.mtp_kv_valid            = image.metadata.mtp_kv_valid;
+    sequence.mtp_draft_count         = image.metadata.mtp_draft_count;
+    sequence.tail_hidden_valid       = image.metadata.tail_hidden_valid;
+    sequence.rewrite_checkpoint      = image.metadata.rewrite_checkpoint;
+    sequence.kv                      = std::move(bundle);
+    sequence.retained                = true;
+
+    // The next unit may read these pages on the peer's stream, and the copies were issued on this
+    // one.
+    device.synchronize();
+    if (peer.has_value()) { peer->device.synchronize(); }
+    return true;
+}
+
+void ProgramImplCore::forget_lane_chain(std::uint32_t lane) noexcept {
+    if (shared_blocks_ == nullptr || lane >= max_concurrency) { return; }
+    try {
+        shared_blocks_->forget_lane(lane);
+        // Blocks only this lane served have no reason to stay: prune takes the leaf tips first and
+        // keeps walking up as long as a whole branch lost its last owner.
+        shared_pruned_ += shared_blocks_->prune();
+        retained_epoch_[lane] = 0;
+    } catch (...) {
+        // The index is an accelerator, never a correctness requirement: a failure to forget may
+        // leave a stale promise behind, and the verification at planning time still rejects it.
+    }
+}
+
+// Retained lanes ordered by what giving them up would cost: the frontier only that lane serves,
+// shortest first, least recently retained on a tie. A lane whose prefix a sibling also serves still
+// costs nothing to drop -- the nodes keep their other owner -- so the exclusive frontier, not the
+// lane's own length, is the value that ordering has to use.
+SharedPrefixStats ProgramImplCore::shared_prefix_stats() const {
+    SharedPrefixStats out;
+    out.lookups = shared_lookups_;
+    out.hits    = shared_hits_;
+    out.pruned  = shared_pruned_;
+    if (shared_blocks_ != nullptr) {
+        const runtime::prefix_cache::SharedBlockStats stats = shared_blocks_->stats();
+        out.nodes     = stats.nodes;
+        out.owners    = stats.owner_slots;
+        out.ownerless = stats.ownerless;
+        out.payloads  = stats.payloads;
+        out.held_pages = stats.pages;
+    }
+    return out;
+}
+
+std::vector<std::uint32_t> ProgramImplCore::retained_lane_eviction_order() const {
+    std::vector<std::uint32_t> order;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (has_retained_lane(lane)) { order.push_back(lane); }
+    }
+    std::array<std::uint32_t, kMaximumConcurrency> exclusive{};
+    if (shared_blocks_ != nullptr) {
+        for (const auto& [lane, frontier] : shared_blocks_->exclusive_frontiers()) {
+            if (lane < max_concurrency) { exclusive[lane] = frontier; }
+        }
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [this, &exclusive](std::uint32_t left, std::uint32_t right) {
+                         if (exclusive[left] != exclusive[right]) {
+                             return exclusive[left] < exclusive[right];
+                         }
+                         if (retained_epoch_[left] != retained_epoch_[right]) {
+                             return retained_epoch_[left] < retained_epoch_[right];
+                         }
+                         return left < right;
+                     });
+    return order;
+}
+
+void ProgramImplCore::adopt_kv_plane(PagedKVPool& pool, PagedKVAllocation& destination,
+                                     const PagedKVAllocation& source, std::uint32_t frontier,
+                                     std::uint32_t owned_pages, cudaStream_t stream) {
+    const std::uint32_t covered =
+        frontier == 0 ? 0U : 1U + (frontier - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::int32_t tail = covered != 0 && covered <= source.mapped_page_count()
+                                  ? source.page_ids()[covered - 1]
+                                  : runtime::prefix_cache::kNoSharedPage;
+    adopt_kv_plane_ids(pool, destination, source.page_ids(), tail, frontier, owned_pages, stream);
+}
+
+// Clones a retained sibling lane's continuable state into `lane`, so the plan this lane was admitted
+// with continues the same frontier without recomputing it. The donor keeps ownership of its pages
+// and its lane; this lane maps the covered prefix read-only and owns everything above it. False
+// leaves `lane` exactly as it found it, and the caller falls back to the cold start the base plan
+// always also priced.
+bool ProgramImplCore::adopt_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                        const RequestPlanImpl& plan) {
+    if (!plan.adopt_lane.has_value()) { return false; }
+    const std::uint32_t donor = *plan.adopt_lane;
+    if (lane >= max_concurrency || donor >= max_concurrency || lane == donor) {
+        return false;
+    }
+    SequenceState& sequence     = sequences[lane];
+    const SequenceState& source = sequences[donor];
+    if (!source.kv) { return false; }
+    if (peer.has_value() != source.kv->text_peer.has_value()) { return false; }
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if (mtp != source.kv->backend.has_value()) { return false; }
+
+    // Re-derive the frontier this plan priced from the donor's own state. A lane between planning
+    // and admission can be displaced, so this is a check rather than an assertion: a mismatch is a
+    // plan that lost its gain, not a broken pool.
+    const ResidentReuse reachable = source.retained ? deepest_resident_reuse(source, prompt)
+                                                    : checkpoint_claim(source, prompt);
+    if (reachable.path != plan.reuse || reachable.base != plan.reuse_base) {
+        return false;
+    }
+    const std::uint32_t backend_frontier = plan.reuse_base == 0 ? 0U : plan.reuse_base - 1U;
+    if (mtp && source.mtp_kv_valid < backend_frontier) { return false; }
+
+    // The claim holds, so this lane's own prefix is about to be replaced by the donor's. Keep it in
+    // the index first if it was resumable, then drop it -- the caller has already published it to
+    // the NVMe tier when there is one -- exactly as a cold start drops it: releasing the bundle also
+    // gives up whatever this lane borrowed, so the pages the donor owns stop being referenced from
+    // here before they are borrowed again below, and the zeroed state keeps a stale GDN slot from
+    // surviving into the continuation.
+    try_capture_node_payload(lane);
+    forget_lane_chain(lane);
+    drop_parked_lane(lane);
+    sequence.kv.reset();
+    ordered_reset(sequence);
+    sequence.ledger.clear();
+    sequence.prefix_identity.clear();
+    sequence.prefix_digests.clear();
+    sequence.text_kv_valid = 0;
+    sequence.mtp_kv_valid  = 0;
+
+    SequenceKVBundle bundle;
+    adopt_kv_plane(decoder->text_kv.pool(), bundle.text, source.kv->text, plan.reuse_base,
+                   plan.text_kv_page_entitlement, device.stream);
+    if (mtp) {
+        adopt_kv_plane(backend_kv_cache()->pool(), bundle.backend.emplace(),
+                       *source.kv->backend, backend_frontier, plan.backend_kv_page_entitlement,
+                       device.stream);
+    }
+    if (source.kv->text_peer) {
+        const ScopedDevice scope(peer->device.device);
+        adopt_kv_plane(peer->decoder->text_kv.pool(), bundle.text_peer.emplace(),
+                       *source.kv->text_peer, plan.reuse_base, plan.text_kv_page_entitlement,
+                       peer->device.stream);
+        if (mtp) {
+            adopt_kv_plane(peer->decoder->mtp_cache()->pool(), bundle.backend_peer.emplace(),
+                           *source.kv->backend_peer, backend_frontier,
+                           plan.backend_kv_page_entitlement, peer->device.stream);
+        }
+    }
+
+    // GDN state, both ranks. The pooled slots are statically partitioned by lane, and a retained
+    // lane's state is still exactly what its last round left behind, so this is a device-to-device
+    // copy of one lane's slot onto another's -- microseconds against the prefill it replaces.
+    decoder->linear_attention.copy_slot(
+        LinearStateSlots::current_state_slot(donor, max_concurrency),
+        LinearStateSlots::current_state_slot(lane, max_concurrency), device.stream);
+    decoder->linear_attention.copy_slot(
+        LinearStateSlots::rewrite_checkpoint_state_slot(donor, max_concurrency),
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency), device.stream);
+    if (peer) {
+        const ScopedDevice scope(peer->device.device);
+        peer->decoder->linear_attention.copy_slot(
+            LinearStateSlots::current_state_slot(donor, max_concurrency),
+            LinearStateSlots::current_state_slot(lane, max_concurrency), peer->device.stream);
+        peer->decoder->linear_attention.copy_slot(
+            LinearStateSlots::rewrite_checkpoint_state_slot(donor, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
+            peer->device.stream);
+    }
+
+    // The token-level hidden rows the MTP bridge samples from. Only rank 0 keeps them per lane --
+    // Rank 1's half of the bridge comes across the TP channel -- which is why a park/restore cycle
+    // moves exactly these two rows and nothing from the peer.
+    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.tail_hidden.data,
+                               sequence.tail_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                               device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data,
+                               source.rewrite_checkpoint_hidden.data,
+                               sequence.rewrite_checkpoint_hidden.bytes(),
+                               cudaMemcpyDeviceToDevice, device.stream));
+
+    // Everything a parked lane's image would have carried, so every reuse branch below behaves the
+    // way it would on the donor's own lane.
+    sequence.ledger                  = source.ledger;
+    sequence.prefix_identity         = source.prefix_identity;
+    sequence.prefix_digests          = source.prefix_digests;
+    sequence.execution_frontier      = source.execution_frontier;
+    sequence.ledger_frontier         = source.ledger_frontier;
+    sequence.text_kv_valid           = source.text_kv_valid;
+    sequence.mtp_kv_valid            = source.mtp_kv_valid;
+    sequence.dflash_context_frontier = source.dflash_context_frontier;
+    sequence.mtp_draft_count         = source.mtp_draft_count;
+    sequence.mtp_drafts              = source.mtp_drafts;
+    sequence.rope_delta              = source.rope_delta;
+    sequence.tail_hidden_valid       = source.tail_hidden_valid;
+    sequence.rewrite_checkpoint      = source.rewrite_checkpoint;
+    sequence.kv                      = std::move(bundle);
+    sequence.retained                = true;
+
+    // The next unit may be a round that reads these pages on the peer's stream, and the copies were
+    // issued on this one.
+    device.synchronize();
+    if (peer) { peer->device.synchronize(); }
+    return true;
+}
+
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
@@ -647,6 +1511,45 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
+    // This plan continues a sibling lane's retained prefix instead of one of this lane's own. Clone
+    // that state now, before any of the checks below: they ask the same questions of the lane that
+    // will continue the prefix, and after the clone the answers are the donor's.
+    if (request_plan.adopt_lane.has_value() || request_plan.adopt_node.has_value()) {
+        const bool claimed = request_plan.adopt_lane.has_value()
+                                 ? adopt_lane_prefix(lane, prompt, request_plan)
+                                 : adopt_node_prefix(lane, prompt, request_plan);
+        if (!claimed) {
+            // The lender is gone -- its lane was displaced between planning and admission -- so the
+            // shared prefix this plan priced does not exist any more. This lane owns nothing yet,
+            // so the request simply starts cold at the footprint the base plan reserved for it, and
+            // every field the plan derived from the shared frontier has to describe that instead.
+            request_plan.adopt_lane.reset();
+            request_plan.adopt_node.reset();
+            request_plan.reuse               = ReusePath::FullReset;
+            request_plan.reuse_base          = 0;
+            request_plan.disk_restore_frontier = 0;
+            request_plan.prepare_mtp = speculative_backend == SpeculativeBackend::Mtp;
+            request_plan.mtp_bridge  = MtpBridgeMode::None;
+            request_plan.text_kv_page_entitlement = request_plan.summary.admission.main_kv_pages;
+            request_plan.backend_kv_page_entitlement =
+                request_plan.summary.admission.backend_kv_pages;
+            // The cold prefill consumes the whole prompt, so the plan is charged the projection the
+            // base plan already priced for exactly that, not the suffix the adoption would have run.
+            request_plan.summary.reusable_prompt_tokens = 0;
+            request_plan.summary.service_work_quanta = request_plan.cold_service_work_quanta;
+            // A cold lane holds no continuation state, so the desired checkpoint is captured by
+            // the prefill it is about to run -- which is what the plan asks for at frontier 0.
+            if (prompt.identity.rewrite_checkpoint) {
+                request_plan.rewrite_checkpoint_action = RewriteCheckpointAction::CaptureNew;
+                request_plan.rewrite_checkpoint_capture =
+                    prompt.identity.rewrite_checkpoint;
+            } else {
+                request_plan.rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
+                request_plan.rewrite_checkpoint_capture.reset();
+            }
+        }
+    }
+
     // A disk-restorable plan names no resident prefix at all: the lane starts empty and the tier
     // fills it below, with a cold prefill as the fallback the plan already priced.
     if (request_plan.reuse != ReusePath::FullReset && request_plan.disk_restore_frontier == 0 &&
@@ -713,27 +1616,43 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const bool disk_plan = request_plan.reuse != ReusePath::FullReset &&
                            request_plan.disk_restore_frontier != 0;
     // The lane's own resident prefix is replaced whenever this plan cannot continue it: a full
-    // reset, or a disk record the lane does not hold. The admission pass only parks the OTHER
-    // lanes, so publish this one's bytes to the NVMe tier before its device pages are reclaimed --
-    // that is what keeps a wait for capacity from turning into a re-prefill. Best effort, and
-    // skipped on every reuse path, where the resident prefix is exactly what the request keeps.
-    if (disk_tier_ != nullptr && (request_plan.reuse == ReusePath::FullReset || disk_plan) &&
+    // reset, a disk record the lane does not hold, or a prefix it continues from a SIBLING instead.
+    // The admission pass only parks the OTHER lanes, so publish this one's bytes to the NVMe tier
+    // before its device pages are reclaimed -- that is what keeps a wait for capacity from turning
+    // into a re-prefill. Best effort, and skipped on every reuse path, where the resident prefix is
+    // exactly what the request keeps.
+    if (disk_tier_ != nullptr &&
+        (request_plan.reuse == ReusePath::FullReset || disk_plan ||
+         request_plan.adopt_lane.has_value()) &&
         sequence.retained && sequence.kv.has_value()) {
         (void)spill_device_prefix(lane);
     }
     sequence.retained = false;
+    // Whether this chain may be offered to a sibling lane at all. Media prompts stay out (a claim
+    // could not re-derive their spans) and so does DFlash (its per-lane context is not cloned).
+    sequence.shareable = prompt.identity.reusable && !prompt.has_media() &&
+                         speculative_backend != SpeculativeBackend::DFlash &&
+                         speculative_backend != SpeculativeBackend::DFlash2;
     try {
         // A disk-restorable plan starts on an empty lane: its bytes are addressed by content, not by
         // what happens to sit in the lane, so the lane is rebuilt from the record below.
         bool cold = request_plan.reuse == ReusePath::FullReset || disk_plan;
         if (cold) {
+            // The chain this lane held is about to go: keep what the index can serve on its own.
+            try_capture_node_payload(lane);
             drop_parked_lane(lane);
+            forget_lane_chain(lane);
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.prefix_digests.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
+            // The lane's own pages are gone; any payload is now holding page groups the pools have
+            // to promise to the lane that replaces it. The oldest payload gives way first, and the
+            // one just captured is the newest.
+            reclaim_payload_pages(request_plan.text_kv_page_entitlement,
+                                  request_plan.backend_kv_page_entitlement);
             if (disk_plan) {
                 // The restore re-checks the whole record and answers with the frontier that landed,
                 // so a record the tier lost since planning becomes the cold prefill the plan priced.
@@ -1213,6 +2132,9 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
+    // Before anything of the lane's state is dropped, keep the continuation the index can still
+    // serve on its own. This is what makes the prefix survive the conversation that produced it.
+    try_capture_node_payload(lane);
     if (lane_store_ != nullptr) {
         bool parked = false;
         try {
@@ -1753,7 +2675,18 @@ bool ProgramImplCore::spill_device_prefix(std::uint32_t lane) noexcept {
 // incremental: the first turn of a session copies its whole prefix, every later turn only the
 // blocks it appended plus the state image at the new frontier.
 void ProgramImplCore::publish_retained_prefix(std::uint32_t lane) noexcept {
-    if (disk_tier_ == nullptr || !has_retained_lane(lane)) { return; }
+    if (!has_retained_lane(lane)) { return; }
+    // The content index first: a prefix keeps serving every sibling lane that repeats it whether or
+    // not this Program has a host or NVMe tier, and the spill below is a second, optional copy.
+    try {
+        const SequenceState& sequence = sequences[lane];
+        publish_lane_chain(lane, sequence.ledger, sequence.text_kv_valid,
+                           runtime::prefix_cache::SharedRole::Append, 0U);
+    } catch (...) {
+        // Publishing is an accelerator: a store that cannot hold the chain must not fail a
+        // completed request.
+    }
+    if (disk_tier_ == nullptr) { return; }
     (void)spill_device_prefix(lane);
 }
 
@@ -2019,6 +2952,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    forget_lane_chain(sequence.lane);
     sequence.kv.reset();
     drop_parked_lane(sequence.lane);
     request.lifecycle           = Lifecycle::Empty;
@@ -2034,6 +2968,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
+    sequence.shareable               = false;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
 }
@@ -3357,6 +4292,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
+        }
+        // Publish the chain this prefill just committed. A sibling that repeats the prompt while
+        // this request is still running can then claim this checkpoint by content, and a burst of
+        // identical prompts shares one prefix instead of each paying for it.
+        if (sequence.shareable && sequence.rewrite_checkpoint.valid &&
+            sequence.rewrite_checkpoint.frontier != 0) {
+            try {
+                publish_lane_chain(sequence.lane, sequence.ledger,
+                                   sequence.rewrite_checkpoint.frontier,
+                                   runtime::prefix_cache::SharedRole::Checkpoint,
+                                   static_cast<std::uint32_t>(sequence.rewrite_checkpoint.kind));
+            } catch (...) {
+                // The index is an accelerator; a prefill that succeeded must not fail because the
+                // store could not take the chain.
+            }
         }
 
         staged.prompt.release_all_media_payloads();
