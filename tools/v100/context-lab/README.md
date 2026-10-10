@@ -9,6 +9,7 @@ server and driver logs; everything needed to reproduce a measurement lives here.
 |---|---|---|---|
 | Session pool | [`serve-pool.sh`](serve-pool.sh) | [`pool_driver.py`](pool_driver.py) | Several full-length conversations retained across restarts, one request at a time |
 | Batch decode | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`batch_decode.py`](batch_decode.py) | N concurrent streams decoding already-resident prefixes |
+| Reuse probe | [`serve-batch-decode.sh`](serve-batch-decode.sh) | [`reuse_probe.py`](reuse_probe.py) | S retained prefixes replayed serially and concurrently |
 
 Both launchers take `CONTEXT_LAB_ARTIFACT` (default `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer`)
 and `CONTEXT_LAB_PORT` (default 8080), and require a build in `build-v100-duo/`.
@@ -44,3 +45,15 @@ Recorded with eight sessions at 192000 target tokens (194950 counted), `--max-co
 
 The per-session tier cost follows from the INT8 G64 KV layout (17952 B per token per device) plus
 the GDN state; size `--disk-kv-mib` for the whole pool.
+
+## Reuse probe
+
+`reuse_probe.py` is the regression check for lane admission. It warms one retained prefix per lane
+and then replays the prompt set serially, concurrently, and once more serially; every replay must
+resume its own prefix with at most a two-token prefill, and the probe exits non-zero if any replay
+had to re-prefill. It runs against the batch-decode server:
+
+```bash
+cd ~/v100/ninfer-context-lab/batch
+python3 reuse_probe.py --request-log logs/probe.jsonl
+```
