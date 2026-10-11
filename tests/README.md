@@ -37,9 +37,14 @@ benchmark-report, and external protocol behavior. Repository verification princi
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
+- `test_access_log.cpp` — the lossless access capture: per-request scope and streaming tee, verbatim
+  JSON and SSE bodies, body truncation, and size-based rotation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_build_dataset.py` — access-capture to dataset: the three wires (including their SSE
+  dialects), tool/thinking/result normalization, conversation grouping, dedup, and capture
+  warnings;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -103,7 +108,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
-  tests/test_bench_matrix.py tests/test_serve_corpus.py
+  tests/test_bench_matrix.py tests/test_serve_corpus.py tests/test_build_dataset.py
 ```
 
 The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for

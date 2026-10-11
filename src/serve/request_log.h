@@ -134,12 +134,17 @@ std::string format_throughput_json(const std::string& server_instance_id,
 
 ServerLogEnvironment query_server_log_environment(int device);
 
+// One process-unique id. The HTTP server mints it once and hands it to every record log it owns, so
+// each log of one run carries the same `server_instance_id`.
+std::string make_server_instance_id();
+
 // Opens in append mode so one campaign file can contain multiple independently started MTP/model
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
 class JsonlRequestLog {
 public:
     explicit JsonlRequestLog(const std::string& path,
-                             const std::string& protected_artifact_path = {});
+                             const std::string& protected_artifact_path = {},
+                             std::string server_instance_id                = {});
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;

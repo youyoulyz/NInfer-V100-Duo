@@ -1,8 +1,9 @@
 #pragma once
 
+#include "serve/access_log.h"
 #include "serve/generation_service.h"
-#include "serve/response_store.h"
 #include "serve/request_log.h"
+#include "serve/response_store.h"
 #include "serve/serve_options.h"
 
 #include <httplib.h>
@@ -52,6 +53,10 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
+    // One record per HTTP request, written after the response has been sent so a streaming body is
+    // complete. `set_logger` is the only caller; it runs on the thread that served the request.
+    void record_access(const httplib::Request& req, const httplib::Response& res);
+
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
     void log_request_start(const RequestLogContext& context);
@@ -65,8 +70,12 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    // Minted once per process and shared by both record logs, so a request measurement and the
+    // matching access capture name the same server run.
+    std::string server_instance_id_;
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
+    AccessLog access_log_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

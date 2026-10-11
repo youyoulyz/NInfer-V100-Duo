@@ -22,6 +22,7 @@ for the selected tool.
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Build a dataset from a server's lossless access capture | [`v100/ninfer-api/build_dataset.py`](v100/ninfer-api/build_dataset.py) |
 
 ## Artifact workflow
 

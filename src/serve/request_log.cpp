@@ -471,6 +471,7 @@ std::string format_server_start_json(
                               {"media_live_bytes", options.media_live_bytes},
                               {"media_preprocess_threads", options.media_preprocess_threads},
                               {"request_log_jsonl", options.request_log_jsonl},
+                              {"access_log_dir", options.access_log_dir},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
                               {"default_preserve_thinking", options.preserve_thinking}};
@@ -670,15 +671,19 @@ ServerLogEnvironment query_server_log_environment(int device) {
     return environment;
 }
 
+std::string make_server_instance_id() { return new_server_instance_id(); }
+
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
-                                 const std::string& protected_artifact_path)
+                                 const std::string& protected_artifact_path,
+                                 std::string server_instance_id)
     : path_(path) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
         normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
-    server_instance_id_ = new_server_instance_id();
+    server_instance_id_ = server_instance_id.empty() ? new_server_instance_id()
+                                                     : std::move(server_instance_id);
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);

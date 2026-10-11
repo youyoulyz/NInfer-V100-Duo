@@ -22,8 +22,9 @@ data) stays there.
 | Prometheus | `http://127.0.0.1:9090` (scrape every 2 s) |
 | Reset the tier | `./stop.sh && rm -f tier/*` (the tier is the only copy of a parked prefix, so deleting it only costs a re-prefill) |
 
-Overrides: `NINFER_API_PORT`, `NINFER_API_ARTIFACT`, `NINFER_API_TIER_DIR`, `NINFER_API_DISK_MIB`.
-`serve.sh` runs one session at a time (`--max-concurrency 1`); extra requests queue.
+Overrides: `NINFER_API_PORT`, `NINFER_API_ARTIFACT`, `NINFER_API_TIER_DIR`, `NINFER_API_DISK_MIB`,
+`NINFER_API_ACCESS_DIR`. `serve.sh` runs one session at a time (`--max-concurrency 1`); extra
+requests queue.
 
 ## Dashboard
 
@@ -76,6 +77,32 @@ as do Grafana and Prometheus, while the renderer stays unreachable off-host.
 |---|---|
 | `codex-ninfer.config.toml` | copy to `~/.codex/ninfer.config.toml`, then `codex --profile ninfer` (Codex 0.162 reads profiles from their own file; nothing else in your `config.toml` changes) |
 | `claude-env.sh` | `source` it before `claude`, or put the same pairs in the `env` object of `~/.claude/settings.json` |
+
+## Access capture and datasets
+
+`serve.sh` passes `--access-log-dir ~/v100/ninfer-api/access` (override with
+`NINFER_API_ACCESS_DIR`, or set it empty to serve without capturing), so every HTTP request is
+stored verbatim: the client's body, the server's body (JSON, or the SSE text of a streaming
+response), the peer, the status and the wall time. The active file rotates to `access-<n>.jsonl`
+past 256 MiB. `docs/serving.md` documents the record.
+
+Prometheus scrapes `/metrics` every two seconds and those bodies are captured too, which is most of
+the capture's volume (~100 MB/day) and none of its value. Raise the scrape interval in
+`monitoring/prometheus.yml` if the capture matters more than the dashboard's resolution.
+
+Turn a capture into a dataset -- one conversation-per-access file, a deduplicated training file, and
+a stats summary:
+
+```bash
+python3 tools/v100/ninfer-api/build_dataset.py ~/v100/ninfer-api/access \
+  --out ~/v100/ninfer-api/dataset
+```
+
+It normalizes all three wires (OpenAI chat, Anthropic Messages, OpenAI Responses) onto OpenAI-style
+messages, reconstructs a streaming response from its frames, groups turns into conversations, and
+keeps anything it could not read with a warning rather than dropping it silently. The capture is
+raw by design, so `chat.jsonl` is the archive view and `sft.jsonl` is the filtered, deduplicated
+training view.
 
 ## Agent clients and the compatibility shim
 

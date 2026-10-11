@@ -119,7 +119,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--devices N,N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--access-log-dir DIR] "
+           "[--access-log-max-mib N] [--access-log-body-mib N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--kv-cache-ttl-seconds N] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
@@ -136,6 +137,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --access-log-dir DIR captures every HTTP request with the client's body and\n"
+           "       the server's body verbatim; the lossless input to dataset construction. It\n"
+           "       rotates the active file at --access-log-max-mib (256) and stores at most\n"
+           "       --access-log-body-mib (16) of one body, beyond which the record keeps the\n"
+           "       head and the true length and sets a truncation flag.\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -298,6 +304,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--access-log-dir") {
+            options.access_log_dir = require_value("--access-log-dir");
+        } else if (arg == "--access-log-max-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--access-log-max-mib"), "access-log-max-mib");
+            if (mib > std::numeric_limits<std::uint64_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--access-log-max-mib is out of range");
+            }
+            options.access_log_max_bytes = mib << 20;
+        } else if (arg == "--access-log-body-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--access-log-body-mib"), "access-log-body-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--access-log-body-mib is out of range");
+            }
+            options.access_log_body_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");

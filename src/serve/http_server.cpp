@@ -41,6 +41,9 @@ void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
+    // A chunked response never reaches `Response::body`, so the access log reads the frames from
+    // here. Only bytes that actually reached the socket count.
+    append_access_stream_bytes(item);
 }
 
 void set_owned_content(httplib::Response& response, std::string body,
@@ -126,8 +129,11 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
+      server_instance_id_(make_server_instance_id()),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, server_instance_id_),
+      access_log_(options_.access_log_dir, options_.access_log_max_bytes,
+                  options_.access_log_body_bytes, server_instance_id_) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -136,6 +142,32 @@ HttpServer::HttpServer(ServeOptions options)
     };
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
+}
+
+void HttpServer::record_access(const httplib::Request& req, const httplib::Response& res) {
+    // Draining first is what closes the per-request scope, and it is the same call that hands over
+    // the bytes a streaming response teed.
+    const AccessScopeDrain drained = drain_access_scope();
+    if (!access_log_.enabled()) { return; }
+
+    const std::string response_type = res.get_header_value("Content-Type");
+    HttpAccessFacts facts;
+    facts.method                = req.method;
+    facts.path                  = req.path;
+    facts.target                = req.target;
+    facts.status                = res.status;
+    facts.remote_addr           = req.remote_addr;
+    facts.remote_port           = req.remote_port < 0 ? 0 : req.remote_port;
+    facts.user_agent            = req.get_header_value("User-Agent");
+    facts.request_content_type  = req.get_header_value("Content-Type");
+    facts.response_content_type = response_type;
+    facts.request_bytes         = req.body.size();
+    facts.duration_seconds      = drained.duration_seconds;
+    facts.streamed              = response_type.rfind("text/event-stream", 0) == 0;
+    const std::string_view response_body =
+        facts.streamed ? std::string_view(drained.streamed_bytes) : std::string_view(res.body);
+    facts.response_bytes = response_body.size();
+    access_log_.write_access(facts, req.body, response_body);
 }
 
 void HttpServer::log_line(const std::string& line) {
@@ -217,6 +249,11 @@ void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });
+    // Runs after the response has been written, streaming body included, on the thread that served
+    // it. Every request lands here, including the ones routing never reached.
+    server_.set_logger([this](const httplib::Request& request, const httplib::Response& response) {
+        record_access(request, response);
+    });
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
@@ -229,6 +266,7 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        begin_access_scope();
         // `/health` and `/metrics` are for the operator (and a scraper), not for the model API, so
         // neither needs the key.
         if (options_.api_key.empty() || req.path == "/health" || req.path == "/metrics" ||

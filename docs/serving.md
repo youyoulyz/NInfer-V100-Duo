@@ -632,6 +632,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--access-log-dir DIR` | capture every HTTP request with both bodies verbatim; the input to dataset construction | disabled |
+| `--access-log-max-mib N` | size one capture file reaches before it rotates | `256` |
+| `--access-log-body-mib N` | most of one body a record stores; beyond it the head and the true length are kept | `16` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
@@ -719,6 +722,49 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
 raw values.
+
+## Access capture and datasets
+
+`--request-log-jsonl` is the measurement log: compact, versioned, and free of payload text, so it is
+the file to quote when a number has to be defended. `--access-log-dir DIR` is its complement for
+dataset construction. The directory is created if missing and holds `access.jsonl`: one
+`ninfer_serve_access_log` schema-v1 record per HTTP request, rotated to `access-<n>.jsonl` once the
+active file passes `--access-log-max-mib`. A record carries the request line and peer, the status,
+the wall time, the number of bytes each way, and both bodies verbatim.
+
+A JSON body is stored as the client's own object rather than as an escaped string. A streaming
+response is stored as the concatenated SSE text, because a chunked body never materializes in the
+HTTP response object the post-response hook sees; the frames are teed as they are written to the
+socket, so a client that disconnects mid-stream leaves exactly the frames that reached it. A body
+larger than `--access-log-body-mib` is stored as its head plus its true byte length, with
+`request_body_truncated` or `response_body_truncated` set so no reader mistakes it for the whole
+thing. An empty `--access-log-dir` serves without capturing.
+
+Every request is captured, operator endpoints included, so a capture also holds monitoring traffic;
+the `GET /metrics` bodies dominate that noise. Records whose path is not one of `/v1/chat/completions`,
+`/v1/messages` and `/v1/responses` are not model accesses and dataset construction ignores them.
+
+`tools/v100/ninfer-api/build_dataset.py` reads a capture directory (or explicit files) and writes:
+
+| Output | Contents |
+|---|---|
+| `chat.jsonl` | one line per successful model access, unfiltered and undeduplicated: the conversation normalized to OpenAI-style messages plus the assistant turn the server produced |
+| `sft.jsonl` | the training view: the same pairs, minus turns with no assistant output, deduplicated |
+| `stats.json` | accesses by protocol, model, status and endpoint; token percentiles; latency percentiles; conversation and dedup counts |
+
+The builder is where protocol knowledge lives. Anthropic `system` blocks, `thinking` blocks,
+`tool_use`/`tool_result` parts and Responses `instructions`, Items and `function_call` pairs all
+become OpenAI-style messages, so one dataset carries all three wires. Non-text content becomes a
+counted placeholder and is reported in the record's `warnings`. A conversation is identified by its
+system prompt and first user turn, so every turn of an agent session groups together even though
+each turn resends the whole history; deduplication then drops only genuinely repeated turns. A body
+the server truncated, a request that failed, or a response the builder could not read is kept in
+`chat.jsonl` with a warning rather than dropped silently.
+
+```bash
+python3 tools/v100/ninfer-api/build_dataset.py ~/v100/ninfer-api/access \
+  --out ~/v100/ninfer-api/dataset
+```
 
 ## Execution behavior
 

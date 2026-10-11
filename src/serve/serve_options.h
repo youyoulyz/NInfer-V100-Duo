@@ -27,6 +27,12 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // Lossless access capture for dataset construction: one record per HTTP request, holding the
+    // client's body and the server's body verbatim. Empty disables it. `max_bytes` rotates the
+    // active file, and `body_bytes` caps how much of one body a record stores.
+    std::string access_log_dir;
+    std::uint64_t access_log_max_bytes = 256ULL << 20;
+    std::size_t access_log_body_bytes  = 16ULL << 20;
     std::uint32_t max_context              = 8192;
     // Rotary regime, mirroring the CLI. `--rope yarn` raises the ceiling `--max-context` is
     // checked against to `--yarn-origin x --yarn-factor`; Engine performs that check.

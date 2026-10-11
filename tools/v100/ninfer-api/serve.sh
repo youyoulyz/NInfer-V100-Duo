@@ -9,7 +9,11 @@
 # back to stops holding memory or disk.
 #
 # Overrides: NINFER_API_HOST (default 0.0.0.0), NINFER_API_PORT, NINFER_API_ARTIFACT,
-# NINFER_API_TIER_DIR, NINFER_API_DISK_MIB, NINFER_API_KEY.
+# NINFER_API_TIER_DIR, NINFER_API_DISK_MIB, NINFER_API_KEY, NINFER_API_ACCESS_DIR.
+#
+# Every HTTP request is captured losslessly under NINFER_API_ACCESS_DIR (default
+# ~/v100/ninfer-api/access): the client's body and the server's body verbatim, which is what
+# `build_dataset.py` turns into a dataset. Set it empty to serve without capturing.
 #
 # The API is served on every interface because this deployment is meant to be reached from the
 # intranet, and it is UNAUTHENTICATED unless NINFER_API_KEY is set: anyone who can reach the port can
@@ -28,6 +32,11 @@ tier_dir="${NINFER_API_TIER_DIR:-$HOME/v100/ninfer-api/tier}"
 host="${NINFER_API_HOST:-0.0.0.0}"
 port="${NINFER_API_PORT:-8080}"
 disk_mib="${NINFER_API_DISK_MIB:-409600}"   # 400 GiB bound; the tier file is sparse
+access_dir="${NINFER_API_ACCESS_DIR:-$HOME/v100/ninfer-api/access}"
+access_args=()
+if [[ -n "${access_dir}" ]]; then
+    access_args+=(--access-log-dir "${access_dir}")
+fi
 
 if [[ ! -x "${executable}" ]]; then
     echo "ninfer-serve is missing: ${executable} (cmake --build ${repo_dir}/build-v100-duo -j)" >&2
@@ -44,4 +53,5 @@ exec "${executable}" "${artifact}" \
     --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 3600000 \
     --host-kv-mib 2048 --disk-kv-path "${tier_dir}" --disk-kv-mib "${disk_mib}" \
     --kv-cache-ttl-seconds 86400 --log-stats-interval-ms 60000 \
+    "${access_args[@]}" \
     ${NINFER_API_KEY:+--api-key "${NINFER_API_KEY}"}

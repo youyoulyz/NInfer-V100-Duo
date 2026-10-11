@@ -101,6 +101,9 @@ void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
+    // A chunked response never reaches `Response::body`, so the access log reads the frames from
+    // here. Only bytes that actually reached the socket count.
+    append_access_stream_bytes(item);
 }
 
 void write_stream_items(httplib::DataSink& sink, StreamingResponse& request,
