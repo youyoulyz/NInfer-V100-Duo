@@ -169,6 +169,11 @@ SharedPrefixStats Program<Variant>::shared_prefix_stats() const {
 }
 
 template <>
+KvRuntimeStats Program<Variant>::kv_runtime_stats() const noexcept {
+    return impl_->kv_runtime_stats();
+}
+
+template <>
 std::uint32_t Program<Variant>::drop_shared_payloads(std::uint32_t count) noexcept {
     return impl_->drop_shared_payloads(count);
 }

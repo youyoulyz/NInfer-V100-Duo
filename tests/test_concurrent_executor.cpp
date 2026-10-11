@@ -228,6 +228,7 @@ public:
         return order;
     }
     [[nodiscard]] ninfer::SharedPrefixStats shared_prefix_stats() const { return {}; }
+    [[nodiscard]] ninfer::KvRuntimeStats kv_runtime_stats() const noexcept { return {}; }
     std::uint32_t drop_shared_payloads(std::uint32_t) noexcept { return 0; }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,

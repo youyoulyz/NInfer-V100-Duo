@@ -168,6 +168,9 @@ public:
     // How the shared block index is being used: lookups, hits, reclaimed blocks and the current
     // node/owner census. Reported through the Engine's periodic runtime stats.
     [[nodiscard]] SharedPrefixStats shared_prefix_stats() const;
+    // The KV pools, tiers and state slots as `GET /metrics` reports them. Published with the runtime
+    // stats rather than read live, so a scrape never waits for a running request.
+    [[nodiscard]] KvRuntimeStats kv_runtime_stats() const noexcept;
     // Gives up `count` lane-free shared payloads, least recently used first, returning how many went.
     // Capacity pressure prefers this to evicting a retained conversation; the prefix stops being
     // claimable without a lane and falls back to the colder path it always had.

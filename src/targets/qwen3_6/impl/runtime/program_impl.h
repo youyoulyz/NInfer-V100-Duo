@@ -1302,6 +1302,47 @@ void ProgramImplCore::forget_lane_chain(std::uint32_t lane) noexcept {
 // shortest first, least recently retained on a tie. A lane whose prefix a sibling also serves still
 // costs nothing to drop -- the nodes keep their other owner -- so the exclusive frontier, not the
 // lane's own length, is the value that ordering has to use.
+KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
+    KvRuntimeStats out;
+    out.max_context           = capacity;
+    out.effective_max_context = effective_max_context;
+    out.kv_payload_bytes      = kv_payload_bytes;
+    out.gdn_state_bytes       = gdn_state_bytes;
+    // What the paged pools hold right now: capacity is fixed at startup, entitlement is what live
+    // sequences reserved, and the free list is what the next allocation can take. A page the shared
+    // index holds for a payload is in neither, which is exactly the distribution a dashboard wants.
+    const PagedKVPool& main = decoder->text_kv.pool();
+    out.main_capacity_page_groups = main.page_group_count();
+    out.main_entitled_page_groups = main.entitled_pages();
+    out.main_free_page_groups     = main.free_pages();
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+        const PagedKVPool& pool = backend->pool();
+        out.backend_capacity_page_groups = pool.page_group_count();
+        out.backend_entitled_page_groups = pool.entitled_pages();
+        out.backend_free_page_groups     = pool.free_pages();
+    }
+    // Two state slots (the live continuation and the rollback seam) per lane, occupied by every lane
+    // that still holds a chain: live, retained or parked.
+    out.state_capacity_slots = 2U * max_concurrency;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (sequences[lane].kv.has_value() || sequences[lane].retained) {
+            out.state_occupied_slots += 2U;
+        }
+    }
+    if (lane_store_ != nullptr) {
+        out.host_kv_capacity_bytes = lane_store_->kv_capacity_bytes();
+        out.host_kv_occupied_bytes = lane_store_->kv_occupied_bytes();
+        out.host_tier_capacity_bytes =
+            lane_store_->kv_capacity_bytes() + lane_store_->linear_capacity_bytes() +
+            2ULL * lane_store_->hidden_bytes() * static_cast<std::size_t>(max_concurrency);
+        out.host_tier_parked_bytes = parked_host_bytes();
+    }
+    out.disk_tier_capacity_bytes = disk_tier_capacity_bytes();
+    out.disk_tier_used_bytes     = disk_tier_used_bytes();
+    out.disk_tier_restores       = disk_tier_restores();
+    return out;
+}
+
 SharedPrefixStats ProgramImplCore::shared_prefix_stats() const {
     SharedPrefixStats out;
     out.lookups = shared_lookups_;
@@ -5074,17 +5115,31 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_observed_bytes      = graph_observed_bytes[0];
     out.cuda_graph_peer_observed_bytes = graph_observed_bytes[1];
     out.cuda_graph_node_count          = graph_node_count;
-    out.kv_payload_bytes               = kv_payload_bytes;
-    out.gdn_state_bytes                = gdn_state_bytes;
+    const KvRuntimeStats kv = kv_runtime_stats();
+    out.kv_payload_bytes                = kv.kv_payload_bytes;
+    out.gdn_state_bytes                 = kv.gdn_state_bytes;
+    out.main_kv_capacity_page_groups    = kv.main_capacity_page_groups;
+    out.main_kv_entitled_page_groups    = kv.main_entitled_page_groups;
+    out.main_kv_free_page_groups        = kv.main_free_page_groups;
+    out.backend_kv_capacity_page_groups = kv.backend_capacity_page_groups;
+    out.backend_kv_entitled_page_groups = kv.backend_entitled_page_groups;
+    out.backend_kv_free_page_groups     = kv.backend_free_page_groups;
+    out.device_state_capacity_slots     = kv.state_capacity_slots;
+    out.device_state_occupied_slots     = kv.state_occupied_slots;
+    out.host_kv_capacity_bytes          = kv.host_kv_capacity_bytes;
+    out.host_kv_occupied_bytes          = kv.host_kv_occupied_bytes;
+    out.host_tier_capacity_bytes        = kv.host_tier_capacity_bytes;
+    out.host_tier_parked_bytes          = kv.host_tier_parked_bytes;
+    out.disk_tier_capacity_bytes        = kv.disk_tier_capacity_bytes;
+    out.disk_tier_used_bytes            = kv.disk_tier_used_bytes;
+    out.disk_tier_restores              = kv.disk_tier_restores;
     if (lane_store_ != nullptr) {
-        out.host_tier_capacity_bytes =
-            lane_store_->kv_capacity_bytes() + lane_store_->linear_capacity_bytes() +
-            2ULL * lane_store_->hidden_bytes() * static_cast<std::size_t>(max_concurrency);
-        out.host_tier_parked_bytes = parked_host_bytes();
+        // Host state slots: two per parked lane, out of two per lane.
+        out.host_state_capacity_slots = 2U * max_concurrency;
+        for (const std::optional<LaneStateImage>& image : parked_images_) {
+            if (image.has_value()) { out.host_state_occupied_slots += 2U; }
+        }
     }
-    out.disk_tier_capacity_bytes = disk_tier_capacity_bytes();
-    out.disk_tier_used_bytes     = disk_tier_used_bytes();
-    out.disk_tier_restores       = disk_tier_restores();
     return out;
 }
 

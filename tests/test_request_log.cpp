@@ -388,6 +388,38 @@ int main() {
                           throughput_json.at("shared_prefix").at("hits") == 7 &&
                           throughput_json.at("shared_prefix").at("lookups") == 9,
                       "shared prefix stats mismatch");
+
+    // The Prometheus exposition behind `GET /metrics`: plain samples a scraper turns into rates,
+    // with the paged-KV distribution and the speculative acceptance the dashboard shows.
+    ninfer::RuntimeStats metrics_stats;
+    metrics_stats.computed_prefill_tokens     = 100;
+    metrics_stats.speculative_rounds          = 4;
+    metrics_stats.speculative_drafted_tokens  = 12;
+    metrics_stats.speculative_accepted_tokens = 7;
+    metrics_stats.shared_prefix.payloads      = 2;
+    metrics_stats.shared_prefix.held_pages    = 62;
+    metrics_stats.kv.main_capacity_page_groups = 3125;
+    metrics_stats.kv.main_entitled_page_groups = 1000;
+    metrics_stats.kv.main_free_page_groups     = 2000;
+    metrics_stats.kv.disk_tier_used_bytes      = 4096;
+    const std::string metrics = format_prometheus_metrics(metrics_stats, "serve-test-model");
+    failures += check(metrics.find("ninfer_prefill_tokens_total 100\n") != std::string::npos &&
+                          metrics.find("ninfer_speculative_rounds_total 4\n") !=
+                              std::string::npos &&
+                          metrics.find("ninfer_speculative_accepted_tokens_total 7\n") !=
+                              std::string::npos,
+                      "prometheus exposition omits a throughput or speculative sample");
+    failures += check(
+        metrics.find("ninfer_kv_page_groups{pool=\"main\",state=\"capacity\"} 3125\n") !=
+                std::string::npos &&
+            metrics.find("ninfer_kv_page_groups{pool=\"main\",state=\"shared_held\"} 62\n") !=
+                std::string::npos &&
+            metrics.find("ninfer_disk_tier_bytes{state=\"used\"} 4096\n") != std::string::npos &&
+            metrics.find("ninfer_shared_payloads 2\n") != std::string::npos,
+        "prometheus exposition omits a KV or shared-index sample");
+    failures += check(metrics.find("ninfer_info{model=\"serve-test-model\"} 1\n") !=
+                          std::string::npos,
+                      "prometheus exposition omits the model identity");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
 

@@ -369,6 +369,9 @@ public:
     // pressure must not walk lane numbers and take whatever sits lowest.
     [[nodiscard]] std::vector<std::uint32_t> retained_lane_eviction_order() const;
     [[nodiscard]] SharedPrefixStats shared_prefix_stats() const;
+    // The KV pools, tiers and state slots as a scraper needs them: read straight from the pool and
+    // tier counters, so `GET /metrics` never waits for a running request.
+    [[nodiscard]] KvRuntimeStats kv_runtime_stats() const noexcept;
     // Drops the least recently used lane-free payloads, giving their page groups and image slots
     // back. Capacity pressure prefers this to eating a retained conversation: a payload is an
     // opportunistic copy of a prefix, while a retained lane is a conversation the process holds.

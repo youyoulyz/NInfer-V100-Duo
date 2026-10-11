@@ -146,6 +146,7 @@ is how reuse was realized, so a resumed session shows `cache` at the prompt fron
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `GET /metrics` | Prometheus text exposition of throughput, speculative acceptance, the paged-KV distribution, the tiers and the shared prefix index; never blocked by a running request, and unauthenticated like `/health` |
 
 ## OpenAI Chat Completions
 
@@ -531,6 +532,15 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+### Live observability
+
+`GET /metrics` is a plain Prometheus exposition, so any Prometheus-compatible dashboard renders it
+without the serving path depending on one. `tools/v100/ninfer-api/` carries a ready deployment: a
+launcher for the 200K-token single-session profile and a `docker compose` stack that scrapes this
+endpoint every two seconds and serves a provisioned Grafana dashboard (speed, MTP acceptance rate and
+average accepted length, the paged-KV distribution per pool, the host and NVMe tiers, and the shared
+prefix index). Its `README.md` has the URLs and the credentials.
 
 ## Authentication and CORS
 

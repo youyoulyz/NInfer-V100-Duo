@@ -867,6 +867,16 @@ struct MemorySummary {
     // measurement of whether the peer's half of the schedule was captured.
     std::size_t cuda_graph_node_count             = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // Paged KV pools in page groups (one 64-token block), and the GDN linear-attention slots. The
+    // backend (MTP) family is zero when the profile has no speculative backend.
+    std::uint32_t main_kv_capacity_page_groups    = 0;
+    std::uint32_t main_kv_entitled_page_groups    = 0;
+    std::uint32_t main_kv_free_page_groups        = 0;
+    std::uint32_t backend_kv_capacity_page_groups = 0;
+    std::uint32_t backend_kv_entitled_page_groups = 0;
+    std::uint32_t backend_kv_free_page_groups     = 0;
+    std::uint32_t device_state_capacity_slots     = 0;
+    std::uint32_t device_state_occupied_slots     = 0;
     // GDN (linear-attention) recurrent + convolution state for THIS device. At tp 2 the head split
     // halves it, so it is reported separately from the rest of the sequence arena.
     std::size_t gdn_state_bytes = 0;
@@ -935,6 +945,31 @@ struct RuntimeHostWorkStats {
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
 // interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+// What a scrape of `GET /metrics` needs about the KV pools, the tiers and the state slots. It is
+// published with the runtime stats (never behind the execution lock), so scraping cannot stall a
+// running request.
+struct KvRuntimeStats {
+    std::uint32_t main_capacity_page_groups    = 0;
+    std::uint32_t main_entitled_page_groups    = 0;
+    std::uint32_t main_free_page_groups        = 0;
+    std::uint32_t backend_capacity_page_groups = 0;
+    std::uint32_t backend_entitled_page_groups = 0;
+    std::uint32_t backend_free_page_groups     = 0;
+    std::uint32_t state_capacity_slots         = 0;
+    std::uint32_t state_occupied_slots         = 0;
+    std::size_t host_kv_capacity_bytes         = 0;
+    std::size_t host_kv_occupied_bytes         = 0;
+    std::size_t host_tier_capacity_bytes       = 0;
+    std::size_t host_tier_parked_bytes         = 0;
+    std::size_t disk_tier_capacity_bytes       = 0;
+    std::size_t disk_tier_used_bytes           = 0;
+    std::uint64_t disk_tier_restores           = 0;
+    std::size_t kv_payload_bytes               = 0;
+    std::size_t gdn_state_bytes                = 0;
+    std::uint32_t max_context                  = 0;
+    std::uint32_t effective_max_context        = 0;
+};
+
 // Cross-lane prefix sharing: how the content-addressed block index is being used. Cumulative
 // counters reset with the engine; the node/owner gauges describe the index right now.
 struct SharedPrefixStats {
@@ -956,6 +991,15 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;
+    // Speculative decoding. The cumulative counters fold each request in as it finishes; the live
+    // one is the sum over the requests running right now, so a dashboard can show both the session
+    // and the server. The acceptance rate is accepted/drafted and the average accepted length is
+    // accepted/rounds.
+    std::uint64_t speculative_rounds          = 0;
+    std::uint64_t speculative_drafted_tokens  = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
+    std::uint64_t speculative_fallback_steps  = 0;
+    SpeculativeStats speculative_live;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
@@ -1012,8 +1056,13 @@ struct RuntimeStats {
     std::uint64_t partial_tail_cow_pages               = 0;
     std::uint32_t device_state_occupied_slots          = 0;
     std::uint32_t host_state_occupied_slots            = 0;
+    // Paged KV occupancy in page groups (one 64-token block): what live sequences have reserved and
+    // what the pool can still hand out. `device_*_kv_occupied_pages` is the entitlement, so it grows
+    // as a request's context does; the free count is what the next allocation can take.
     std::uint32_t device_main_kv_occupied_pages        = 0;
+    std::uint32_t device_main_kv_free_pages            = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
+    std::uint32_t device_backend_kv_free_pages         = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
@@ -1027,6 +1076,7 @@ struct RuntimeStats {
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
     SharedPrefixStats shared_prefix;
+    KvRuntimeStats kv;
 };
 
 [[nodiscard]] inline constexpr const char*

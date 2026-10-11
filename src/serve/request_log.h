@@ -99,6 +99,13 @@ std::string format_request_done(const RequestLogContext& context, const Generati
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
 
+// One Prometheus text exposition of the engine's runtime and memory surface, for `GET /metrics`:
+// throughput counters, speculative acceptance, the paged-KV distribution and the shared prefix
+// index. Every line is a plain sample, so the scraper derives the rates and nothing in the serving
+// path depends on the format.
+[[nodiscard]] std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
+                                                    std::string_view model_id);
+
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,

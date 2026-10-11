@@ -738,4 +738,120 @@ void JsonlRequestLog::append(std::string record) {
     }
 }
 
+std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
+                                      std::string_view model_id) {
+    const ninfer::KvRuntimeStats& kv = stats.kv;
+    const auto metric = [](std::ostringstream& out, std::string_view name, std::string_view help,
+                           std::string_view type, std::uint64_t value) {
+        out << "# HELP " << name << ' ' << help << '\n' << "# TYPE " << name << ' ' << type << '\n'
+            << name << ' ' << value << '\n';
+    };
+    std::ostringstream out;
+    const ninfer::SharedPrefixStats& shared = stats.shared_prefix;
+    const std::uint64_t held_pages = shared.held_pages;
+
+    metric(out, "ninfer_prefill_tokens_total", "Prompt tokens evaluated by prefill.", "counter",
+           stats.computed_prefill_tokens);
+    metric(out, "ninfer_decode_tokens_total", "Tokens committed by decode rounds.", "counter",
+           stats.committed_decode_tokens);
+    metric(out, "ninfer_decode_rounds_total", "Decode batch executions.", "counter",
+           stats.decode_rounds);
+    metric(out, "ninfer_decode_rows_total", "Sum of the decode batch sizes.", "counter",
+           stats.decode_row_rounds);
+
+    out << "# HELP ninfer_requests Requests by scheduler state.\n# TYPE ninfer_requests gauge\n"
+        << "ninfer_requests{state=\"running\"} " << stats.running_requests << '\n'
+        << "ninfer_requests{state=\"prefilling\"} " << stats.prefilling_requests << '\n'
+        << "ninfer_requests{state=\"decode_ready\"} " << stats.decode_ready_requests << '\n'
+        << "ninfer_requests{state=\"waiting\"} " << stats.waiting_requests << '\n';
+
+    metric(out, "ninfer_speculative_rounds_total", "Speculative rounds the server has run.",
+           "counter", stats.speculative_rounds);
+    metric(out, "ninfer_speculative_drafted_tokens_total", "Draft tokens proposed.", "counter",
+           stats.speculative_drafted_tokens);
+    metric(out, "ninfer_speculative_accepted_tokens_total", "Draft tokens accepted.", "counter",
+           stats.speculative_accepted_tokens);
+    metric(out, "ninfer_speculative_fallback_steps_total", "Rounds with no accepted draft.",
+           "counter", stats.speculative_fallback_steps);
+    metric(out, "ninfer_speculative_live_rounds", "Speculative rounds of the running requests.",
+           "gauge", stats.speculative_live.rounds);
+    metric(out, "ninfer_speculative_live_drafted_tokens",
+           "Drafted tokens of the running requests.", "gauge",
+           stats.speculative_live.drafted_tokens);
+    metric(out, "ninfer_speculative_live_accepted_tokens",
+           "Accepted tokens of the running requests.", "gauge",
+           stats.speculative_live.accepted_tokens);
+    if (!stats.speculative_live.accepted_per_position.empty()) {
+        out << "# HELP ninfer_speculative_live_accepted_per_position Accepted tokens per draft "
+               "position of the running requests.\n"
+               "# TYPE ninfer_speculative_live_accepted_per_position gauge\n";
+        for (std::size_t position = 0; position < stats.speculative_live.accepted_per_position.size();
+             ++position) {
+            out << "ninfer_speculative_live_accepted_per_position{position=\"" << (position + 1)
+                << "\"} " << stats.speculative_live.accepted_per_position[position] << '\n';
+        }
+    }
+
+    out << "# HELP ninfer_kv_page_groups Paged KV page groups (one 64-token block) by pool and "
+           "state.\n# TYPE ninfer_kv_page_groups gauge\n"
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"capacity\"} "
+        << kv.main_capacity_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"entitled\"} "
+        << kv.main_entitled_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"free\"} "
+        << kv.main_free_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"shared_held\"} " << held_pages << '\n'
+        << "ninfer_kv_page_groups{pool=\"backend\",state=\"capacity\"} "
+        << kv.backend_capacity_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"backend\",state=\"entitled\"} "
+        << kv.backend_entitled_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"backend\",state=\"free\"} "
+        << kv.backend_free_page_groups << '\n';
+
+    metric(out, "ninfer_kv_bytes_per_token", "Main KV bytes one token costs on one device.", "gauge",
+           kv.kv_payload_bytes);
+    metric(out, "ninfer_gdn_state_bytes", "GDN linear-attention state bytes on one device.", "gauge",
+           kv.gdn_state_bytes);
+    out << "# HELP ninfer_state_slots GDN linear-attention slots.\n# TYPE ninfer_state_slots "
+           "gauge\n"
+        << "ninfer_state_slots{state=\"capacity\"} " << kv.state_capacity_slots << '\n'
+        << "ninfer_state_slots{state=\"occupied\"} " << kv.state_occupied_slots << '\n';
+    out << "# HELP ninfer_context_tokens Context ceilings in tokens.\n# TYPE ninfer_context_tokens "
+           "gauge\n"
+        << "ninfer_context_tokens{state=\"max\"} " << kv.max_context << '\n'
+        << "ninfer_context_tokens{state=\"effective\"} " << kv.effective_max_context << '\n';
+
+    out << "# HELP ninfer_host_kv_bytes Pinned host KV tier.\n# TYPE ninfer_host_kv_bytes gauge\n"
+        << "ninfer_host_kv_bytes{state=\"capacity\"} " << kv.host_kv_capacity_bytes << '\n'
+        << "ninfer_host_kv_bytes{state=\"occupied\"} " << kv.host_kv_occupied_bytes << '\n';
+    out << "# HELP ninfer_host_tier_bytes Pinned host lane tier.\n# TYPE ninfer_host_tier_bytes "
+           "gauge\n"
+        << "ninfer_host_tier_bytes{state=\"capacity\"} " << kv.host_tier_capacity_bytes << '\n'
+        << "ninfer_host_tier_bytes{state=\"parked\"} " << kv.host_tier_parked_bytes << '\n';
+    out << "# HELP ninfer_disk_tier_bytes NVMe lane tier.\n# TYPE ninfer_disk_tier_bytes gauge\n"
+        << "ninfer_disk_tier_bytes{state=\"capacity\"} " << kv.disk_tier_capacity_bytes << '\n'
+        << "ninfer_disk_tier_bytes{state=\"used\"} " << kv.disk_tier_used_bytes << '\n';
+    metric(out, "ninfer_disk_tier_restores_total", "Prefixes resumed from the NVMe tier.", "counter",
+           kv.disk_tier_restores);
+
+    metric(out, "ninfer_shared_nodes", "Content-addressed blocks the shared index holds.", "gauge",
+           shared.nodes);
+    metric(out, "ninfer_shared_owners", "Live lane promises on those blocks.", "gauge",
+           shared.owners);
+    metric(out, "ninfer_shared_ownerless", "Indexed blocks no lane serves any more.", "gauge",
+           shared.ownerless);
+    metric(out, "ninfer_shared_payloads", "Blocks holding a lane-free continuation image.", "gauge",
+           shared.payloads);
+    metric(out, "ninfer_shared_hits_total", "Plans the shared index answered.", "counter",
+           shared.hits);
+    metric(out, "ninfer_shared_lookups_total", "Plans that asked the shared index.", "counter",
+           shared.lookups);
+    metric(out, "ninfer_shared_pruned_total", "Blocks reclaimed once no lane served them.",
+           "counter", shared.pruned);
+
+    out << "# HELP ninfer_info Build identity of the served model.\n# TYPE ninfer_info gauge\n"
+        << "ninfer_info{model=\"" << model_id << "\"} 1\n";
+    return out.str();
+}
+
 } // namespace ninfer::serve

@@ -225,7 +225,10 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // `/health` and `/metrics` are for the operator (and a scraper), not for the model API, so
+        // neither needs the key.
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/metrics" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -268,6 +271,14 @@ void HttpServer::register_routes() {
 
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    // Prometheus text exposition of the engine's runtime and memory surface: throughput, MTP
+    // acceptance, the paged-KV distribution and the shared prefix index. Deliberately a plain
+    // scrape endpoint -- any Prometheus-compatible dashboard can render it, and nothing in the
+    // serving path depends on it.
+    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_content(format_prometheus_metrics(service_->runtime_stats(), public_model_id()),
+                        "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);

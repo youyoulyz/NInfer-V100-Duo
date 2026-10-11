@@ -247,6 +247,34 @@ private:
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
         snapshot.shared_prefix       = instance_.program->shared_prefix_stats();
+        // KV pools, tiers and state slots are read straight from their counters as well: a scrape
+        // must never wait for the execution lock a running request holds.
+        snapshot.kv                  = instance_.program->kv_runtime_stats();
+        // The live half of the speculative picture: the requests running right now, which the
+        // cumulative counters cannot see yet.
+        snapshot.speculative_live = {};
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            const ninfer::SpeculativeStats live =
+                instance_.program->speculative_stats_lane(lane);
+            snapshot.speculative_live.backend = live.backend;
+            snapshot.speculative_live.enabled = snapshot.speculative_live.enabled || live.enabled;
+            snapshot.speculative_live.draft_window = live.draft_window;
+            snapshot.speculative_live.rounds += live.rounds;
+            snapshot.speculative_live.drafted_tokens += live.drafted_tokens;
+            snapshot.speculative_live.accepted_tokens += live.accepted_tokens;
+            snapshot.speculative_live.fallback_steps += live.fallback_steps;
+            if (snapshot.speculative_live.accepted_per_position.size() <
+                live.accepted_per_position.size()) {
+                snapshot.speculative_live.accepted_per_position.resize(
+                    live.accepted_per_position.size(), 0);
+            }
+            for (std::size_t position = 0; position < live.accepted_per_position.size();
+                 ++position) {
+                snapshot.speculative_live.accepted_per_position[position] +=
+                    live.accepted_per_position[position];
+            }
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -569,6 +597,15 @@ private:
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
     void remove_completed_slot(std::uint32_t lane) {
+        // The speculative counters live with the request that produced them. Fold the finished one
+        // into the server totals before its lane is handed back, so the dashboard's acceptance rate
+        // is about the server and not about whichever request happens to be running.
+        const ninfer::SpeculativeStats speculative =
+            instance_.program->speculative_stats_lane(lane);
+        cumulative_stats_.speculative_rounds += speculative.rounds;
+        cumulative_stats_.speculative_drafted_tokens += speculative.drafted_tokens;
+        cumulative_stats_.speculative_accepted_tokens += speculative.accepted_tokens;
+        cumulative_stats_.speculative_fallback_steps += speculative.fallback_steps;
         slots_[lane].reset();
         invalidate_lane_plans(lane);
     }
