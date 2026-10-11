@@ -240,6 +240,33 @@ void claimed_reads(const std::filesystem::path& root) {
     check(store.evict(id(1, 64)), "a released page can be evicted");
 }
 
+// The idle timeout: a record survives a sweep inside its window and is released past it, and the
+// slots it frees are usable again.
+void idle_timeout(const std::filesystem::path& root) {
+    const DiskKVStore::Options options{.path       = (root / "ttl").string(),
+                                       .slot_size  = kSlot,
+                                       .max_slots  = kSlotCount,
+                                       .verify_crc = true};
+    DiskKVStore store(options);
+    const auto bytes = page(kSlot, 3);
+    check(store.upsert_page(id(5, 64), bytes) && store.upsert_page(id(6, 128), bytes),
+          "two pages stored for the timeout test");
+    const std::uint64_t now = DiskKVStore::wall_clock_seconds();
+    check(store.sweep_expired(3600, now) == 0 && store.live_slots() == 2,
+          "a record inside its window is kept");
+    check(store.sweep_expired(3600, now + 3599) == 0 && store.live_slots() == 2,
+          "the window is exclusive at its edge");
+    check(store.sweep_expired(3600, now + 3601) == 2 && store.live_slots() == 0,
+          "records past the window are released");
+    check(store.used_bytes() == 0, "released records give their space back");
+    // A read renews the clock, so an idle sweep between two uses does not take the record.
+    check(store.upsert_page(id(7, 192), bytes), "the freed slots take a new record");
+    std::vector<std::byte> read_back(kSlot);
+    check(store.read_page(id(7, 192), read_back) && store.contains(id(7, 192)),
+          "the renewed record is readable");
+    check(store.sweep_expired(0, now + 100000) == 0, "a zero timeout disables the sweep");
+}
+
 } // namespace
 
 int main() {
@@ -251,6 +278,7 @@ int main() {
         capacity_sizing(root);
         concurrent_reads_survive_eviction(root);
         claimed_reads(root);
+        idle_timeout(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "disk KV store test: " << error.what() << '\n';

@@ -122,6 +122,10 @@ public:
     void wait_idle();
 
     [[nodiscard]] std::uint32_t state_slots() const;
+
+    // Drops every record (KV block or state image) nobody used for `ttl_seconds` before `now`, the
+    // tier's idle-cache timeout. Returns how many records the whole tier released.
+    std::uint32_t expire(std::uint64_t ttl_seconds, std::uint64_t now);
     [[nodiscard]] std::size_t used_bytes() const;
     [[nodiscard]] DiskKVBridgeStats stats() const;
 

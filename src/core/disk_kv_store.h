@@ -118,6 +118,13 @@ public:
     bool evict(const DiskKVIdentity& id);
     [[nodiscard]] std::vector<DiskKVIdentity> live_identities() const;
 
+    // Drops every record whose last use is older than `ttl_seconds` before `now` (unix seconds),
+    // returning how many went. Stamps live in the index in memory and are renewed by every read,
+    // insert and touch; a record loaded from an older index starts its clock at open, so enabling a
+    // TTL never deletes a prefix that was parked before the upgrade.
+    std::uint32_t sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now);
+    [[nodiscard]] static std::uint64_t wall_clock_seconds() noexcept;
+
     // Publishes pending index changes (atomic replacement, not a durability barrier).
     void flush_index();
 
@@ -197,6 +204,9 @@ private:
     std::intptr_t mapping_handle_ = -1;
 #endif
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
+    // Unix seconds of the last use of each slot, 0 when the slot is free. Runtime-only: a restart
+    // renews every loaded record, which is what makes the TTL safe to enable on an existing store.
+    std::vector<std::uint64_t> wall_stamps_;
     std::vector<std::uint32_t> free_slots_;
     std::vector<std::uint32_t> readers_;
     // Live slots by (LRU stamp, slot), so eviction takes the coldest slot without reading every

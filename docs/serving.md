@@ -100,6 +100,12 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 
 ### Retained context: a session pool that does not re-prefill
 
+A prefix kept by the tiers lives until `--kv-cache-ttl-seconds` (0 = forever) passes without any
+request using it: the retained lane is spilled and released, its parked host image is dropped, and the
+NVMe records nobody read for the same window are swept. The counters
+`ninfer_kv_cache_expired_total{kind="retained_lane|parked_image|disk_record"}` in `/metrics` show what
+the timeout has released.
+
 `--host-kv-mib` and `--disk-kv-path` keep a displaced prefix instead of discarding it. A prefix
 leaves the paged KV pool when another conversation takes its lane, and it is stored on the way out;
 a later request that reaches the same tokens resumes the stored frontier instead of prefilling
@@ -565,6 +571,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--host-kv-mib N` | pinned host lane tier; a prefix displaced from the paged KV pool is parked there instead of discarded. `0` disables the tier, and the NVMe tier with it | `0` |
+| `--kv-cache-ttl-seconds N` | idle timeout for every KV cache the engine holds -- retained device lanes (spilled first), parked host images and NVMe tier records; `0` (the default) keeps them until something else displaces them. A serving deployment that expects conversations to go cold sets `86400` | `0` |
 | `--shared-kv-mib N` | pinned host budget for one KV image per lane-free shared checkpoint: a captured prefix parks its KV per node and releases its device pages, so displaced conversations stop competing for the pool. A park that does not fit falls back to holding the page groups; `0` keeps the KV on the device | `0` |
 | `--disk-kv-path DIR` | content-addressed NVMe tier directory, under which displaced prefixes survive a process restart. Requires `--host-kv-mib` | unset |
 | `--disk-kv-mib N` | NVMe tier budget; `0` selects the engine default | `0` |

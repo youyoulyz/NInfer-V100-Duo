@@ -174,6 +174,11 @@ KvRuntimeStats Program<Variant>::kv_runtime_stats() const noexcept {
 }
 
 template <>
+std::uint32_t Program<Variant>::expire_kv_cache() noexcept {
+    return impl_->expire_kv_cache();
+}
+
+template <>
 std::uint32_t Program<Variant>::drop_shared_payloads(std::uint32_t count) noexcept {
     return impl_->drop_shared_payloads(count);
 }

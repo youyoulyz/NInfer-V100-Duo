@@ -92,6 +92,9 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    // Idle-cache maintenance: asks the engine to release KV entries idle past the timeout.
+    void request_kv_cache_maintenance() noexcept { engine_->request_kv_cache_maintenance(); }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

@@ -99,6 +99,13 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+
+    // Asks the engine to release every KV cache entry nothing has used for
+    // `EngineOptions::kv_cache_ttl_seconds` (retained device lanes, parked host images, NVMe
+    // records). Non-blocking: the request is served between execution units, so the serving layer's
+    // wall-clock thread can call it even while the worker holds the execution lock waiting for work.
+    // A no-op when no timeout is configured.
+    void request_kv_cache_maintenance() noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 

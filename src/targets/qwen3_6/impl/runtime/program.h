@@ -372,6 +372,10 @@ public:
     // The KV pools, tiers and state slots as a scraper needs them: read straight from the pool and
     // tier counters, so `GET /metrics` never waits for a running request.
     [[nodiscard]] KvRuntimeStats kv_runtime_stats() const noexcept;
+    // Releases every KV cache entry nothing has used for the configured idle timeout: retained
+    // device lanes (spilled first, so the cold copy survives), parked host images, and NVMe tier
+    // records. Called on a wall-clock schedule by the serving layer, with the execution lock held.
+    std::uint32_t expire_kv_cache() noexcept;
     // Drops the least recently used lane-free payloads, giving their page groups and image slots
     // back. Capacity pressure prefers this to eating a retained conversation: a payload is an
     // opportunistic copy of a prefix, while a retained lane is a conversation the process holds.
@@ -740,6 +744,8 @@ private:
     // Best-effort capture on a displacement path: a prefix that could not be captured simply stops
     // being shared, and nothing about admitting the replacement request changes.
     void try_capture_node_payload(std::uint32_t lane) noexcept;
+    // Notes that lane's retained prefix was used just now, so the idle timeout starts over.
+    void touch_retained_lane(std::uint32_t lane) noexcept;
     // Drops lane-free payloads until both pools can hand out the given page counts. Best effort: a
     // payload that cannot be dropped leaves the pool exactly as it was.
     void reclaim_payload_pages(std::uint32_t text_pages, std::uint32_t backend_pages) noexcept;
@@ -771,6 +777,13 @@ private:
     // that capacity again.
     std::uint32_t shared_held_text_pages_    = 0;
     std::uint32_t shared_held_backend_pages_ = 0;
+    // Idle-cache timeout and the wall clock of each lane's last use of its retained prefix.
+    std::uint64_t kv_cache_ttl_seconds_ = 0;
+    std::array<std::uint64_t, kMaximumConcurrency> retained_wall_seconds_{};
+    std::uint64_t expired_retained_lanes_ = 0;
+    std::uint64_t expired_parked_images_  = 0;
+    std::uint64_t expired_disk_records_   = 0;
+    std::uint64_t kv_cache_maintenance_runs_ = 0;
     // Monotonic stamp ordering owner promises and retained-lane eviction.
     std::uint64_t shared_epoch_ = 0;
     std::array<std::uint64_t, kMaximumConcurrency> retained_epoch_{};

@@ -121,7 +121,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8] [--kv-cache-ttl-seconds N] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -153,6 +153,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --shared-kv-mib N gives those checkpoints a per-node KV budget in pinned host\n"
            "       RAM, so a captured prefix releases its device pages instead of holding them\n"
            "       (0 keeps the KV on the device).\n"
+           "       --kv-cache-ttl-seconds N releases every KV cache entry nothing has used for N\n"
+           "       seconds -- retained device lanes, parked host images and NVMe records alike\n"
+           "       (0, the default, keeps them until something else displaces them; 86400 = a day).\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -256,6 +259,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--shared-kv-mib is out of range");
             }
             options.shared_kv_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--kv-cache-ttl-seconds") {
+            options.kv_cache_ttl_seconds =
+                parse_u64(require_value("--kv-cache-ttl-seconds"), "kv-cache-ttl-seconds");
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));

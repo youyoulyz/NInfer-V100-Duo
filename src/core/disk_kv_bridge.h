@@ -126,6 +126,12 @@ public:
     // headers), so a summary can report the tier's footprint without walking the stores.
     [[nodiscard]] std::size_t used_bytes() const;
 
+    // Drops every record nobody used for `ttl_seconds` before `now` (unix seconds) across all
+    // families -- KV blocks and state images alike -- returning how many went. A tier whose budget
+    // would otherwise fill with conversations nobody comes back to needs this; it is safe while
+    // readers hold claims, because the stores skip a slot being read.
+    std::uint32_t sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now);
+
 private:
     struct Family {
         std::unique_ptr<DiskKVStore> store;

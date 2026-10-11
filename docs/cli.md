@@ -141,6 +141,7 @@ measured recommendation rather than a semantic limit.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-cache-ttl-seconds N` | idle timeout for every KV cache the engine holds: a retained device lane, a parked host image and NVMe records are released once nothing used them for N seconds. `0` keeps them until something else displaces them | `0` |
 | `--shared-state-images N` | lane-free shared checkpoints held as pinned host state images (~294 MiB each at the 27B TP2 profile); a prefix whose lane was displaced stays claimable by a later request. `0` disables it | `0` |
 | `--host-kv-mib N` | pinned host lane tier; a prefix displaced from the paged KV pool is parked there instead of discarded. `0` disables the tier, and the NVMe tier with it | `0` |
 | `--shared-kv-mib N` | pinned host budget for one KV image per lane-free shared checkpoint, so a captured prefix parks its KV per node and releases its device pages instead of holding them (`0` keeps the KV on the device) | `0` |

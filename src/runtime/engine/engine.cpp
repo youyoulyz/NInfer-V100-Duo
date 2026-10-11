@@ -399,6 +399,18 @@ MediaCacheSummary Engine::media_cache_summary() const {
         impl_->active);
 }
 
+void Engine::request_kv_cache_maintenance() noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [](const auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (!std::is_same_v<Executor, std::monostate>) {
+                executor->request_kv_cache_maintenance();
+            }
+        },
+        impl_->executor);
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

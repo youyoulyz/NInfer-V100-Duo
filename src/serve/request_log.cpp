@@ -781,6 +781,16 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
     metric(out, "ninfer_speculative_live_accepted_tokens",
            "Accepted tokens of the running requests.", "gauge",
            stats.speculative_live.accepted_tokens);
+    if (!stats.speculative_accepted_per_position.empty()) {
+        out << "# HELP ninfer_speculative_accepted_per_position_total Rounds in which a draft at "
+               "this position was accepted, over the server's life.\n"
+               "# TYPE ninfer_speculative_accepted_per_position_total counter\n";
+        for (std::size_t position = 0; position < stats.speculative_accepted_per_position.size();
+             ++position) {
+            out << "ninfer_speculative_accepted_per_position_total{position=\"" << (position + 1)
+                << "\"} " << stats.speculative_accepted_per_position[position] << '\n';
+        }
+    }
     if (!stats.speculative_live.accepted_per_position.empty()) {
         out << "# HELP ninfer_speculative_live_accepted_per_position Accepted tokens per draft "
                "position of the running requests.\n"
@@ -808,8 +818,8 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << "ninfer_kv_page_groups{pool=\"backend\",state=\"free\"} "
         << kv.backend_free_page_groups << '\n';
 
-    metric(out, "ninfer_kv_bytes_per_token", "Main KV bytes one token costs on one device.", "gauge",
-           kv.kv_payload_bytes);
+    metric(out, "ninfer_kv_pool_payload_bytes", "Persistent KV payload this device holds, whole pool.",
+           "gauge", kv.kv_payload_bytes);
     metric(out, "ninfer_gdn_state_bytes", "GDN linear-attention state bytes on one device.", "gauge",
            kv.gdn_state_bytes);
     out << "# HELP ninfer_state_slots GDN linear-attention slots.\n# TYPE ninfer_state_slots "
@@ -833,6 +843,20 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << "ninfer_disk_tier_bytes{state=\"used\"} " << kv.disk_tier_used_bytes << '\n';
     metric(out, "ninfer_disk_tier_restores_total", "Prefixes resumed from the NVMe tier.", "counter",
            kv.disk_tier_restores);
+
+    metric(out, "ninfer_kv_cache_ttl_seconds", "Configured idle timeout for every KV cache.", "gauge",
+           kv.kv_cache_ttl_seconds);
+    metric(out, "ninfer_kv_cache_oldest_idle_seconds",
+           "Idle time of the oldest retained prefix.", "gauge", kv.oldest_retained_idle_seconds);
+    metric(out, "ninfer_kv_cache_maintenance_total", "Idle-cache maintenance passes run.", "counter",
+           kv.kv_cache_maintenance_runs);
+    out << "# HELP ninfer_kv_cache_expired_total KV cache entries released by the idle timeout.\n"
+           "# TYPE ninfer_kv_cache_expired_total counter\n"
+        << "ninfer_kv_cache_expired_total{kind=\"retained_lane\"} " << kv.expired_retained_lanes
+        << '\n'
+        << "ninfer_kv_cache_expired_total{kind=\"parked_image\"} " << kv.expired_parked_images
+        << '\n'
+        << "ninfer_kv_cache_expired_total{kind=\"disk_record\"} " << kv.expired_disk_records << '\n';
 
     metric(out, "ninfer_shared_nodes", "Content-addressed blocks the shared index holds.", "gauge",
            shared.nodes);

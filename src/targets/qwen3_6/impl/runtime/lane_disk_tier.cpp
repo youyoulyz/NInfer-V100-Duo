@@ -212,6 +212,12 @@ std::uint32_t LaneDiskTier::state_slots() const {
 }
 
 std::size_t LaneDiskTier::used_bytes() const { return bridge_->used_bytes(); }
+std::uint32_t LaneDiskTier::expire(std::uint64_t ttl_seconds, std::uint64_t now) {
+    if (ttl_seconds == 0) { return 0; }
+    return bridge_->sweep_expired(ttl_seconds, now);
+}
+
+
 
 DiskKVBridgeStats LaneDiskTier::stats() const { return bridge_->stats(); }
 

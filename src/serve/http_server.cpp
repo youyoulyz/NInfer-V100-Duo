@@ -176,6 +176,10 @@ void HttpServer::run_stats_reporter() {
 
     for (;;) {
         {
+            // Wall-clock maintenance: ask the worker to drop KV cache entries idle past the
+            // configured timeout, so an idle process still gives its caches back. This must not
+            // block: the worker holds the execution lock while it waits for work.
+            service_->request_kv_cache_maintenance();
             std::unique_lock lock(stats_mutex_);
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }

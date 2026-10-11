@@ -198,6 +198,15 @@ public:
         return published_stats_;
     }
 
+    // Asks the worker to release every KV cache entry idle past the configured timeout. The serving
+    // layer's wall-clock thread must not block on the execution lock -- the worker holds it while
+    // waiting for work -- so this only flags the request and wakes the worker, which does the sweep
+    // between units.
+    void request_kv_cache_maintenance() noexcept {
+        maintenance_requested_.store(true, std::memory_order_release);
+        queue_cv_.notify_all();
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -606,6 +615,16 @@ private:
         cumulative_stats_.speculative_drafted_tokens += speculative.drafted_tokens;
         cumulative_stats_.speculative_accepted_tokens += speculative.accepted_tokens;
         cumulative_stats_.speculative_fallback_steps += speculative.fallback_steps;
+        if (cumulative_stats_.speculative_accepted_per_position.size() <
+            speculative.accepted_per_position.size()) {
+            cumulative_stats_.speculative_accepted_per_position.resize(
+                speculative.accepted_per_position.size(), 0);
+        }
+        for (std::size_t position = 0; position < speculative.accepted_per_position.size();
+             ++position) {
+            cumulative_stats_.speculative_accepted_per_position[position] +=
+                speculative.accepted_per_position[position];
+        }
         slots_[lane].reset();
         invalidate_lane_plans(lane);
     }
@@ -1296,7 +1315,10 @@ private:
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait(lock, [&] {
+                            return stopping_ || !pending_.empty() ||
+                                   maintenance_requested_.load(std::memory_order_acquire);
+                        });
                     }
                 }
                 if (stopping_) {
@@ -1309,6 +1331,14 @@ private:
 
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
+                if (maintenance_requested_.exchange(false, std::memory_order_acq_rel)) {
+                    try {
+                        // Republish when the sweep released something, so the counters are visible
+                        // without waiting for the next request to publish them.
+                        if (instance_.program->expire_kv_cache() != 0) { publish_runtime_stats(); }
+                    } catch (...) {
+                    }
+                }
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
@@ -1365,6 +1395,8 @@ private:
     const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;
+    // Set by request_kv_cache_maintenance() and consumed by the worker under the execution lock.
+    std::atomic<bool> maintenance_requested_{false};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

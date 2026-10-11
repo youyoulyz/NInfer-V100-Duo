@@ -1,6 +1,7 @@
 #include "core/disk_kv_store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -127,6 +128,8 @@ DiskKVStore::DiskKVStore(Options options) : options_(std::move(options)) {
     map_file(!reuse);
     readers_.assign(max_slots_, 0);
     lru_stamps_.assign(max_slots_, kNoStamp);
+    wall_stamps_.assign(max_slots_, 0);
+    const std::uint64_t opened_at = wall_clock_seconds();
     if (!load_index()) { rebuild_from_scan(); }
 }
 
@@ -277,12 +280,15 @@ void DiskKVStore::lru_touch_locked(std::uint32_t slot, std::uint64_t stamp) {
     lru_erase_locked(slot);
     lru_.emplace(stamp, slot);
     lru_stamps_[slot] = stamp;
+    // One place to keep the wall clock: every insert, read, claim and touch comes through here.
+    wall_stamps_[slot] = wall_clock_seconds();
 }
 
 void DiskKVStore::lru_erase_locked(std::uint32_t slot) noexcept {
     if (lru_stamps_[slot] == kNoStamp) { return; }
-    lru_.erase({lru_stamps_[slot], slot});
+    if (lru_stamps_[slot] != kNoStamp) { lru_.erase({lru_stamps_[slot], slot}); }
     lru_stamps_[slot] = kNoStamp;
+    wall_stamps_[slot] = 0;
 }
 
 bool DiskKVStore::load_index() {
@@ -307,6 +313,8 @@ bool DiskKVStore::load_index() {
     index_.reserve(rows.size());
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
+    wall_stamps_.assign(max_slots_, 0);
+    const std::uint64_t opened_at = wall_clock_seconds();
     std::vector<bool> live(max_slots_, false);
     for (const IndexRow& row : rows) {
         if (row.slot >= max_slots_ || live[row.slot]) { continue; }
@@ -319,6 +327,7 @@ bool DiskKVStore::load_index() {
             continue;
         }
         index_[id]     = row.slot;
+        wall_stamps_[row.slot] = opened_at;
         live[row.slot] = true;
         clock_         = std::max(clock_, slot_header.last_used);
         lru_touch_locked(row.slot, slot_header.last_used);
@@ -335,6 +344,8 @@ void DiskKVStore::rebuild_from_scan() {
     free_slots_.clear();
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
+    wall_stamps_.assign(max_slots_, 0);
+    const std::uint64_t opened_at = wall_clock_seconds();
     clock_ = 0;
     std::vector<bool> live(max_slots_, false);
     std::vector<std::byte> payload(options_.slot_size);
@@ -343,6 +354,7 @@ void DiskKVStore::rebuild_from_scan() {
         if (slot_header.magic != Header::kMagic) { continue; }
         if (!read_payload(slot, payload) || crc32(payload) != slot_header.crc) { continue; }
         index_[{slot_header.lo, slot_header.hi, slot_header.tag, slot_header.frontier}] = slot;
+        wall_stamps_[slot] = opened_at;
         live[slot]                                                                      = true;
         clock_ = std::max(clock_, slot_header.last_used);
         lru_touch_locked(slot, slot_header.last_used);
@@ -535,6 +547,38 @@ bool DiskKVStore::touch(const DiskKVIdentity& id) {
     lru_touch_locked(found->second, clock_);
     index_dirty_ = true;
     return true;
+}
+
+std::uint64_t DiskKVStore::wall_clock_seconds() noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+std::uint32_t DiskKVStore::sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now) {
+    if (ttl_seconds == 0) { return 0; }
+    std::lock_guard lock(mutex_);
+    std::vector<DiskKVIdentity> victims;
+    for (const auto& [id, slot] : index_) {
+        const std::uint64_t used = wall_stamps_[slot];
+        if (used == 0 || now < used || now - used <= ttl_seconds) { continue; }
+        // A slot another thread is reading stays: its claim refreshes the stamp when it lands.
+        if (readers_[slot] != 0) { continue; }
+        victims.push_back(id);
+    }
+    for (const DiskKVIdentity& id : victims) {
+        const auto found = index_.find(id);
+        if (found == index_.end()) { continue; }
+        const std::uint32_t slot = found->second;
+        index_.erase(found);
+        lru_erase_locked(slot);
+        clear_slot(slot);
+        free_slots_.push_back(slot);
+        index_dirty_ = true;
+    }
+    if (!victims.empty()) { persist_index_locked(); }
+    return static_cast<std::uint32_t>(victims.size());
 }
 
 bool DiskKVStore::evict(const DiskKVIdentity& id) {

@@ -95,6 +95,8 @@ struct SequencePlanningInputs {
     std::uint32_t shared_state_images = 0;
     // Per-node KV host budget for those images. See EngineOptions::shared_kv_bytes.
     std::size_t shared_kv_bytes = 0;
+    // Idle timeout for every KV cache. See EngineOptions::kv_cache_ttl_seconds.
+    std::uint64_t kv_cache_ttl_seconds = 0;
     // NVMe lane tier; layout-neutral like the host budget. See EngineOptions::disk_kv_path.
     std::string disk_kv_path;
     std::size_t disk_kv_bytes = 0;
@@ -136,6 +138,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     // Shared prefix state images. See SequencePlanningInputs.
     std::uint32_t shared_state_images = 0;
     std::size_t shared_kv_bytes = 0;
+    // Idle timeout for every KV cache. See SequencePlanningInputs.
+    std::uint64_t kv_cache_ttl_seconds = 0;
     // NVMe lane tier. See SequencePlanningInputs.
     std::string disk_kv_path;
     std::size_t disk_kv_bytes = 0;

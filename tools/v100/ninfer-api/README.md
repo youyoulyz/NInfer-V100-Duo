@@ -1,7 +1,9 @@
 # NInfer API service and live dashboard (2 × V100-SXM2-16GB)
 
 Qwen3.8-27B NVFP4, TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`), INT8-G64 KV, **one session up to
-200 000 tokens**. A prefix the session displaces is parked in 2 GiB of pinned host RAM and then on
+200 000 tokens**. Every KV cache -- the retained device lane, the parked host image and the NVMe
+records -- has a **24 h idle timeout** (`--kv-cache-ttl-seconds 86400`), so a conversation nobody
+comes back to releases its memory and disk. A prefix the session displaces is parked in 2 GiB of pinned host RAM and then on
 NVMe (400 GiB sparse bound), so a long conversation -- and a restarted server -- resumes it without
 recomputing it.
 

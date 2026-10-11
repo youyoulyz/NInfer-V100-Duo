@@ -4,6 +4,10 @@
 #   ~/v100/ninfer-api/serve.sh > logs/serve.log 2>&1 &      # start (background)
 #   kill $(pgrep -x ninfer-serve)                            # stop
 #
+# Every KV cache -- the retained device lane, the parked host image and the NVMe records -- is
+# released after 24 h without use (`--kv-cache-ttl-seconds 86400`), so a conversation nobody comes
+# back to stops holding memory or disk.
+#
 # Overrides: NINFER_API_PORT, NINFER_API_ARTIFACT, NINFER_API_TIER_DIR, NINFER_API_DISK_MIB.
 # A prefix the session displaces is parked in host RAM and then on NVMe, so a long conversation --
 # or a restarted server -- resumes it without recomputing it.
@@ -30,4 +34,4 @@ exec "${executable}" "${artifact}" \
     --spec mtp --draft-tokens 3 --lm-head-draft \
     --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 3600000 \
     --host-kv-mib 2048 --disk-kv-path "${tier_dir}" --disk-kv-mib "${disk_mib}" \
-    --log-stats-interval-ms 60000
+    --kv-cache-ttl-seconds 86400 --log-stats-interval-ms 60000

@@ -901,7 +901,7 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "MTP accepted per draft position (running request)",
+      "title": "MTP accepted per draft position (session and running request)",
       "datasource": {
         "type": "prometheus",
         "uid": "ninfer-prometheus"
@@ -915,8 +915,15 @@
       "targets": [
         {
           "refId": "A",
+          "expr": "ninfer_speculative_accepted_per_position_total",
+          "legendFormat": "session position {{position}}",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "B",
           "expr": "ninfer_speculative_live_accepted_per_position",
-          "legendFormat": "position {{position}}",
+          "legendFormat": "running now position {{position}}",
           "instant": false,
           "range": true
         }
@@ -952,7 +959,7 @@
           "sort": "desc"
         }
       },
-      "description": "Published only while a request is running -- there is no draft to attribute between sessions, so an empty panel here means idle, not broken."
+      "description": "Rounds in which the draft at that position was accepted: the chained draft decays with position, which is why the average accepted length is around two of three."
     }
   ]
 }

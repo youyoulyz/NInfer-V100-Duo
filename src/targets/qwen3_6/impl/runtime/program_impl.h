@@ -401,6 +401,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
+    kv_cache_ttl_seconds_ = plan.kv_cache_ttl_seconds;
     {
         // The shared block index holds a promise per 64-token block of a resident prefix, and every
         // promise comes from a lane that had to map a page group for that block. Its budget is
@@ -1048,6 +1049,45 @@ RewriteCheckpoint ProgramImplCore::shared_payload_checkpoint(std::uint32_t slot)
     return shared_payloads_[slot]->metadata.rewrite_checkpoint;
 }
 
+void ProgramImplCore::touch_retained_lane(std::uint32_t lane) noexcept {
+    if (lane < max_concurrency) { retained_wall_seconds_[lane] = DiskKVStore::wall_clock_seconds(); }
+}
+
+// The KV idle timeout. A retained lane nobody used for the timeout is spilled (so the cold copy
+// survives on NVMe) and released; a parked image is dropped, since the disk record is the copy that
+// remains; the tier itself then drops every record nobody read for the same window.
+std::uint32_t ProgramImplCore::expire_kv_cache() noexcept {
+    ++kv_cache_maintenance_runs_;
+    if (kv_cache_ttl_seconds_ == 0) { return 0; }
+    const std::uint64_t now_unix_seconds = DiskKVStore::wall_clock_seconds();
+    std::uint32_t expired = 0;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (!sequences[lane].retained) { continue; }
+        const std::uint64_t used = retained_wall_seconds_[lane];
+        if (used == 0 || now_unix_seconds < used ||
+            now_unix_seconds - used <= kv_cache_ttl_seconds_) {
+            continue;
+        }
+        if (parked_images_[lane].has_value()) {
+            drop_parked_lane(lane);
+            ++expired_parked_images_;
+            ++expired;
+            continue;
+        }
+        if (disk_tier_ != nullptr) { (void)spill_device_prefix(lane); }
+        clear_lane(sequences[lane], requests[lane]);
+        retained_wall_seconds_[lane] = 0;
+        ++expired_retained_lanes_;
+        ++expired;
+    }
+    if (disk_tier_ != nullptr) {
+        const std::uint32_t dropped = disk_tier_->expire(kv_cache_ttl_seconds_, now_unix_seconds);
+        expired_disk_records_ += dropped;
+        expired += dropped;
+    }
+    return expired;
+}
+
 // Gives up lane-free payloads until both pools can hand out what a lane is about to own. A payload
 // holds real page groups out of the pool, so an admission that needs room has to take them back:
 // they are opportunistic copies of prefixes whose lane is already gone, and the newest capture is
@@ -1276,6 +1316,7 @@ bool ProgramImplCore::adopt_node_prefix(std::uint32_t lane, const PreparedPrompt
     sequence.rewrite_checkpoint      = image.metadata.rewrite_checkpoint;
     sequence.kv                      = std::move(bundle);
     sequence.retained                = true;
+    touch_retained_lane(lane);
 
     // The next unit may read these pages on the peer's stream, and the copies were issued on this
     // one.
@@ -1340,6 +1381,20 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
     out.disk_tier_capacity_bytes = disk_tier_capacity_bytes();
     out.disk_tier_used_bytes     = disk_tier_used_bytes();
     out.disk_tier_restores       = disk_tier_restores();
+    out.expired_retained_lanes   = expired_retained_lanes_;
+    out.expired_parked_images    = expired_parked_images_;
+    out.expired_disk_records     = expired_disk_records_;
+    out.kv_cache_ttl_seconds     = kv_cache_ttl_seconds_;
+    out.kv_cache_maintenance_runs = kv_cache_maintenance_runs_;
+    // Oldest idle prefix: what the timeout compares against.
+    const std::uint64_t now = DiskKVStore::wall_clock_seconds();
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (!sequences[lane].retained || retained_wall_seconds_[lane] == 0) { continue; }
+        const std::uint64_t idle = now >= retained_wall_seconds_[lane]
+                                       ? now - retained_wall_seconds_[lane]
+                                       : 0;
+        out.oldest_retained_idle_seconds = std::max(out.oldest_retained_idle_seconds, idle);
+    }
     return out;
 }
 
@@ -1492,6 +1547,8 @@ bool ProgramImplCore::adopt_lane_prefix(std::uint32_t lane, const PreparedPrompt
                                sequence.rewrite_checkpoint_hidden.bytes(),
                                cudaMemcpyDeviceToDevice, device.stream));
 
+    // The donor's prefix was just used by another lane, so its idle clock starts over.
+    touch_retained_lane(donor);
     // Everything a parked lane's image would have carried, so every reuse branch below behaves the
     // way it would on the donor's own lane.
     sequence.ledger                  = source.ledger;
@@ -2517,6 +2574,7 @@ void ProgramImplCore::restore_lane(std::uint32_t lane) {
     sequence.rewrite_checkpoint      = parked->metadata.rewrite_checkpoint;
     sequence.kv                      = std::move(bundle);
     sequence.retained                = true;
+    touch_retained_lane(lane);
     parked.reset();
 }
 
@@ -2717,6 +2775,7 @@ bool ProgramImplCore::spill_device_prefix(std::uint32_t lane) noexcept {
 // blocks it appended plus the state image at the new frontier.
 void ProgramImplCore::publish_retained_prefix(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
+    touch_retained_lane(lane);
     // The content index first: a prefix keeps serving every sibling lane that repeats it whether or
     // not this Program has a host or NVMe tier, and the spill below is a second, optional copy.
     try {

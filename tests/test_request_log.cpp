@@ -402,6 +402,8 @@ int main() {
     metrics_stats.kv.main_entitled_page_groups = 1000;
     metrics_stats.kv.main_free_page_groups     = 2000;
     metrics_stats.kv.disk_tier_used_bytes      = 4096;
+    metrics_stats.kv.expired_disk_records      = 3;
+    metrics_stats.speculative_accepted_per_position = {9, 6, 3};
     const std::string metrics = format_prometheus_metrics(metrics_stats, "serve-test-model");
     failures += check(metrics.find("ninfer_prefill_tokens_total 100\n") != std::string::npos &&
                           metrics.find("ninfer_speculative_rounds_total 4\n") !=
@@ -415,6 +417,10 @@ int main() {
             metrics.find("ninfer_kv_page_groups{pool=\"main\",state=\"shared_held\"} 62\n") !=
                 std::string::npos &&
             metrics.find("ninfer_disk_tier_bytes{state=\"used\"} 4096\n") != std::string::npos &&
+            metrics.find("ninfer_kv_cache_expired_total{kind=\"disk_record\"} 3\n") !=
+                std::string::npos &&
+            metrics.find("ninfer_speculative_accepted_per_position_total{position=\"2\"} 6\n") !=
+                std::string::npos &&
             metrics.find("ninfer_shared_payloads 2\n") != std::string::npos,
         "prometheus exposition omits a KV or shared-index sample");
     failures += check(metrics.find("ninfer_info{model=\"serve-test-model\"} 1\n") !=

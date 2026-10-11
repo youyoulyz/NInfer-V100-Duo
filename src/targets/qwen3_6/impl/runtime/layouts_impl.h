@@ -765,6 +765,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->host_context_bytes  = inputs.host_context_bytes;
     impl->shared_state_images = inputs.shared_state_images;
     impl->shared_kv_bytes     = inputs.shared_kv_bytes;
+    impl->kv_cache_ttl_seconds = inputs.kv_cache_ttl_seconds;
     impl->disk_kv_path        = inputs.disk_kv_path;
     impl->disk_kv_bytes       = inputs.disk_kv_bytes;
     impl->kv_dtype            = inputs.kv_dtype;
@@ -885,6 +886,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .host_context_bytes = options.host_context_bytes,
         .shared_state_images = options.shared_state_images,
         .shared_kv_bytes    = options.shared_kv_bytes,
+        .kv_cache_ttl_seconds = options.kv_cache_ttl_seconds,
         .disk_kv_path       = options.disk_kv_path.string(),
         .disk_kv_bytes      = options.disk_kv_bytes,
         .tp                 = options.tp,

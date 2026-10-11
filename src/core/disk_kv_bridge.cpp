@@ -336,6 +336,15 @@ std::uint32_t DiskKVBridge::slot_count(DiskKVKind kind) const {
     return target.store != nullptr ? target.store->slot_count() : 0U;
 }
 
+std::uint32_t DiskKVBridge::sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now) {
+    std::uint32_t dropped = 0;
+    for (Family& entry : families_) {
+        if (entry.store == nullptr) { continue; }
+        dropped += entry.store->sweep_expired(ttl_seconds, now);
+    }
+    return dropped;
+}
+
 std::size_t DiskKVBridge::used_bytes() const {
     std::size_t total = 0;
     for (const Family& target : families_) {

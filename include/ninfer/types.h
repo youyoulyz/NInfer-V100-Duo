@@ -222,6 +222,10 @@ struct EngineOptions {
     // claimable. The device pages of those prefixes are held by the engine's block index, not by
     // this budget.
     std::uint32_t shared_state_images = 0;
+    // Idle timeout for every KV cache the engine holds -- retained device lanes, parked host
+    // images, and the NVMe tier's records. Zero (the default) keeps them until something else
+    // displaces them; a long-running service that expects conversations to go cold sets a day.
+    std::uint64_t kv_cache_ttl_seconds = 0;
     // Pinned host RAM budget for one KV image per lane-free shared checkpoint. Zero (the default)
     // keeps the payload's KV on the device: the engine then holds the chain's page groups so the
     // bytes survive the lane, at the cost of that many device pages. With a budget, a captured
@@ -964,6 +968,16 @@ struct KvRuntimeStats {
     std::size_t disk_tier_capacity_bytes       = 0;
     std::size_t disk_tier_used_bytes           = 0;
     std::uint64_t disk_tier_restores           = 0;
+    // Idle-cache expiry: records the 24h-style timeout has released, by kind.
+    std::uint64_t expired_retained_lanes       = 0;
+    std::uint64_t expired_parked_images        = 0;
+    std::uint64_t expired_disk_records         = 0;
+    // Idle-cache timeout as configured, how long the oldest retained prefix has been idle, and how
+    // many times the maintenance pass has run.
+    std::uint64_t kv_cache_ttl_seconds         = 0;
+    std::uint64_t oldest_retained_idle_seconds = 0;
+    std::uint64_t kv_cache_maintenance_runs    = 0;
+    // Persistent KV payload this device holds, for the whole pool (not per token).
     std::size_t kv_payload_bytes               = 0;
     std::size_t gdn_state_bytes                = 0;
     std::uint32_t max_context                  = 0;
@@ -1000,6 +1014,9 @@ struct RuntimeStats {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     SpeculativeStats speculative_live;
+    // Accepted drafts per position over the server's life: `accepted_per_position[i]` counts the
+    // rounds in which draft i+1 was accepted, which is the shape of the chained draft's decay.
+    std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;

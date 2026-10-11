@@ -61,6 +61,8 @@ struct ServeOptions {
     std::uint32_t shared_state_images = 0;
     // Pinned host budget for one KV image per shared checkpoint (0 keeps the KV on the device).
     std::size_t shared_kv_bytes = 0;
+    // Idle timeout for every KV cache the engine holds (0 disables it).
+    std::uint64_t kv_cache_ttl_seconds = 0;
     std::filesystem::path disk_kv_path;
     std::size_t disk_kv_bytes = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
