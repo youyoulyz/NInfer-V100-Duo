@@ -1,0 +1,13 @@
+# Drop this file in as ~/.codex/ninfer.config.toml (Codex 0.162 reads profiles from
+# <CODEX_HOME>/<name>.config.toml), then run:  codex --profile ninfer
+# It touches nothing else in your existing ~/.codex/config.toml.
+model = "qwen3.8-27b-nvfp4"
+model_provider = "ninfer"
+model_reasoning_effort = "high"
+
+[model_providers.ninfer]
+name = "NInfer local (2xV100)"
+base_url = "http://192.168.1.211:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "local"

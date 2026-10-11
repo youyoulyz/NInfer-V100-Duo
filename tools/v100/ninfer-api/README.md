@@ -13,7 +13,7 @@ data) stays there.
 
 | | |
 |---|---|
-| Endpoint | `http://127.0.0.1:8080/v1` (OpenAI-compatible: `/v1/chat/completions`, `/v1/messages`, `/v1/models`) |
+| Endpoint | `http://192.168.1.211:8080/v1` on every interface (OpenAI-compatible: `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/v1/responses`); `127.0.0.1` works locally too |
 | Metrics | `http://127.0.0.1:8080/metrics` (Prometheus text; unauthenticated, never blocked by a request) |
 | Model id | `qwen3.8-27b-nvfp4` |
 | Artifact | `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer` |
@@ -57,6 +57,25 @@ speed panels mean an idle server, not a broken dashboard.
 
 `docs/serving.md` documents the endpoint itself; the scrape path reads published counters only, so
 scraping cannot stall inference.
+
+## Reachability (intranet)
+
+`serve.sh` binds the API on **every interface** (`NINFER_API_HOST`, default `0.0.0.0`), Grafana
+publishes `3000` and Prometheus `9090` on every interface, and the image renderer stays on
+`127.0.0.1:8081` because it is Grafana's helper, not a service. The API is **unauthenticated**
+unless `NINFER_API_KEY` is set (clients then send the same value as their bearer token), so anyone
+who can reach the port can run the model. Keep it behind the host firewall
+(`sudo ufw allow from <lan-cidr> to any port 8080 proto tcp`, the same for 3000 and 9090 for the
+dashboard), or set `NINFER_API_HOST=127.0.0.1` to keep the API local. Verified through the host's
+INPUT path -- a bridge-networked container reaching `http://192.168.1.211:8080/v1/models` gets 200,
+as do Grafana and Prometheus, while the renderer stays unreachable off-host.
+
+`clients/` carries both agent configurations, verified against this deployment:
+
+| File | Use |
+|---|---|
+| `codex-ninfer.config.toml` | copy to `~/.codex/ninfer.config.toml`, then `codex --profile ninfer` (Codex 0.162 reads profiles from their own file; nothing else in your `config.toml` changes) |
+| `claude-env.sh` | `source` it before `claude`, or put the same pairs in the `env` object of `~/.claude/settings.json` |
 
 ## Agent clients and the compatibility shim
 

@@ -6,8 +6,10 @@
 # Config (scrape targets, datasource, dashboards) is mounted from this repository, so the tree is
 # the authority; the runtime state (Prometheus TSDB, Grafana database) stays in the deployment
 # directory and never lands in the tree. Both are overridable with NINFER_REPO_DIR / NINFER_API_DIR.
-# Both containers share the host network, so Prometheus reaches the server on loopback and Grafana
-# binds the host's 3000 directly.
+# Both containers share the host network: Prometheus scrapes the server on loopback and listens on
+# every interface, Grafana listens on every interface (3000), and the image renderer stays on
+# 127.0.0.1:8081. Open the ports you need in the host firewall
+# (`sudo ufw allow from <lan-cidr> to any port 3000 proto tcp`).
 # The image renderer is optional: without it Grafana serves every panel except `GET /render/...`.
 services:
   renderer:
@@ -17,6 +19,8 @@ services:
     restart: unless-stopped
     environment:
       AUTH_TOKEN: ninfer-renderer-token
+      # The renderer is a helper for Grafana, not a service to reach from the intranet.
+      SERVER_ADDR: 127.0.0.1:8081
   prometheus:
     image: prom/prometheus:latest
     container_name: ninfer-prometheus
@@ -27,7 +31,7 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
-      - --web.listen-address=127.0.0.1:9090
+      - --web.listen-address=:9090
       - --web.enable-lifecycle
     volumes:
       - ${NINFER_REPO_DIR:-/home/luyzh/v100/NInfer-V100-Duo}/tools/v100/ninfer-api/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
