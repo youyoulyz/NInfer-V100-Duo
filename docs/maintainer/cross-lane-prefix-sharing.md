@@ -239,6 +239,27 @@ per-node 镜像；四份都成功就把 `payload.copies` 记为 `Host`、**不**
 image、或让 L3 也按节点（而不是按 64-token 块）组织，都只影响存储成本与实现形状，lookup /
 claim / 淘汰的语义不再变。
 
+### 剩余工作（TODO）
+
+**背景**：KV 的"字节"已经是 block 级——L3 每条记录就是一个 64-token 块（按内容寻址、跨会话去重），
+`SharedBlockStore` 的节点就是块，开启 node payload 后 device/host 的页组与 KV 也以节点为单位持有。
+但**生命周期（超时/淘汰）在 device/host 这层目前仍按 lane**：`--kv-cache-ttl-seconds` 到期释放的是
+"一条 retained lane / 一张 parked lane image"，而不是一批节点。GDN 的 recurrent state 不是每 token
+的 KV，所以"能续跑"的最小单位只能是 **checkpoint = 一段 block 链 + 一张 state image**；但"存字节"和
+"淘汰字节"完全可以、也应该按块走。下面四件事把这件事补齐（互相独立，可按序做）。
+
+| # | 待办 | 现状 | 目标 / 验收 | 代价 |
+|---|---|---|---|---|
+| T1 | 节点级（block 级）生命周期 | `expire_kv_cache` 只按 lane 判断（`retained_wall_seconds_`/`parked_images_`），disk 层已按记录 | 给 `SharedBlockStore` 每个节点一个 last-use：超时先丢该节点的 state image，节点随即失去可恢复性 → `prune` 释放它持有的页组；lane 级 TTL 只兜底"从未 capture 的 lane"。验收：store 单测 + 隔离 tier 的 TTL 跑，`ninfer_kv_cache_expired_total{kind="node"}` 按节点增长、disk 记录同步被扫 | 中：要选好 last-use 的写点（intern / claim / attach payload），并保证"还挂 state image 的节点不被摘" |
+| T2 | 去掉重复的 lane park | `evict_retained_lane` 先 `capture_node_payload` 再 `park_lane`，同一份字节在 host 存两遍 | payload 成功就不再 park，直接清 lane（lane 立刻可以给别的会话）；lane park 只留给"没有 state image 可挂"的前缀。验收：capture 后 `host_tier_parked_bytes` 不涨、`shared_payloads` 涨；claim 仍非 `full_reset` 且与冷跑逐 token 相同（复用现有 gate） | 小 |
+| T3 | 部署打开 node path | `serve.sh` 只开了 host/disk tier，没开 `--shared-state-images`，所以现在被顶掉的前缀仍是"整条 lane park" | `serve.sh` 加 `--shared-state-images N`（建议 4–8，每张 ~295 MiB）与可选 `--shared-kv-mib`（每块每 rank ~1.09 MiB，按前缀线性）。**决策点**：要多少张 state image（= 同时可续跑的 checkpoint 数）以及 KV 是否也放 host。验收：`ninfer_qwen3_6_27b_shared_payload_real_test` 三变体 + 真实服务观察（`shared_payloads`/`held_pages`/TTL 计数） | 小（配置），但要先定预算 |
+| T4 | 合并 per-node 镜像；只 capture 需要的那一个 slot | node 镜像现在是"state（两个 slot）+ KV"两份预算、两次 LRU 决策；state 每张 ~295 MiB | 合成一条 per-node 记录；capture 只取该 promise 需要的那一个 slot 角色（~147 MiB），另一角色 claim 时按需重建/不取。验收同上，外加 host 预算占用减半的测量 | 中 |
+
+**验证缺口（交给审核者）**：`ninfer_kv_cache_test`、`ninfer_concurrent_executor_test` 需要两块 GPU
+空闲才能跑（服务占满 16 GB 时会 `cudaSetDevice` OOM），当前只在服务未启动时验证过；
+TTL 的 `parked_image` 分支尚未被端到端触发过（隔离 tier 那次只走了 `retained_lane` 与
+`disk_record`）。
+
 P1 分两半，两半都已落地：
 
 - **store 半边**：`PagedKVPool::adopt_shared()` 让一个 allocation 把 owner 的物理页发布
