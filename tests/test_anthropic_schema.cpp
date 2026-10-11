@@ -558,14 +558,16 @@ int test_reasoning_effort() {
                           low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
                       "Anthropic low effort did not reach PromptInput");
 
+    // Claude Code 2.1 asks for `output_config.effort = high`; the template's top level is `xhigh`,
+    // so the protocol value is translated rather than refused.
     Json high                            = base;
     high["output_config"]                = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_messages_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Anthropic high effort bypassed template capability validation");
+    const ResolvedPromptSemantics high_semantics =
+        resolve_prompt_semantics(high_request, default_server(), effort_capabilities());
+    failures += check(high_semantics.enable_thinking &&
+                          high_semantics.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "Anthropic high effort did not translate onto the template ladder");
 
     Json conflict        = low;
     conflict["thinking"] = Json{{"type", "disabled"}};

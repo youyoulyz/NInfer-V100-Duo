@@ -58,6 +58,23 @@ speed panels mean an idle server, not a broken dashboard.
 `docs/serving.md` documents the endpoint itself; the scrape path reads published counters only, so
 scraping cannot stall inference.
 
+## Agent clients and the compatibility shim
+
+Codex (Responses wire) and Claude Code (Anthropic Messages wire) run against this server unchanged;
+`docs/serving.md` has both configurations. The engine validates both request bodies field by field,
+which refuses a field a newer agent build starts sending -- that is how Codex 0.162 needed
+`client_metadata`/`prompt_cache_key`/`include`/non-function tools/`reasoning.summary` and Claude Code
+2.1 needed its `output_config.effort = high` translated. The engine now tolerates that set natively;
+`compat-shim.py` is the forward-compatibility fallback for the next such field:
+
+```bash
+python3 compat-shim.py --port 8098 --upstream 127.0.0.1:8080   # point the client at :8098
+```
+
+It forwards bodies and streaming responses unchanged after dropping the fields the engine does not
+act on, skipping tools it cannot execute and translating the effort vocabularies, logging every
+change.
+
 ## opencode
 
 `~/.config/opencode/opencode.json` declares the provider and makes it the default model:

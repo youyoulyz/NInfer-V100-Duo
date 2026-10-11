@@ -154,6 +154,38 @@ is how reuse was realized, so a resumed session shows `cache` at the prompt fron
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 | `GET /metrics` | Prometheus text exposition of throughput, speculative acceptance, the paged-KV distribution, the tiers and the shared prefix index; never blocked by a running request, and unauthenticated like `/health` |
 
+### Agent clients
+
+Both official agents work against this server unchanged. Codex speaks the Responses wire:
+
+```toml
+# ~/.codex/config.toml
+model = "qwen3.8-27b-nvfp4"
+model_provider = "ninfer"
+
+[model_providers.ninfer]
+name = "NInfer local"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "local"
+```
+
+```bash
+# Claude Code speaks the Anthropic Messages wire
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN=local
+export ANTHROPIC_MODEL=qwen3.8-27b-nvfp4
+export ANTHROPIC_SMALL_FAST_MODEL=qwen3.8-27b-nvfp4
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000   # it does not know the alias and would assume this
+claude -p "run cat marker.txt" --dangerously-skip-permissions
+```
+
+A server that serves one session at a time (`--max-concurrency 1`) queues the agents' side
+requests (title/summary traffic, parallel tool turns), so a first token can take as long as the
+request ahead of it; the agents' own system prompt plus tools is 6K-30K tokens, which is the cold
+prefill cost of their first turn.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -195,13 +227,14 @@ artifact template's existing tool/reasoning-instruction composition.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`; omitting effort uses that template's declared default.
 
-For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
-select the corresponding template effort when available. The other OpenAI protocol values
-`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
+The three protocol vocabularies are translated onto that ladder rather than refused, because the
+official agents ask in their own words (Codex defaults to `high`, Claude Code sends
+`output_config.effort = "high"`): `minimal` selects `low`, `high` and `max` select `xhigh`, and
+`none` disables thinking. An effort the *translated* template still does not expose returns HTTP 400
+with code `reasoning_effort_not_supported` before prompt preparation.
+
 `enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
 `reasoning_effort` returns `conflicting_template_option`.
 
@@ -315,7 +348,12 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking; `low`/`medium`/`xhigh` select an effort exposed by the loaded chat template; the other protocol values are translated (`minimal` to `low`, `high`/`max` to `xhigh`) so the official agents work unchanged |
+| `reasoning.summary` | accepted and ignored (a client display preference) |
+| `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention` | accepted and ignored: reuse is decided by the engine's own content-addressed prefix store |
+| `include` | accepted and ignored; the engine adds no additional response fields |
+| `client_metadata` | accepted and ignored (Codex's session/installation/turn telemetry) |
+| `tools` entries that are not `function` | skipped, not rejected: Codex advertises a namespaced sub-agent tool and a disabled `web_search` on every request |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -521,6 +559,8 @@ The independent top-level `preserve_thinking` boolean controls closed-turn histo
 uses the server default.
 
 Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
+`max` (`minimal` is not an Anthropic value). `high` and `max` select the template's `xhigh`, and
+`low`/`medium`/`xhigh` map directly; the values below are the raw protocol names.
 `max`. The value is then checked against the loaded chat template in the same way as the OpenAI
 endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
 an effort with `thinking.type: "disabled"` is rejected as contradictory.

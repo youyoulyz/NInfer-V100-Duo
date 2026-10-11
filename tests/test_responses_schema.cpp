@@ -184,14 +184,56 @@ int test_reasoning_effort() {
     failures += check(!none_semantics.enable_thinking && !none_semantics.reasoning_effort,
                       "Responses none effort did not disable thinking");
 
-    Json high                            = base;
-    high["reasoning"]                    = Json{{"effort", "high"}};
-    const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Responses high effort bypassed template capability validation");
+    // The protocol vocabularies are translated onto the template's ladder: OpenAI's `high` and
+    // `max` are the template's `xhigh`, and `minimal` its `low`.
+    for (const std::pair<const char*, ninfer::ReasoningEffort> translated :
+         std::array<std::pair<const char*, ninfer::ReasoningEffort>, 3>{
+             {{"minimal", ninfer::ReasoningEffort::Low},
+              {"high", ninfer::ReasoningEffort::XHigh},
+              {"max", ninfer::ReasoningEffort::XHigh}}}) {
+        Json body         = base;
+        body["reasoning"] = Json{{"effort", translated.first}};
+        const GenerationRequest request = parse_responses_request(body, limits()).generation;
+        const ResolvedPromptSemantics semantics =
+            resolve_prompt_semantics(request, ServeOptions{}, effort_capabilities());
+        failures += check(semantics.enable_thinking &&
+                              semantics.reasoning_effort == translated.second,
+                          std::string("Responses effort ") + translated.first +
+                              " did not translate onto the template ladder");
+    }
+
+    // Fields the official clients send but this engine does not act on are accepted and ignored:
+    // Codex's telemetry, its cache hints, the extra response fields it asks for, the tools it
+    // advertises that are not functions, and its reasoning-summary preference.
+    Json tolerated       = base;
+    tolerated["client_metadata"] = Json{{"session_id", "s"}, {"turn_id", "t"}};
+    tolerated["prompt_cache_key"] = "codex-cache-key";
+    tolerated["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    tolerated["prompt_cache_retention"] = "24h";
+    tolerated["include"] = Json::array({"reasoning.encrypted_content"});
+    tolerated["reasoning"] = Json{{"effort", "none"}, {"summary", "auto"}};
+    tolerated["tools"] = Json::array({
+        Json{{"type", "web_search"}, {"external_web_access", false}},
+        Json{{"type", "namespace"}, {"name", "multi_agent"},
+             {"tools", Json::array({Json{{"type", "function"},
+                                         {"name", "sub"},
+                                         {"parameters", Json{{"type", "object"}}}}})}},
+        Json{{"type", "function"}, {"name", "shell"},
+             {"parameters", Json{{"type", "object"}}}}});
+    const ResponsesRequest tolerated_request = parse_responses_request(tolerated, limits());
+    failures += check(tolerated_request.tools.size() == 1 &&
+                          tolerated_request.tools.at(0).at("name") == "shell",
+                      "Responses did not skip the tools it cannot execute");
+    failures += check(tolerated_request.metadata.is_object(),
+                      "Responses telemetry was not tolerated");
+
+    Json input_tokens_telemetry = Json{{"model", "qwen3.6-27b"}, {"input", "hello"},
+                                       {"client_metadata", Json{{"session_id", "s"}}}};
+    failures += check(throws_api([&] {
+                          (void)parse_response_input_tokens_request(input_tokens_telemetry,
+                                                                    limits());
+                      }) == false,
+                      "the token-count request refused client telemetry");
 
     Json invalid         = base;
     invalid["reasoning"] = Json{{"effort", "ultra"}};

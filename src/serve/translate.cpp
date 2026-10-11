@@ -137,13 +137,19 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     case RequestedReasoningEffort::XHigh:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
+    // The three protocol vocabularies do not line up with the template's ladder (none / low /
+    // medium / xhigh): OpenAI's `minimal` sits below its lowest reasoning level and `high`/`max` at
+    // or above its highest. Translate the names instead of refusing them -- the official agents ask
+    // in their own vocabulary (Codex defaults to `high`, Claude Code sends
+    // `output_config.effort = high`) -- and let the capability check below reject a template that
+    // genuinely lacks the level a request landed on.
     case RequestedReasoningEffort::Minimal:
+        result.reasoning_effort = ninfer::ReasoningEffort::Low;
+        break;
     case RequestedReasoningEffort::High:
     case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+        break;
     case RequestedReasoningEffort::None:
         break;
     }

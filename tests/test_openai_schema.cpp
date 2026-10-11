@@ -218,11 +218,11 @@ int test_reasoning_effort() {
     Json high                            = base;
     high["reasoning_effort"]             = "high";
     const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "protocol-valid high effort was not rejected by template capability");
+    const ResolvedPromptSemantics high_semantics =
+        resolve_prompt_semantics(high_request, default_server(), effort_capabilities());
+    failures += check(high_semantics.enable_thinking &&
+                          high_semantics.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "protocol-valid high effort did not translate onto the template ladder");
 
     ninfer::PromptCapabilities toggle_capabilities;
     toggle_capabilities.enable_thinking = true;

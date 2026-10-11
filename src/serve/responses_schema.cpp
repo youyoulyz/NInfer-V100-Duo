@@ -454,7 +454,10 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             bad_request("tools entries must be objects with a string type", "tools");
         }
         if (item.at("type").get<std::string>() != "function") {
-            bad_request("only function tools are supported", "tools", "tool_type_not_supported");
+            // Codex always advertises tools this engine cannot execute (a namespaced sub-agent tool,
+            // a disabled web_search). Skipping them keeps the request usable; the model simply never
+            // sees them.
+            continue;
         }
         ToolDefinition tool;
         tool.name = require_function_name(item, "tools");
@@ -531,12 +534,9 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     if (!body.contains("reasoning") || body.at("reasoning").is_null()) { return; }
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
-    for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
-            bad_request("reasoning." + it.key() + " is not supported", "reasoning",
-                        "reasoning_option_not_supported");
-        }
-    }
+    // `effort` is the only key the engine acts on. Codex also sends `summary` ("auto"), which is a
+    // display preference; it is accepted and ignored instead of failing the request.
+
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {
         bad_request("reasoning.effort must be a string", "reasoning");
@@ -573,6 +573,9 @@ void reject_unknown_top_level(const Json& body) {
     static const std::unordered_set<std::string> allowed = {
         "background",
         "chat_template_kwargs",
+        // Codex sends its session/installation/turn ids here. They are telemetry, not something the
+        // engine acts on, so the field is accepted and ignored rather than refused.
+        "client_metadata",
         "context_management",
         "conversation",
         "include",
@@ -613,9 +616,11 @@ void reject_unknown_top_level(const Json& body) {
 }
 
 void reject_server_managed_features(const Json& body) {
+    // `prompt_cache_key` / `prompt_cache_options` / `prompt_cache_retention` are deliberately NOT
+    // in this list: clients (Codex always) advertise a cache key, and the engine's own
+    // content-addressed prefix store decides reuse, so the hint is accepted and ignored.
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+                            "prompt", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -631,10 +636,8 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
-        }
+        // Codex asks for `reasoning.encrypted_content`. The engine emits reasoning Items with their
+        // text either way, so the request is accepted and the extra field simply is not added.
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
         if (!body.at("parallel_tool_calls").is_boolean()) {
@@ -946,7 +949,7 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
-            it.key() != "preserve_thinking") {
+            it.key() != "preserve_thinking" && it.key() != "client_metadata") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }
