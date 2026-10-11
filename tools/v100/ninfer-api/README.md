@@ -30,9 +30,13 @@ cd ~/v100/ninfer-api/monitoring && docker compose up -d     # Prometheus + Grafa
 docker compose down                                          # stop them
 ```
 
-Both containers use the host network, so Prometheus scrapes `127.0.0.1:8080/metrics` directly and
-Grafana binds the host's 3000. From another machine, either open `http://<this-host>:3000` or forward
-it: `ssh -L 3000:127.0.0.1:3000 luyzh@<this-host>`.
+The stack is three containers on the host network: Prometheus scrapes `127.0.0.1:8080/metrics`
+directly, Grafana binds the host's 3000, and `grafana-image-renderer` serves Grafana's
+`GET /render/d/ninfer/...png` so a dashboard snapshot can be captured without a browser
+(`curl -u admin:ninfer 'http://127.0.0.1:3000/render/d/ninfer/ninfer-2xv100-200k-single-session?width=1600&height=2400&from=now-6h&to=now&kiosk' -o dash.png`).
+From another machine, either open `http://<this-host>:3000` or forward it:
+`ssh -L 3000:127.0.0.1:3000 luyzh@<this-host>`. The compose file honours `NINFER_REPO_DIR` (config,
+defaults to this repository) and `NINFER_API_DIR` (runtime state, defaults to `~/v100/ninfer-api`).
 
 The provisioned dashboard (15 panels, 2 s refresh) shows:
 
@@ -43,6 +47,11 @@ The provisioned dashboard (15 panels, 2 s refresh) shows:
 | KV cache | main and MTP KV page groups by state (`capacity` / `entitled` / `free` / `shared_held`), GDN state slots, host and NVMe tier bytes |
 | Shared prefix index | indexed blocks, lane promises, lane-free payloads, pages held, hit rate |
 | Requests | `ninfer_requests{state="running|prefilling|decode_ready|waiting"}`, context ceiling, KV bytes/token |
+
+Panels default to a six-hour window, so a burst stays visible after it ends; the rate windows are
+five minutes (thirty for the session acceptance) and the stat panels reduce over the whole window.
+`MTP accepted per draft position` only fills while a request is running -- it is live-only. Empty
+speed panels mean an idle server, not a broken dashboard.
 
 `docs/serving.md` documents the endpoint itself; the scrape path reads published counters only, so
 scraping cannot stall inference.
