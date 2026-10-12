@@ -1,24 +1,21 @@
 # NInfer API service and live dashboard (2 × V100-SXM2-16GB)
 
-Qwen3.8-27B `gguf-blocks` (GSQ-RCO IQ3_S v3), TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`),
-INT8-G64 KV, **240 000-token context at `--max-concurrency 2`**. The artifact is the same model as
-the NVFP4 profile at 3.4 bits: 5.66 GiB of weights per GPU against 10.46, and that difference goes
-into the pool rather than into lanes -- 440 000 shared tokens against 190 000. Two lanes is the
-measured optimum for this route, not a conservative default: with four rows a decode round cost
-89.6 ms for 10.8 committed tokens (120 tok/s) against 27 ms for 2.7 at one row, because the GGUF/dp4a
-kernels on this card do not overlap weight streaming with the per-position compute MTP's 1+3 verify
-pays for. Admission charges each request its prompt plus its declared `max_tokens`, so one request
-can hold the full 240 000 and a second about 205 000, or two ~90K agent sessions run together
-(Claude Code declares 32 000). Against the NVFP4 artifact measured on this host,
-prefill is 55-65% faster and decode 10-15% slower. **Switching the artifact requires clearing the
-tier** (`./stop.sh && rm -f tier/*`): records are keyed without the weights, so one quantization's
-KV would otherwise be resumed by the next. Every KV cache -- the retained device lane, the parked host image and the NVMe
-records -- has a **4 h idle timeout** (`--kv-cache-ttl-seconds 14400`), so a conversation nobody
-comes back to releases its memory and disk. A prefix the session displaces is parked in 2 GiB of pinned host RAM and then on
-NVMe (400 GiB sparse bound), so a long conversation -- and a restarted server -- resumes it without
-recomputing it. The tier file is sparse but keeps the blocks of everything it has held: an hourly
-reclaim pass hands the blocks of released records back to the filesystem (no restart needed), and
-`ninfer_disk_tier_reclaimed_bytes_total` reports the total it has returned.
+Qwen3.8-27B NVFP4, TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`), INT8-G64 KV, **190 000-token
+context at `--max-concurrency 2`**. The 190 000-token pool is shared: admission charges each
+request its prompt plus its declared `max_tokens`, so two ~63K agent sessions run together (Claude
+Code declares 32 000) while one 190 000-token request still fits alone. The lighter `gguf-blocks`
+artifact is available and reaches a 440 000-token pool, but it gives up committing throughput on
+this route -- see [Artifact choice](#artifact-choice). **Switching the artifact requires clearing
+the tier** (`./stop.sh && rm -f tier/*`): records are keyed without the weights, so one
+quantization's KV would otherwise be resumed by the next.
+
+Every KV cache -- the retained device lane, the parked host image and the NVMe records -- has a
+**4 h idle timeout** (`--kv-cache-ttl-seconds 14400`), so a conversation nobody comes back to
+releases its memory and disk. A prefix the session displaces is parked in 2 GiB of pinned host RAM
+and then on NVMe (400 GiB sparse bound), so a long conversation -- and a restarted server --
+resumes it without recomputing it. The tier file is sparse but keeps the blocks of everything it
+has held: an hourly reclaim pass hands the blocks of released records back to the filesystem (no
+restart needed), and `ninfer_disk_tier_reclaimed_bytes_total` reports the total it has returned.
 
 Everything here is run from the deployment directory `~/v100/ninfer-api`, whose scripts and monitoring
 config are symlinks to this directory; its runtime state (`tier/`, `logs/`, the Prometheus and Grafana
@@ -29,7 +26,7 @@ data) stays there.
 | Endpoint | `http://192.168.1.211:8080/v1` on every interface (OpenAI-compatible: `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/v1/responses`); `127.0.0.1` works locally too |
 | Metrics | `http://127.0.0.1:8080/metrics` (Prometheus text; unauthenticated, never blocked by a request) |
 | Model id | `qwen3.8-27b-nvfp4` |
-| Artifact | `/home/luyzh/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (`qwen3.8-27b/gguf-blocks`); the NVFP4 profile is `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer` |
+| Artifact | `/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer`; the lighter `gguf-blocks` profile is `/home/luyzh/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` |
 | Start / stop | `./serve.sh` (foreground) / `./stop.sh`; background: `setsid nohup ./serve.sh > logs/serve.log 2>&1 &` |
 | Dashboard | `http://<host>:3000` -> folder **NInfer** -> *NInfer (2xV100, 200k single session)*; anonymous viewer, or `admin` / `ninfer` |
 | Prometheus | `http://127.0.0.1:9090` (scrape every 2 s) |
@@ -38,6 +35,51 @@ data) stays there.
 Overrides: `NINFER_API_PORT`, `NINFER_API_ARTIFACT`, `NINFER_API_TIER_DIR`, `NINFER_API_DISK_MIB`,
 `NINFER_API_ACCESS_DIR`. `serve.sh` admits two sessions at a time (`--max-concurrency 2`); extra
 requests queue.
+
+## Artifact choice
+
+Both artifacts are `qwen3.8-27b` and both are already on this host. The choice was measured on this
+deployment, not argued from the model cards, and it lands on NVFP4 for the opposite reason the
+memory numbers suggest.
+
+**What each one costs in memory** (TP2, per GPU, from the startup record):
+
+| | NVFP4 | gguf-blocks (GSQ-RCO IQ3_S v3) |
+|---|---:|---:|
+| weights | 10.46 GiB | ~6.4 GiB |
+| free after weights | 5.00 GiB | 9.46 GiB |
+| pool at C=2 | 190 000 tok (2969 pages) | 440 000 tok (6875 pages) |
+| slack at that shape | 81.4 MiB | 65.0 MiB |
+
+**What each one does with a batch.** A decode round's cost and what it commits, measured here with
+two counters sampled 120 s apart while every admitted lane was decoding:
+
+| artifact | lanes | round | rows/round | committed/round | **aggregate** | per request |
+|---|---:|---:|---:|---:|---:|---:|
+| gguf-blocks | 1 (doc, matched prompts) | 27.6 ms | 1.00 | 2.9 | 105 tok/s | 105 |
+| gguf-blocks | 2 (measured) | 50.6 ms | 2.00 | 5.7 | **112.6 tok/s** | 56.3 |
+| gguf-blocks | 4 (measured) | 89.6 ms | 3.99 | 10.8 | **120.1 tok/s** | 30.1 |
+| NVFP4 | 1 (measured) | — | 1.00 | — | ~85 tok/s | 85 |
+| NVFP4 | 2 (measured) | — | 2.00 | — | **~172 tok/s** | 86 |
+
+The gguf-blocks round costs `~4.6 ms + 23 ms x rows`: each extra row pays for its four MTP verify
+positions again, because the GGUF/dp4a projections on this card re-stream the weights per position
+instead of amortizing them across rows. Committed tokens grow linearly with rows, the round grows
+almost as fast, and aggregate decode saturates near 120 tok/s no matter how many lanes are admitted.
+The NVFP4 route is tensor-core and does amortize, so its second lane nearly doubles throughput.
+
+**The same shape on a 5090** (`docs/performance.md`, concurrent decode-saturation campaign, 27B):
+`groupwise-int` scales 1.00x / 1.33x / 1.67x / 2.88x at C = 1 / 2 / 4 / 8, against 1.00x / 1.97x /
+3.46x / 5.67x for `nvfp4`. Our V100 measurement of NVFP4 (85 -> 172 from one lane to two, 2.02x)
+matches that campaign's 1.97x, so this is the route's property rather than the card's.
+
+**Verdict.** NVFP4, because committing tokens faster is what this deployment's agents wait on, and
+it is what the extra lane buys: the lighter artifact would spend its freed 4 GiB on lanes
+re-streaming the weights and on a pool the single-owner prefill cannot fill any faster. It remains
+the right shape for a workload that is long-context-bound rather than decode-bound -- it prefills
+55-65% faster (measured 950 -> 1630 tok/s on the same prompts) and its 440K pool holds a 240K
+request plus another 205K -- and `serve.sh` documents the switch, including the tier clear it
+requires.
 
 ## Dashboard
 
