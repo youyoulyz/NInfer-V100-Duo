@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# NInfer API service: two concurrent sessions sharing a 190K-token KV pool, backed by the pinned
+# NInfer API service: four concurrent sessions sharing a 400K-token KV pool, backed by the pinned
 # host tier and the local NVMe tier.
 #
-# `--max-context 190000` is the per-sequence ceiling and `--kv-capacity 190000` the shared pool:
-# admission charges `prompt + declared max_tokens` per request, so two 63K-prompt agent sessions can
-# run together, while one 190K request still fits alone. A second lane costs 2 GDN state slots
-# (146.8 MiB) plus its share of the MTP graph allowance (82 MiB) per device, which is why the pool
-# is 190K rather than 200K -- the 200K shape leaves only 86.5 MiB of slack and cannot host lane 2.
+# The artifact is `qwen3.8-27b/gguf-blocks` (GSQ-RCO IQ3_S v3). It is the same Qwen3.8-27B model as
+# the NVFP4 artifact, quantized to 3.4 bits instead of the NVFP4 hybrid, and that is what buys the
+# concurrency: 5.66 GiB of weights per GPU against 10.46 GiB, leaving ~10.2 GiB where the NVFP4
+# profile had 5.0. Measured on this host (docs/performance.md): prefill is 55-65% faster, decode
+# 10-15% slower, and the NVFP4 shape could not host lane 2 at 200K at all.
+#
+# `--max-context 190000` is the per-sequence ceiling and `--kv-capacity 400000` the shared pool:
+# admission charges `prompt + declared max_tokens` per request, so four ~18K-prompt agent sessions
+# (Claude Code declares 32 000) run together, or two requests at the full 190K. Each lane costs 2
+# GDN state slots (146.8 MiB) plus its share of the MTP graph allowance (82 MiB) per device.
+#
+# Switching the artifact invalidates the NVMe tier: its records are keyed by token digest and an
+# execution tag that does not name the weights, so a record written under one quantization would be
+# resumed under the next. Clear it (stop.sh, then `rm -f tier/*`) whenever the artifact changes.
 #
 #   ~/v100/ninfer-api/serve.sh > logs/serve.log 2>&1 &      # start (background)
 #   kill $(pgrep -x ninfer-serve)                            # stop
@@ -34,7 +43,7 @@ set -euo pipefail
 
 repo_dir=/home/luyzh/v100/NInfer-V100-Duo
 executable="${repo_dir}/build-v100-duo/apps/ninfer-serve"
-artifact="${NINFER_API_ARTIFACT:-/home/luyzh/models/qwen3_8_27b_nvfp4.ninfer}"
+artifact="${NINFER_API_ARTIFACT:-/home/luyzh/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer}"
 tier_dir="${NINFER_API_TIER_DIR:-$HOME/v100/ninfer-api/tier}"
 host="${NINFER_API_HOST:-0.0.0.0}"
 port="${NINFER_API_PORT:-8080}"
@@ -55,9 +64,9 @@ mkdir -p "${tier_dir}"
 exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 --host "${host}" --port "${port}" \
     --model-id qwen3.8-27b-nvfp4 \
-    --max-context 190000 --kv-capacity 190000 --kv-dtype int8 --prefill-chunk 1024 \
+    --max-context 190000 --kv-capacity 400000 --kv-dtype int8 --prefill-chunk 1024 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
-    --max-concurrency 2 --max-pending-requests 16 --pending-timeout-ms 3600000 \
+    --max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 3600000 \
     --host-kv-mib 2048 --disk-kv-path "${tier_dir}" --disk-kv-mib "${disk_mib}" \
     --kv-cache-ttl-seconds 14400 --log-stats-interval-ms 60000 \
     "${access_args[@]}" \
