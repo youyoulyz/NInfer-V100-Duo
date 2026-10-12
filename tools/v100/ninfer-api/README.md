@@ -1,8 +1,10 @@
 # NInfer API service and live dashboard (2 × V100-SXM2-16GB)
 
-Qwen3.8-27B NVFP4, TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`), INT8-G64 KV, **one session up to
-200 000 tokens**. Every KV cache -- the retained device lane, the parked host image and the NVMe
-records -- has a **24 h idle timeout** (`--kv-cache-ttl-seconds 86400`), so a conversation nobody
+Qwen3.8-27B NVFP4, TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`), INT8-G64 KV, **190 000-token
+context at `--max-concurrency 2`**. The 190 000-token pool is shared: admission charges each request
+its prompt plus its declared `max_tokens`, so two ~63K agent sessions run together (Claude Code
+declares 32 000) while one 190 000-token request still fits alone. Every KV cache -- the retained device lane, the parked host image and the NVMe
+records -- has a **4 h idle timeout** (`--kv-cache-ttl-seconds 14400`), so a conversation nobody
 comes back to releases its memory and disk. A prefix the session displaces is parked in 2 GiB of pinned host RAM and then on
 NVMe (400 GiB sparse bound), so a long conversation -- and a restarted server -- resumes it without
 recomputing it.
@@ -23,7 +25,7 @@ data) stays there.
 | Reset the tier | `./stop.sh && rm -f tier/*` (the tier is the only copy of a parked prefix, so deleting it only costs a re-prefill) |
 
 Overrides: `NINFER_API_PORT`, `NINFER_API_ARTIFACT`, `NINFER_API_TIER_DIR`, `NINFER_API_DISK_MIB`,
-`NINFER_API_ACCESS_DIR`. `serve.sh` runs one session at a time (`--max-concurrency 1`); extra
+`NINFER_API_ACCESS_DIR`. `serve.sh` admits two sessions at a time (`--max-concurrency 2`); extra
 requests queue.
 
 ## Dashboard

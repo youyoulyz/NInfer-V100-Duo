@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# NInfer API service: one 200K-token session, backed by the pinned host tier and the local NVMe tier.
+# NInfer API service: two concurrent sessions sharing a 190K-token KV pool, backed by the pinned
+# host tier and the local NVMe tier.
+#
+# `--max-context 190000` is the per-sequence ceiling and `--kv-capacity 190000` the shared pool:
+# admission charges `prompt + declared max_tokens` per request, so two 63K-prompt agent sessions can
+# run together, while one 190K request still fits alone. A second lane costs 2 GDN state slots
+# (146.8 MiB) plus its share of the MTP graph allowance (82 MiB) per device, which is why the pool
+# is 190K rather than 200K -- the 200K shape leaves only 86.5 MiB of slack and cannot host lane 2.
 #
 #   ~/v100/ninfer-api/serve.sh > logs/serve.log 2>&1 &      # start (background)
 #   kill $(pgrep -x ninfer-serve)                            # stop
 #
 # Every KV cache -- the retained device lane, the parked host image and the NVMe records -- is
-# released after 24 h without use (`--kv-cache-ttl-seconds 86400`), so a conversation nobody comes
+# released after 4 h without use (`--kv-cache-ttl-seconds 14400`), so a conversation nobody comes
 # back to stops holding memory or disk.
 #
 # Overrides: NINFER_API_HOST (default 0.0.0.0), NINFER_API_PORT, NINFER_API_ARTIFACT,
@@ -48,10 +55,10 @@ mkdir -p "${tier_dir}"
 exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 --host "${host}" --port "${port}" \
     --model-id qwen3.8-27b-nvfp4 \
-    --max-context 200000 --kv-capacity 200000 --kv-dtype int8 --prefill-chunk 1024 \
+    --max-context 190000 --kv-capacity 190000 --kv-dtype int8 --prefill-chunk 1024 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
-    --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 3600000 \
+    --max-concurrency 2 --max-pending-requests 16 --pending-timeout-ms 3600000 \
     --host-kv-mib 2048 --disk-kv-path "${tier_dir}" --disk-kv-mib "${disk_mib}" \
-    --kv-cache-ttl-seconds 86400 --log-stats-interval-ms 60000 \
+    --kv-cache-ttl-seconds 14400 --log-stats-interval-ms 60000 \
     "${access_args[@]}" \
     ${NINFER_API_KEY:+--api-key "${NINFER_API_KEY}"}
