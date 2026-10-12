@@ -267,6 +267,64 @@ void idle_timeout(const std::filesystem::path& root) {
     check(store.sweep_expired(0, now + 100000) == 0, "a zero timeout disables the sweep");
 }
 
+// The idle timeout spans processes: the stamp lives in the slot header, so a reopen hands back the
+// window a record already used. Before that stamp was persisted, every reopen re-stamped the whole
+// store as freshly used, which made the timeout unreachable on a deployment that restarts -- the
+// tier's `disk_record` expiry count stayed 0 while its used bytes grew without bound.
+void idle_timeout_survives_reopen(const std::filesystem::path& root) {
+    const std::string path = (root / "ttl-reopen").string();
+    const DiskKVStore::Options options{.path       = path,
+                                       .slot_size  = kSlot,
+                                       .max_slots  = kSlotCount,
+                                       .verify_crc = true};
+    const auto bytes              = page(kSlot, 11);
+    const std::uint64_t now       = DiskKVStore::wall_clock_seconds();
+    const std::uint32_t stale     = static_cast<std::uint32_t>(now - 7200);
+    const std::uint32_t unstamped = 0;
+    {
+        DiskKVStore store(options);
+        check(store.upsert_page(id(4, 256), bytes) && store.upsert_page(id(5, 512), bytes),
+              "two pages stored before the restart");
+        store.flush_index();
+    }
+
+    // Two hours pass with nobody reading either record: the first carries that last use on disk,
+    // the second carries none because the build that wrote it did not record one. A 32-bit second
+    // count sits at offset 4 of the 48-byte slot header.
+    constexpr std::uint32_t kHeaderMagic = 0x4E44564B; // mirrors DiskKVStore::Header::kMagic
+    std::FILE* file = std::fopen(path.c_str(), "r+b");
+    check(file != nullptr, "the tier file opens for the timeout case");
+    int patched = 0;
+    if (file != nullptr) {
+        for (std::uint32_t slot = 0; slot < kSlotCount; ++slot) {
+            const off_t header = static_cast<off_t>(slot) * static_cast<off_t>(kSlotPitch);
+            std::uint32_t magic = 0;
+            if (std::fseek(file, header, SEEK_SET) != 0 ||
+                std::fread(&magic, sizeof(magic), 1, file) != 1) {
+                break;
+            }
+            if (magic != kHeaderMagic) { continue; }
+            const std::uint32_t stamp = patched == 0 ? stale : unstamped;
+            if (std::fseek(file, header + 4, SEEK_SET) == 0 &&
+                std::fwrite(&stamp, sizeof(stamp), 1, file) == 1) {
+                ++patched;
+            }
+        }
+        std::fclose(file);
+    }
+    check(patched == 2, "both slot headers were stamped by hand");
+
+    {
+        DiskKVStore store(options);
+        check(store.live_slots() == 2, "both records survive the reopen");
+        // Nothing was read since, so both are past the window -- the reboot did not restart it.
+        check(store.sweep_expired(3600, now) == 2 && store.live_slots() == 0,
+              "a reopen does not hand a record a window it already used");
+        check(store.used_bytes() == 0, "the swept records give their bytes back");
+    }
+}
+
+
 } // namespace
 
 int main() {
@@ -279,6 +337,7 @@ int main() {
         concurrent_reads_survive_eviction(root);
         claimed_reads(root);
         idle_timeout(root);
+        idle_timeout_survives_reopen(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "disk KV store test: " << error.what() << '\n';

@@ -124,6 +124,11 @@ public:
     // TTL never deletes a prefix that was parked before the upgrade.
     std::uint32_t sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now);
     [[nodiscard]] static std::uint64_t wall_clock_seconds() noexcept;
+    // The idle timeout lives in a 32-bit second count in the slot header, so every writer of the
+    // wall clock narrows it the same way.
+    [[nodiscard]] static std::uint32_t wall_seconds() noexcept {
+        return static_cast<std::uint32_t>(wall_clock_seconds());
+    }
 
     // Publishes pending index changes (atomic replacement, not a durability barrier).
     void flush_index();
@@ -135,7 +140,11 @@ public:
 private:
     struct Header {
         std::uint32_t magic                   = 0;
-        std::uint32_t reserved                = 0;
+        // Unix seconds of this slot's last use. The idle timeout is measured between two processes'
+        // want of it, so it has to be on disk and not only in `wall_stamps_`; 0 marks a record
+        // written before this field existed, which the sweep reads as "unknown, so stale". A 32-bit
+        // second count is good through 2106.
+        std::uint32_t last_used_wall_seconds  = 0;
         std::uint64_t last_used               = 0;
         std::uint64_t lo                      = 0;
         std::uint64_t hi                      = 0;
@@ -187,8 +196,9 @@ private:
     // into "not stored". False on any I/O error or short transfer.
     [[nodiscard]] bool write_payload(std::uint32_t slot, std::span<const std::byte> bytes) noexcept;
     [[nodiscard]] bool read_payload(std::uint32_t slot, std::span<std::byte> destination) noexcept;
-    // Moves a live slot to `stamp` in the LRU order, or erases it. Caller holds mutex_.
-    void lru_touch_locked(std::uint32_t slot, std::uint64_t stamp);
+    // Moves a live slot to `stamp` in the LRU order. `wall_seconds` becomes the slot's last use,
+    // both in the persisted header and in `wall_stamps_`. Caller holds mutex_.
+    void lru_touch_locked(std::uint32_t slot, std::uint64_t stamp, std::uint32_t wall_seconds);
     void lru_erase_locked(std::uint32_t slot) noexcept;
 
     mutable std::mutex mutex_;
@@ -204,8 +214,9 @@ private:
     std::intptr_t mapping_handle_ = -1;
 #endif
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
-    // Unix seconds of the last use of each slot, 0 when the slot is free. Runtime-only: a restart
-    // renews every loaded record, which is what makes the TTL safe to enable on an existing store.
+    // Unix seconds of the last use of each slot, 0 when the slot is free or carries no stamp. The
+    // value the idle timeout reads is the persisted `Header::last_used_wall_seconds`, mirrored here
+    // so the sweep does not fault a page of every slot it visits.
     std::vector<std::uint64_t> wall_stamps_;
     std::vector<std::uint32_t> free_slots_;
     std::vector<std::uint32_t> readers_;

@@ -129,7 +129,6 @@ DiskKVStore::DiskKVStore(Options options) : options_(std::move(options)) {
     readers_.assign(max_slots_, 0);
     lru_stamps_.assign(max_slots_, kNoStamp);
     wall_stamps_.assign(max_slots_, 0);
-    const std::uint64_t opened_at = wall_clock_seconds();
     if (!load_index()) { rebuild_from_scan(); }
 }
 
@@ -276,12 +275,15 @@ bool DiskKVStore::read_payload(std::uint32_t slot, std::span<std::byte> destinat
 
 #endif
 
-void DiskKVStore::lru_touch_locked(std::uint32_t slot, std::uint64_t stamp) {
+void DiskKVStore::lru_touch_locked(std::uint32_t slot, std::uint64_t stamp,
+                                   std::uint32_t wall_seconds) {
     lru_erase_locked(slot);
     lru_.emplace(stamp, slot);
-    lru_stamps_[slot] = stamp;
-    // One place to keep the wall clock: every insert, read, claim and touch comes through here.
-    wall_stamps_[slot] = wall_clock_seconds();
+    lru_stamps_[slot]                   = stamp;
+    // One place to keep the wall clock: every insert, read, claim and touch comes through here, and
+    // the header copy is what lets the next process measure the same window.
+    wall_stamps_[slot]                  = wall_seconds;
+    header(slot).last_used_wall_seconds = wall_seconds;
 }
 
 void DiskKVStore::lru_erase_locked(std::uint32_t slot) noexcept {
@@ -314,7 +316,6 @@ bool DiskKVStore::load_index() {
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
     wall_stamps_.assign(max_slots_, 0);
-    const std::uint64_t opened_at = wall_clock_seconds();
     std::vector<bool> live(max_slots_, false);
     for (const IndexRow& row : rows) {
         if (row.slot >= max_slots_ || live[row.slot]) { continue; }
@@ -326,11 +327,11 @@ bool DiskKVStore::load_index() {
             index_dirty_ = true;
             continue;
         }
-        index_[id]     = row.slot;
-        wall_stamps_[row.slot] = opened_at;
+        index_[id] = row.slot;
         live[row.slot] = true;
         clock_         = std::max(clock_, slot_header.last_used);
-        lru_touch_locked(row.slot, slot_header.last_used);
+        // The record keeps the window it had: its last use is the stamp on disk, not this start.
+        lru_touch_locked(row.slot, slot_header.last_used, slot_header.last_used_wall_seconds);
     }
     free_slots_.clear();
     for (std::uint32_t slot = max_slots_; slot-- > 0;) {
@@ -345,7 +346,6 @@ void DiskKVStore::rebuild_from_scan() {
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
     wall_stamps_.assign(max_slots_, 0);
-    const std::uint64_t opened_at = wall_clock_seconds();
     clock_ = 0;
     std::vector<bool> live(max_slots_, false);
     std::vector<std::byte> payload(options_.slot_size);
@@ -354,10 +354,9 @@ void DiskKVStore::rebuild_from_scan() {
         if (slot_header.magic != Header::kMagic) { continue; }
         if (!read_payload(slot, payload) || crc32(payload) != slot_header.crc) { continue; }
         index_[{slot_header.lo, slot_header.hi, slot_header.tag, slot_header.frontier}] = slot;
-        wall_stamps_[slot] = opened_at;
-        live[slot]                                                                      = true;
-        clock_ = std::max(clock_, slot_header.last_used);
-        lru_touch_locked(slot, slot_header.last_used);
+        live[slot] = true;
+        clock_     = std::max(clock_, slot_header.last_used);
+        lru_touch_locked(slot, slot_header.last_used, slot_header.last_used_wall_seconds);
     }
     for (std::uint32_t slot = max_slots_; slot-- > 0;) {
         if (!live[slot]) { free_slots_.push_back(slot); }
@@ -440,7 +439,7 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         std::lock_guard lock(mutex_);
         if (const auto found = index_.find(id); found != index_.end()) {
             header(found->second).last_used = ++clock_;
-            lru_touch_locked(found->second, clock_);
+            lru_touch_locked(found->second, clock_, wall_seconds());
             index_dirty_ = true;
             return true;
         }
@@ -479,7 +478,7 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
                           .frontier  = id.frontier,
                           .crc       = crc};
     index_[id] = slot;
-    lru_touch_locked(slot, stamp);
+    lru_touch_locked(slot, stamp, wall_seconds());
     index_dirty_ = true;
     if (!options_.defer_index_updates) { persist_index_locked(); }
     return true;
@@ -503,7 +502,7 @@ bool DiskKVStore::read_page(const DiskKVIdentity& id, std::span<std::byte> desti
     --readers_[slot];
     if (intact) {
         header(slot).last_used = ++clock_;
-        lru_touch_locked(slot, clock_);
+        lru_touch_locked(slot, clock_, wall_seconds());
         index_dirty_ = true;
     }
     return intact;
@@ -529,7 +528,7 @@ void DiskKVStore::release_read(const ReadClaim& claim, bool intact) {
     --readers_[claim.slot];
     if (intact) {
         header(claim.slot).last_used = ++clock_;
-        lru_touch_locked(claim.slot, clock_);
+        lru_touch_locked(claim.slot, clock_, wall_seconds());
         index_dirty_ = true;
     }
 }
@@ -544,7 +543,7 @@ bool DiskKVStore::touch(const DiskKVIdentity& id) {
     const auto found = index_.find(id);
     if (found == index_.end()) { return false; }
     header(found->second).last_used = ++clock_;
-    lru_touch_locked(found->second, clock_);
+    lru_touch_locked(found->second, clock_, wall_seconds());
     index_dirty_ = true;
     return true;
 }
@@ -561,8 +560,11 @@ std::uint32_t DiskKVStore::sweep_expired(std::uint64_t ttl_seconds, std::uint64_
     std::lock_guard lock(mutex_);
     std::vector<DiskKVIdentity> victims;
     for (const auto& [id, slot] : index_) {
+        // Every live slot carries a stamp: the ones written before the stamp was persisted read 0
+        // here, and "unknown last use" has to mean long idle, or an existing tier would outlive
+        // every timeout it is configured with.
         const std::uint64_t used = wall_stamps_[slot];
-        if (used == 0 || now < used || now - used <= ttl_seconds) { continue; }
+        if (now < used || now - used <= ttl_seconds) { continue; }
         // A slot another thread is reading stays: its claim refreshes the stamp when it lands.
         if (readers_[slot] != 0) { continue; }
         victims.push_back(id);
