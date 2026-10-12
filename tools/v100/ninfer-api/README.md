@@ -7,7 +7,9 @@ declares 32 000) while one 190 000-token request still fits alone. Every KV cach
 records -- has a **4 h idle timeout** (`--kv-cache-ttl-seconds 14400`), so a conversation nobody
 comes back to releases its memory and disk. A prefix the session displaces is parked in 2 GiB of pinned host RAM and then on
 NVMe (400 GiB sparse bound), so a long conversation -- and a restarted server -- resumes it without
-recomputing it.
+recomputing it. The tier file is sparse but keeps the blocks of everything it has held: an hourly
+reclaim pass hands the blocks of released records back to the filesystem (no restart needed), and
+`ninfer_disk_tier_reclaimed_bytes_total` reports the total it has returned.
 
 Everything here is run from the deployment directory `~/v100/ninfer-api`, whose scripts and monitoring
 config are symlinks to this directory; its runtime state (`tier/`, `logs/`, the Prometheus and Grafana

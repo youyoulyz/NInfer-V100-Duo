@@ -968,6 +968,10 @@ struct KvRuntimeStats {
     std::size_t disk_tier_capacity_bytes       = 0;
     std::size_t disk_tier_used_bytes           = 0;
     std::uint64_t disk_tier_restores           = 0;
+    // Bytes the tier's reclaim pass has handed back to the filesystem. Records are dropped lazily:
+    // without this the file keeps the blocks of everything it has ever held, so a live set that
+    // shrank never shows up as free space.
+    std::uint64_t disk_tier_reclaimed_bytes    = 0;
     // Idle-cache expiry: records the 24h-style timeout has released, by kind.
     std::uint64_t expired_retained_lanes       = 0;
     std::uint64_t expired_parked_images        = 0;

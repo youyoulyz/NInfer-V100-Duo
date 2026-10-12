@@ -19,7 +19,11 @@
 #else
 #    include <fcntl.h>
 #    include <sys/mman.h>
+#    include <sys/stat.h>
 #    include <unistd.h>
+#    ifdef __linux__
+#        include <linux/falloc.h>
+#    endif
 #endif
 
 namespace ninfer {
@@ -100,6 +104,12 @@ DiskKVStore::Header& DiskKVStore::header(std::uint32_t slot) const noexcept {
     return *reinterpret_cast<Header*>(base_ + static_cast<std::size_t>(slot) * slot_pitch());
 }
 
+void DiskKVStore::release_slot_locked(std::uint32_t slot) {
+    free_slots_.push_back(slot);
+    // The blocks stay allocated until a reclaim pass punches them; the slot is reusable before that.
+    pending_reclaim_.push_back(slot);
+}
+
 bool DiskKVStore::matches(const Header& header, const DiskKVIdentity& id) noexcept {
     return header.magic == Header::kMagic && header.lo == id.lo && header.hi == id.hi &&
            header.tag == id.tag && header.frontier == id.frontier;
@@ -130,6 +140,9 @@ DiskKVStore::DiskKVStore(Options options) : options_(std::move(options)) {
     lru_stamps_.assign(max_slots_, kNoStamp);
     wall_stamps_.assign(max_slots_, 0);
     if (!load_index()) { rebuild_from_scan(); }
+    // Everything free at open is a candidate: the previous process may have released far more than
+    // the live set needs, and those blocks are only returned by a punch.
+    pending_reclaim_ = free_slots_;
 }
 
 DiskKVStore::~DiskKVStore() { unmap_file(); }
@@ -413,7 +426,7 @@ std::optional<DiskKVIdentity> DiskKVStore::evict_one_lru_locked() {
         lru_erase_locked(slot);
         index_.erase(id);
         clear_slot(slot);
-        free_slots_.push_back(slot);
+        release_slot_locked(slot);
         index_dirty_ = true;
         return id;
     }
@@ -463,11 +476,11 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
 
     std::lock_guard lock(mutex_);
     if (!written) {
-        free_slots_.push_back(slot);
+        release_slot_locked(slot);
         return false;
     }
     if (index_.contains(id)) {
-        free_slots_.push_back(slot);
+        release_slot_locked(slot);
         return true;
     }
     header(slot) = Header{.magic     = Header::kMagic,
@@ -576,11 +589,46 @@ std::uint32_t DiskKVStore::sweep_expired(std::uint64_t ttl_seconds, std::uint64_
         index_.erase(found);
         lru_erase_locked(slot);
         clear_slot(slot);
-        free_slots_.push_back(slot);
+        release_slot_locked(slot);
         index_dirty_ = true;
     }
     if (!victims.empty()) { persist_index_locked(); }
     return static_cast<std::uint32_t>(victims.size());
+}
+
+bool DiskKVStore::punch_slot(std::uint32_t slot) noexcept {
+#ifdef __linux__
+    const off_t offset = static_cast<off_t>(static_cast<std::size_t>(slot) * slot_pitch());
+    return ::fallocate(static_cast<int>(file_handle_),
+                       FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset,
+                       static_cast<off_t>(slot_pitch())) == 0;
+#else
+    (void)slot;
+    return false;
+#endif
+}
+
+std::uintmax_t DiskKVStore::allocated_bytes() const noexcept {
+    struct stat info {};
+    if (file_handle_ < 0 || ::fstat(static_cast<int>(file_handle_), &info) != 0) { return 0; }
+    // POSIX reports allocated blocks in 512-byte units, which is what distinguishes a sparse hole
+    // from a slot that still owns its blocks.
+    return static_cast<std::uintmax_t>(info.st_blocks) * 512ULL;
+}
+
+std::size_t DiskKVStore::reclaim_free_space() {
+    std::lock_guard lock(mutex_);
+    const std::uintmax_t before = allocated_bytes();
+    for (const std::uint32_t slot : pending_reclaim_) {
+        // Handed out again since it was released: its payload is live, so it keeps its blocks.
+        if (lru_stamps_[slot] != kNoStamp || readers_[slot] != 0) { continue; }
+        (void)punch_slot(slot);
+    }
+    pending_reclaim_.clear();
+    // What the file actually gave up, not what was asked for: a slot that was never written is
+    // already a hole, and reporting its pitch as reclaimed would invent space that never existed.
+    const std::uintmax_t after = allocated_bytes();
+    return before > after ? static_cast<std::size_t>(before - after) : 0;
 }
 
 bool DiskKVStore::evict(const DiskKVIdentity& id) {
@@ -591,7 +639,7 @@ bool DiskKVStore::evict(const DiskKVIdentity& id) {
     index_.erase(found);
     lru_erase_locked(slot);
     clear_slot(slot);
-    free_slots_.push_back(slot);
+    release_slot_locked(slot);
     index_dirty_ = true;
     persist_index_locked();
     return true;

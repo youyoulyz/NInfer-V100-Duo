@@ -345,6 +345,15 @@ std::uint32_t DiskKVBridge::sweep_expired(std::uint64_t ttl_seconds, std::uint64
     return dropped;
 }
 
+std::size_t DiskKVBridge::reclaim_free_space() {
+    std::size_t reclaimed = 0;
+    for (Family& entry : families_) {
+        if (entry.store == nullptr) { continue; }
+        reclaimed += entry.store->reclaim_free_space();
+    }
+    return reclaimed;
+}
+
 std::size_t DiskKVBridge::used_bytes() const {
     std::size_t total = 0;
     for (const Family& target : families_) {

@@ -1333,9 +1333,12 @@ private:
                 std::scoped_lock execution_lock(execution_mutex_);
                 if (maintenance_requested_.exchange(false, std::memory_order_acq_rel)) {
                     try {
-                        // Republish when the sweep released something, so the counters are visible
-                        // without waiting for the next request to publish them.
-                        if (instance_.program->expire_kv_cache() != 0) { publish_runtime_stats(); }
+                        // Republish when either pass released something, so the counters are visible
+                        // without waiting for the next request to publish them. The reclaim pass
+                        // gates itself to one pass an hour.
+                        const bool expired = instance_.program->expire_kv_cache() != 0;
+                        const bool reclaimed = instance_.program->reclaim_disk_space();
+                        if (expired || reclaimed) { publish_runtime_stats(); }
                     } catch (...) {
                     }
                 }

@@ -376,6 +376,11 @@ public:
     // device lanes (spilled first, so the cold copy survives), parked host images, and NVMe tier
     // records. Called on a wall-clock schedule by the serving layer, with the execution lock held.
     std::uint32_t expire_kv_cache() noexcept;
+    // Hands the NVMe tier's released records back to the filesystem, at most once an hour. Records
+    // are dropped lazily and their slots are reusable immediately, so without this the tier keeps
+    // the blocks of everything it has ever held. Called on the same wall-clock schedule as
+    // `expire_kv_cache`, with the execution lock held; true when it released anything.
+    bool reclaim_disk_space() noexcept;
     // Drops the least recently used lane-free payloads, giving their page groups and image slots
     // back. Capacity pressure prefers this to eating a retained conversation: a payload is an
     // opportunistic copy of a prefix, while a retained lane is a conversation the process holds.
@@ -423,6 +428,9 @@ public:
     [[nodiscard]] std::size_t disk_tier_used_bytes() const noexcept;
     // Resumes that landed from the NVMe tier, cumulative since the Program opened it.
     [[nodiscard]] std::uint64_t disk_tier_restores() const noexcept { return disk_restores_; }
+    [[nodiscard]] std::uint64_t disk_tier_reclaimed_bytes() const noexcept {
+        return disk_reclaimed_bytes_;
+    }
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -783,6 +791,10 @@ private:
     std::uint64_t expired_retained_lanes_ = 0;
     std::uint64_t expired_parked_images_  = 0;
     std::uint64_t expired_disk_records_   = 0;
+    // Bytes the reclaim pass has handed back, and when it last ran. Unix seconds, 0 before the
+    // first pass of this process.
+    std::uint64_t disk_reclaimed_bytes_    = 0;
+    std::uint64_t disk_reclaim_wall_seconds_ = 0;
     std::uint64_t kv_cache_maintenance_runs_ = 0;
     // Monotonic stamp ordering owner promises and retained-lane eviction.
     std::uint64_t shared_epoch_ = 0;

@@ -14,6 +14,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace {
 
 using ninfer::DiskKVIdentity;
@@ -58,6 +61,14 @@ std::filesystem::path fresh_directory() {
 constexpr std::size_t kSlot        = 64 * 1024;
 constexpr std::size_t kSlotPitch   = (DiskKVStore::kSlotHeaderSize + kSlot + 4095) / 4096 * 4096;
 constexpr std::uint32_t kSlotCount = 16;
+
+// Allocated bytes of a file, holes excluded: what `du` reports, from the same filesystem accounting
+// the reclaim pass reports its result against.
+std::uintmax_t allocated_blocks(const std::string& path) {
+    struct stat info {};
+    if (::stat(path.c_str(), &info) != 0) { return 0; }
+    return static_cast<std::uintmax_t>(info.st_blocks) * 512ULL;
+}
 
 void lru_and_persistence(const std::filesystem::path& root) {
     const DiskKVStore::Options options{.path       = (root / "main").string(),
@@ -325,6 +336,45 @@ void idle_timeout_survives_reopen(const std::filesystem::path& root) {
 }
 
 
+// Releasing a record returns its slot to the free list at once, but the blocks stay allocated until
+// a reclaim pass punches them out. Without that pass the file keeps the high-water mark of
+// everything the store has ever held, which is why a deployment saw a 197 GiB tier whose live set
+// was empty.
+void free_space_is_reclaimed(const std::filesystem::path& root) {
+    const std::string path = (root / "reclaim").string();
+    const DiskKVStore::Options options{.path       = path,
+                                       .slot_size  = kSlot,
+                                       .max_slots  = kSlotCount,
+                                       .verify_crc = true};
+    const auto bytes = page(kSlot, 13);
+    std::uintmax_t written = 0;
+    {
+        DiskKVStore store(options);
+        for (std::uint32_t i = 0; i < kSlotCount; ++i) {
+            check(store.upsert_page(id(10 + i, 64 * (i + 1)), bytes), "a page stored for reclaim");
+        }
+        written = allocated_blocks(path);
+        check(written >= kSlotCount * kSlot, "the file holds every slot it wrote");
+        check(store.sweep_expired(1, DiskKVStore::wall_clock_seconds() + 10) == kSlotCount,
+              "every record expires");
+        check(store.used_bytes() == 0, "the records leave the index");
+        check(allocated_blocks(path) == written, "a released slot keeps its blocks on its own");
+        check(store.reclaim_free_space() >= kSlotCount * kSlot,
+              "the pass reports the blocks it handed back");
+        check(allocated_blocks(path) < written, "the blocks go back to the filesystem");
+    }
+    // A slot handed out again before the pass holds a live payload and keeps its blocks.
+    {
+        DiskKVStore store(options);
+        check(store.upsert_page(id(99, 4096), bytes), "a page stored after the first pass");
+        check(store.evict(id(99, 4096)), "the page is evicted");
+        check(store.upsert_page(id(98, 4096), bytes), "the released slot takes a new page");
+        check(store.reclaim_free_space() == 0, "a slot holding a live payload is not punched");
+        check(reads_back(store, id(98, 4096), bytes), "the live payload survives the pass");
+    }
+}
+
+
 } // namespace
 
 int main() {
@@ -338,6 +388,7 @@ int main() {
         claimed_reads(root);
         idle_timeout(root);
         idle_timeout_survives_reopen(root);
+        free_space_is_reclaimed(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "disk KV store test: " << error.what() << '\n';

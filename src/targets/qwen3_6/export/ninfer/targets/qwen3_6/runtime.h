@@ -173,6 +173,8 @@ public:
     [[nodiscard]] KvRuntimeStats kv_runtime_stats() const noexcept;
     // Releases every KV cache entry idle for the configured timeout; returns how many went.
     std::uint32_t expire_kv_cache() noexcept;
+    // Hands the NVMe tier's released records back to the filesystem, at most once an hour.
+    bool reclaim_disk_space() noexcept;
     // Gives up `count` lane-free shared payloads, least recently used first, returning how many went.
     // Capacity pressure prefers this to evicting a retained conversation; the prefix stops being
     // claimable without a lane and falls back to the colder path it always had.

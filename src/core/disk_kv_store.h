@@ -119,10 +119,18 @@ public:
     [[nodiscard]] std::vector<DiskKVIdentity> live_identities() const;
 
     // Drops every record whose last use is older than `ttl_seconds` before `now` (unix seconds),
-    // returning how many went. Stamps live in the index in memory and are renewed by every read,
-    // insert and touch; a record loaded from an older index starts its clock at open, so enabling a
-    // TTL never deletes a prefix that was parked before the upgrade.
+    // returning how many went. The stamp is renewed by every read, insert and touch and is persisted
+    // in the slot header, so a record's window follows it across a restart; a record written before
+    // that stamp existed carries none and reads as long idle.
     std::uint32_t sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now);
+
+    // Hands the released slots' blocks back to the filesystem with a hole punch, and reports the
+    // bytes it released. A slot is reusable the moment it is released, but its blocks stay
+    // allocated until this runs: without it the store keeps a high-water mark, so a live set that
+    // shrank never gives the space back. Every free slot is a candidate -- including the ones a
+    // previous process freed, which is what lets an existing store drain instead of being
+    // recreated. Callers run it out of band; it holds the lock for the whole pass.
+    [[nodiscard]] std::size_t reclaim_free_space();
     [[nodiscard]] static std::uint64_t wall_clock_seconds() noexcept;
     // The idle timeout lives in a 32-bit second count in the slot header, so every writer of the
     // wall clock narrows it the same way.
@@ -182,6 +190,14 @@ private:
     [[nodiscard]] Header& header(std::uint32_t slot) const noexcept;
     [[nodiscard]] static bool matches(const Header& header, const DiskKVIdentity& id) noexcept;
 
+    // Blocks the file currently holds, from the filesystem's own accounting.
+    [[nodiscard]] std::uintmax_t allocated_bytes() const noexcept;
+    // Returns a slot to the free list and queues it for the next reclaim pass. Caller holds mutex_.
+    void release_slot_locked(std::uint32_t slot);
+    // Punches one slot's header and payload out of the file. False when the platform cannot, which
+    // leaves the slot allocated and the pass a no-op rather than an error.
+    [[nodiscard]] bool punch_slot(std::uint32_t slot) noexcept;
+
     void map_file(bool create);
     void unmap_file() noexcept;
     bool load_index();
@@ -219,6 +235,10 @@ private:
     // so the sweep does not fault a page of every slot it visits.
     std::vector<std::uint64_t> wall_stamps_;
     std::vector<std::uint32_t> free_slots_;
+    // Slots to hand back on the next reclaim pass: everything free at open, then every slot
+    // released since. A slot handed out again is skipped there, so a stale entry costs a syscall,
+    // never a live record.
+    std::vector<std::uint32_t> pending_reclaim_;
     std::vector<std::uint32_t> readers_;
     // Live slots by (LRU stamp, slot), so eviction takes the coldest slot without reading every
     // header under the lock; rebuilt from the slot headers on open. lru_stamps_ holds each slot's

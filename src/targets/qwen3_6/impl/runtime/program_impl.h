@@ -224,6 +224,11 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     }
 }
 
+// How long the tier waits between passes that hand released blocks back to the filesystem. Records
+// themselves are dropped as soon as the idle timeout says so; this is only the out-of-band punch,
+// which is worth batching because a working set needs time to settle.
+constexpr std::uint64_t kDiskReclaimIntervalSeconds = 3600;
+
 } // namespace
 
 PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
@@ -1088,6 +1093,25 @@ std::uint32_t ProgramImplCore::expire_kv_cache() noexcept {
     return expired;
 }
 
+// The tier's blocks come back lazily and out of band. Releasing a record makes its slot reusable at
+// once, but the filesystem keeps the blocks until something punches them out, and that has to run
+// when the extent map is quiet -- so it waits an hour rather than chasing every release. The first
+// pass after a start also covers what the previous process left free, which is what lets a tier with
+// a large high-water mark drain without being recreated.
+bool ProgramImplCore::reclaim_disk_space() noexcept {
+    if (disk_tier_ == nullptr) { return false; }
+    const std::uint64_t now = DiskKVStore::wall_clock_seconds();
+    if (disk_reclaim_wall_seconds_ != 0 &&
+        now < disk_reclaim_wall_seconds_ + kDiskReclaimIntervalSeconds) {
+        return false;
+    }
+    disk_reclaim_wall_seconds_ = now;
+    const std::size_t reclaimed = disk_tier_->reclaim_free_space();
+    if (reclaimed == 0) { return false; }
+    disk_reclaimed_bytes_ += reclaimed;
+    return true;
+}
+
 // Gives up lane-free payloads until both pools can hand out what a lane is about to own. A payload
 // holds real page groups out of the pool, so an admission that needs room has to take them back:
 // they are opportunistic copies of prefixes whose lane is already gone, and the newest capture is
@@ -1381,6 +1405,7 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
     out.disk_tier_capacity_bytes = disk_tier_capacity_bytes();
     out.disk_tier_used_bytes     = disk_tier_used_bytes();
     out.disk_tier_restores       = disk_tier_restores();
+    out.disk_tier_reclaimed_bytes = disk_tier_reclaimed_bytes();
     out.expired_retained_lanes   = expired_retained_lanes_;
     out.expired_parked_images    = expired_parked_images_;
     out.expired_disk_records     = expired_disk_records_;

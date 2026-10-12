@@ -848,6 +848,9 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << "ninfer_disk_tier_bytes{state=\"used\"} " << kv.disk_tier_used_bytes << '\n';
     metric(out, "ninfer_disk_tier_restores_total", "Prefixes resumed from the NVMe tier.", "counter",
            kv.disk_tier_restores);
+    metric(out, "ninfer_disk_tier_reclaimed_bytes_total",
+           "Tier bytes the hourly reclaim pass handed back to the filesystem.", "counter",
+           kv.disk_tier_reclaimed_bytes);
 
     metric(out, "ninfer_kv_cache_ttl_seconds", "Configured idle timeout for every KV cache.", "gauge",
            kv.kv_cache_ttl_seconds);

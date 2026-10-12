@@ -132,6 +132,11 @@ public:
     // readers hold claims, because the stores skip a slot being read.
     std::uint32_t sweep_expired(std::uint64_t ttl_seconds, std::uint64_t now);
 
+    // Hands every released slot's blocks back to the filesystem across all families, returning the
+    // bytes released. Records are dropped lazily -- the space they occupied is reusable at once --
+    // so this is what turns a shrunken live set into file space an operator can see.
+    std::size_t reclaim_free_space();
+
 private:
     struct Family {
         std::unique_ptr<DiskKVStore> store;

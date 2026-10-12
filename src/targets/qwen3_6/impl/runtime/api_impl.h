@@ -179,6 +179,11 @@ std::uint32_t Program<Variant>::expire_kv_cache() noexcept {
 }
 
 template <>
+bool Program<Variant>::reclaim_disk_space() noexcept {
+    return impl_->reclaim_disk_space();
+}
+
+template <>
 std::uint32_t Program<Variant>::drop_shared_payloads(std::uint32_t count) noexcept {
     return impl_->drop_shared_payloads(count);
 }

@@ -110,7 +110,16 @@ the timeout has released.
 leaves the paged KV pool when another conversation takes its lane, and it is stored on the way out;
 a later request that reaches the same tokens resumes the stored frontier instead of prefilling
 again. With `--disk-kv-path` the record is on NVMe and content-addressed, so it also survives a
-server restart, and the store never evicts: a record disappears only when its session is rewritten.
+server restart, and the store never evicts: a record disappears only when its session is rewritten
+or the idle timeout releases it.
+
+A released record's slot is reusable immediately, but the blocks it occupied stay allocated in the
+tier file until the hourly reclaim pass punches them out -- so a live set that shrank does not hand
+the space back on its own, and in particular a tier whose records all expired still shows its
+high-water mark in `df` until that pass runs. The pass is part of the same wall-clock maintenance
+that runs the idle timeout, needs no restart, covers records a previous process released, and
+reports what it gave back as `ninfer_disk_tier_reclaimed_bytes_total`; `ninfer_disk_tier_bytes{state="used"}`
+is the logical record total, which drops as soon as the timeout releases a record.
 
 The serial long-context profile -- one request at a time, every conversation up to the full
 `--max-context` -- is what a coding agent drives:

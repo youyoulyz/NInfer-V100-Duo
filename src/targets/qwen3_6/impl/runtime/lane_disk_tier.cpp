@@ -217,6 +217,8 @@ std::uint32_t LaneDiskTier::expire(std::uint64_t ttl_seconds, std::uint64_t now)
     return bridge_->sweep_expired(ttl_seconds, now);
 }
 
+std::size_t LaneDiskTier::reclaim_free_space() { return bridge_->reclaim_free_space(); }
+
 
 
 DiskKVBridgeStats LaneDiskTier::stats() const { return bridge_->stats(); }
