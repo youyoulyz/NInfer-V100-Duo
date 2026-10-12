@@ -816,12 +816,20 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << "ninfer_kv_page_groups{pool=\"main\",state=\"free\"} "
         << kv.main_free_page_groups << '\n'
         << "ninfer_kv_page_groups{pool=\"main\",state=\"shared_held\"} " << held_pages << '\n'
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"mapped\"} "
+        << kv.main_mapped_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"main\",state=\"parked\"} "
+        << kv.main_parked_page_groups << '\n'
         << "ninfer_kv_page_groups{pool=\"backend\",state=\"capacity\"} "
         << kv.backend_capacity_page_groups << '\n'
         << "ninfer_kv_page_groups{pool=\"backend\",state=\"entitled\"} "
         << kv.backend_entitled_page_groups << '\n'
         << "ninfer_kv_page_groups{pool=\"backend\",state=\"free\"} "
-        << kv.backend_free_page_groups << '\n';
+        << kv.backend_free_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"backend\",state=\"mapped\"} "
+        << kv.backend_mapped_page_groups << '\n'
+        << "ninfer_kv_page_groups{pool=\"backend\",state=\"parked\"} "
+        << kv.backend_parked_page_groups << '\n';
 
     metric(out, "ninfer_kv_pool_payload_bytes", "Persistent KV payload this device holds, whole pool.",
            "gauge", kv.kv_payload_bytes);

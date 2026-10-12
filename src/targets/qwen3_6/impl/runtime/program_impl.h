@@ -622,10 +622,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return false;
     }
     const SequenceState& sequence = sequences[lane];
+    // The pool owns the arithmetic: an entitlement may claim everything that is neither promised to
+    // an owner nor parked for a borrower of one.
     const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
                                 std::uint32_t new_pages) {
-        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
+        return pool.can_replace_entitlement(old_pages, new_pages);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
@@ -662,6 +663,8 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
         }
     }
 
+    // The same arithmetic with the retained lanes this pass would evict credited back -- including
+    // the pages they own, never the ones already parked for a borrower.
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
                                 std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
         if (old_pages > pool.entitled_pages() ||
@@ -669,7 +672,8 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             new_pages > pool.logical_page_capacity()) {
             return false;
         }
-        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
+        const std::uint32_t committed =
+            pool.entitled_pages() - old_pages - reclaimable_pages + pool.parked_pages();
         return new_pages <= pool.page_group_count() - committed;
     };
 
@@ -1380,11 +1384,15 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
     out.main_capacity_page_groups = main.page_group_count();
     out.main_entitled_page_groups = main.entitled_pages();
     out.main_free_page_groups     = main.free_pages();
+    out.main_mapped_page_groups   = main.mapped_pages();
+    out.main_parked_page_groups   = main.parked_pages();
     if (const qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
         const PagedKVPool& pool = backend->pool();
         out.backend_capacity_page_groups = pool.page_group_count();
         out.backend_entitled_page_groups = pool.entitled_pages();
         out.backend_free_page_groups     = pool.free_pages();
+        out.backend_mapped_page_groups   = pool.mapped_pages();
+        out.backend_parked_page_groups   = pool.parked_pages();
     }
     // Two state slots (the live continuation and the rollback seam) per lane, occupied by every lane
     // that still holds a chain: live, retained or parked.

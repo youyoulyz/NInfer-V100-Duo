@@ -58,7 +58,10 @@ RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& e
     RequestFailureClass classification = RequestFailureClass::Internal;
     if (error.status == 499 || error.code == "client_disconnected") {
         classification = RequestFailureClass::ClientDisconnected;
-    } else if (error.status == 429 || error.status == 529) {
+    } else if (error.status == 429 || error.status == 529 ||
+               error.code == "kv_capacity_unavailable") {
+        // Capacity pressure the caller can retry, not an engine that is gone: the same class as a
+        // refused queue slot, so a run's failure ledger does not read as an outage.
         classification = RequestFailureClass::Overload;
     } else if (error.code == "request_queue_timeout" || error.code == "media_fetch_timeout" ||
                error.status == 504) {

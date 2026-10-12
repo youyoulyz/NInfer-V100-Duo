@@ -791,6 +791,13 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 There is no admission ETA or unbounded overflow queue.
 
+Admission itself charges each request its prompt plus its declared output against the shared pool,
+and a request whose pages the pool cannot promise is refused with HTTP 503 and code
+`kv_capacity_unavailable` -- one request loses, the Engine keeps serving. The pool's accounting
+counts the pages an owner already returned while a lane still maps them (`state="parked"` in
+`ninfer_kv_page_groups`), so `capacity = free + mapped + parked` holds at every boundary and a plan
+is never admitted for pages the free list does not have.
+
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
 media request retains the same cancellation and timeout deadline. Model output is bounded by the

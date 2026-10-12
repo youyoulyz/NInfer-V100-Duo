@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer {
@@ -94,6 +95,14 @@ struct PagedKVPoolLayout {
 class PagedKVAllocation;
 struct PagedKVResize;
 
+// Raised when the pool cannot hand out what an entitlement promised. It is an accounting or
+// retention condition -- a parked borrow, a lane that has not given its pages back -- never a broken
+// device, so a caller may refuse one request and keep serving.
+class PagedKVUnavailable final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class PagedKVPool {
 public:
     PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout);
@@ -114,7 +123,15 @@ public:
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
+    // Page groups an owner already returned while a borrower still maps them: they are not entitled
+    // and not free, and they only come back when the last borrow drops. Capacity arithmetic has to
+    // subtract them, or the pool promises pages it cannot hand out.
+    [[nodiscard]] std::uint32_t parked_pages() const noexcept;
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    // Whether the pool could carry a lane from `old_pages` of entitlement to `new_pages`. The
+    // Program asks this before admitting, so the arithmetic lives here and only here.
+    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
+                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     // Zeros only the named physical page groups across every storage plane.
@@ -149,8 +166,6 @@ private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
 
-    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
-                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
                                                        std::int32_t preferred_first);
     void borrow_pages(std::span<const std::int32_t> page_ids);
@@ -169,9 +184,14 @@ private:
     // when the last borrow drops, so a retained page group cannot be recycled under a live row.
     std::vector<std::uint32_t> pending_returns_;
     std::vector<bool> row_in_use_;
+    // Capacity an entitlement may not claim: mapped-or-promised pages plus the parked returns.
+    [[nodiscard]] std::uint32_t unavailable_pages() const noexcept;
+
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
     std::uint32_t borrowed_pages_ = 0;
+    // Sum of `pending_returns_`, kept incrementally so the capacity predicates stay O(1).
+    std::uint32_t parked_pages_   = 0;
 };
 
 class PagedKVAllocation {

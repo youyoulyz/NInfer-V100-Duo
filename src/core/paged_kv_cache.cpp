@@ -150,15 +150,24 @@ std::uint32_t PagedKVPool::free_pages() const noexcept {
     return static_cast<std::uint32_t>(free_page_ids_.size());
 }
 
+std::uint32_t PagedKVPool::parked_pages() const noexcept { return parked_pages_; }
+
+// What the pool cannot hand out: the pages owners may still map, plus the pages parked for a
+// borrower whose owner already returned them. Counting a parked page as capacity is what let a plan
+// be admitted for pages the free list did not have.
+std::uint32_t PagedKVPool::unavailable_pages() const noexcept {
+    return entitled_pages_ + parked_pages_;
+}
+
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {
     return page_entitlement != 0 && page_entitlement <= logical_page_capacity() &&
-           page_entitlement <= page_group_count() - entitled_pages_;
+           page_entitlement <= page_group_count() - unavailable_pages();
 }
 
 bool PagedKVPool::can_replace_entitlement(std::uint32_t old_pages,
                                           std::uint32_t new_pages) const noexcept {
     return old_pages <= entitled_pages_ && new_pages <= logical_page_capacity() &&
-           new_pages <= page_group_count() - (entitled_pages_ - old_pages);
+           new_pages <= page_group_count() - (unavailable_pages() - old_pages);
 }
 
 PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
@@ -249,7 +258,11 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
                                                   std::int32_t preferred_first) {
     if (count == 0) { return {}; }
     if (count > free_page_ids_.size()) {
-        throw std::logic_error("Paged KV entitlement could not be materialized");
+        throw PagedKVUnavailable("paged KV cannot materialize " + std::to_string(count) +
+                                 " pages: " + std::to_string(free_page_ids_.size()) +
+                                 " are free of " + std::to_string(mapped_pages_) +
+                                 " mapped, " + std::to_string(entitled_pages_) + " entitled and " +
+                                 std::to_string(parked_pages_) + " parked");
     }
 
     const auto run_at = [&](std::size_t begin) {
@@ -306,6 +319,7 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
             free_page_ids_.push_back(page);
         } else {
             ++pending_returns_[static_cast<std::size_t>(page)];
+            ++parked_pages_;
         }
     }
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
@@ -354,6 +368,7 @@ void PagedKVPool::release_borrowed_pages(std::span<const std::int32_t> pages) no
         if (borrow_counts_[index] != 0 || pending_returns_[index] == 0) { continue; }
         for (std::uint32_t repeat = pending_returns_[index]; repeat != 0; --repeat) {
             free_page_ids_.push_back(page);
+            --parked_pages_;
         }
         pending_returns_[index] = 0;
     }

@@ -564,6 +564,10 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // The Engine could not reserve KV capacity for this one request. The engine itself keeps
+    // serving; the request is refused, and a retry once other conversations release their prefixes
+    // may well succeed. It is deliberately not `Unavailable`, which says the engine is gone.
+    CapacityUnavailable,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -956,9 +960,16 @@ struct KvRuntimeStats {
     std::uint32_t main_capacity_page_groups    = 0;
     std::uint32_t main_entitled_page_groups    = 0;
     std::uint32_t main_free_page_groups        = 0;
+    // Mapped pages, and the pages an owner already returned while a borrower still maps them. The
+    // parked ones are neither entitled nor free, so `capacity - free - entitled` is this pair: a
+    // capacity shortfall is exactly that gap appearing.
+    std::uint32_t main_mapped_page_groups      = 0;
+    std::uint32_t main_parked_page_groups      = 0;
     std::uint32_t backend_capacity_page_groups = 0;
     std::uint32_t backend_entitled_page_groups = 0;
     std::uint32_t backend_free_page_groups     = 0;
+    std::uint32_t backend_mapped_page_groups   = 0;
+    std::uint32_t backend_parked_page_groups   = 0;
     std::uint32_t state_capacity_slots         = 0;
     std::uint32_t state_occupied_slots         = 0;
     std::size_t host_kv_capacity_bytes         = 0;

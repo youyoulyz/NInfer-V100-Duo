@@ -3,6 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "core/device.h"
+#include "core/paged_kv_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -584,6 +585,19 @@ private:
         return false;
     }
 
+    // Undoes an admission that did not reach a running lane: the Program gives the lane up, the
+    // transient region is handed back, and the slot and its cached plans are dropped. Both the
+    // capacity refusal above and a device failure need exactly this.
+    void teardown_admission(std::uint32_t lane, bool target_started) {
+        if (target_started) { instance_.program->abort_lane(lane); }
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        slots_[lane].reset();
+        invalidate_lane_plans(lane);
+    }
+
     // A failure whose blast radius is exactly one request: its OutputSession (byte-level
     // detokenization, stop-string/channel policy, published deltas) and its own budget
     // accounting. Nothing about the device, the shared KV pool or another lane is implicated, so
@@ -1001,15 +1015,20 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
+        } catch (const PagedKVUnavailable& error) {
+            // Capacity, not the device: the pool could not hand out what the plan's entitlement
+            // promised, because pages are parked for a borrower or a retained lane did not give its
+            // own back. The promotion below is what keeps this from being fatal -- this request
+            // loses, the lane is torn down exactly as a device failure would tear it down, and the
+            // Engine keeps serving. Latching the whole Engine on a page shortfall is what turned one
+            // refused admission into an outage: `failed_` has no path back to false.
+            teardown_admission(lane, target_started);
+            complete_error(request, std::make_exception_ptr(RequestError(
+                                        RequestErrorKind::CapacityUnavailable, error.what())));
+            return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            if (target_started) { instance_.program->abort_lane(lane); }
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
-            slots_[lane].reset();
-            invalidate_lane_plans(lane);
+            teardown_admission(lane, target_started);
             complete_error(request, error);
             throw;
         }

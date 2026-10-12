@@ -69,6 +69,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "request_cancelled";
         error.code   = "client_disconnected";
         break;
+    case ninfer::RequestErrorKind::CapacityUnavailable:
+        error.param.clear();
+        error.status = 503;
+        error.type   = "server_error";
+        error.code   = "kv_capacity_unavailable";
+        break;
     case ninfer::RequestErrorKind::Unavailable:
         error.param.clear();
         error.status = 503;

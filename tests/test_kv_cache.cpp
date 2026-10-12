@@ -450,6 +450,48 @@ int main() {
     wide_owner.release();
     failures += expect_size(wide_pool.free_pages(), 8, "wide pool fully returned");
 
+    // The capacity ledger has to count a page an owner returned while a borrower still maps it: it
+    // is neither entitled nor free until the last borrow drops, so an entitlement admitted against
+    // "capacity minus entitled" is admitted for pages the free list does not have. On 2026-10-12 two
+    // lanes adopting each other's prefixes reached exactly that, and the refusal arrived as a
+    // `logic_error` the executor could not classify -- which latched the whole engine.
+    {
+        auto parked_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::BF16, 16, 1}});
+        ninfer::DeviceArena parked_arena(parked_plan.bytes);
+        ninfer::PagedKVPool parked_pool({parked_arena.base(), parked_arena.capacity()},
+                                        parked_plan.layout);
+        auto owner = parked_pool.reserve(4);
+        owner.materialize_pages(4);
+        owner.bind_row(0);
+        const std::vector<std::int32_t> lent(owner.page_ids().begin(), owner.page_ids().end());
+        auto borrower = parked_pool.reserve(4);
+        borrower.adopt_prefix(lent);
+        borrower.bind_row(1);
+
+        owner.release();
+        failures += expect_size(parked_pool.parked_pages(), 4, "the returned borrows are parked");
+        failures += expect_size(parked_pool.mapped_pages(), 0, "the owner's mapping is gone");
+        failures += expect_size(parked_pool.entitled_pages(), 4, "the borrower's entitlement");
+        failures += expect_size(parked_pool.free_pages(), 4, "a parked page is not free");
+        // Four pages is exactly what the owner parked, and exactly what "capacity minus
+        // entitled" still offered: both entry points have to refuse the parked half.
+        if (parked_pool.can_reserve(4)) {
+            ++failures;
+            std::cerr << "Parked pages were exposed as reservable capacity\n";
+        }
+        if (parked_pool.can_replace_entitlement(0, 4)) {
+            ++failures;
+            std::cerr << "Parked pages were exposed to a fresh entitlement\n";
+        }
+        borrower.release();
+        failures += expect_size(parked_pool.parked_pages(), 0, "the last borrow returns the pages");
+        failures += expect_size(parked_pool.free_pages(), 8, "the park drains to the free list");
+        if (!parked_pool.can_reserve(8)) {
+            ++failures;
+            std::cerr << "Returned borrows did not return reservable capacity\n";
+        }
+    }
+
     prefix_owner.release();
     failures += expect_size(hybrid_pool.free_pages(), 5, "the adopted prefix stays mapped");
     hybrid.release();
