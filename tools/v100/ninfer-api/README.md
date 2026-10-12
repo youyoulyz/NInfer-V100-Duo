@@ -1,11 +1,15 @@
 # NInfer API service and live dashboard (2 × V100-SXM2-16GB)
 
 Qwen3.8-27B `gguf-blocks` (GSQ-RCO IQ3_S v3), TP2 + MTP3 (`--draft-tokens 3 --lm-head-draft`),
-INT8-G64 KV, **190 000-token context at `--max-concurrency 4`**. The artifact is the same model as
-the NVFP4 profile at 3.4 bits: 5.66 GiB of weights per GPU against 10.46, which is what pays for the
-extra lanes and the pool. The 400 000-token pool is shared: admission charges each request its
-prompt plus its declared `max_tokens`, so four ~18K agent sessions run together (Claude Code declares
-32 000), or two requests at the full 190 000. Against the NVFP4 artifact measured on this host,
+INT8-G64 KV, **240 000-token context at `--max-concurrency 2`**. The artifact is the same model as
+the NVFP4 profile at 3.4 bits: 5.66 GiB of weights per GPU against 10.46, and that difference goes
+into the pool rather than into lanes -- 440 000 shared tokens against 190 000. Two lanes is the
+measured optimum for this route, not a conservative default: with four rows a decode round cost
+89.6 ms for 10.8 committed tokens (120 tok/s) against 27 ms for 2.7 at one row, because the GGUF/dp4a
+kernels on this card do not overlap weight streaming with the per-position compute MTP's 1+3 verify
+pays for. Admission charges each request its prompt plus its declared `max_tokens`, so one request
+can hold the full 240 000 and a second about 205 000, or two ~90K agent sessions run together
+(Claude Code declares 32 000). Against the NVFP4 artifact measured on this host,
 prefill is 55-65% faster and decode 10-15% slower. **Switching the artifact requires clearing the
 tier** (`./stop.sh && rm -f tier/*`): records are keyed without the weights, so one quantization's
 KV would otherwise be resumed by the next. Every KV cache -- the retained device lane, the parked host image and the NVMe
@@ -32,7 +36,7 @@ data) stays there.
 | Reset the tier | `./stop.sh && rm -f tier/*` (the tier is the only copy of a parked prefix, so deleting it only costs a re-prefill) |
 
 Overrides: `NINFER_API_PORT`, `NINFER_API_ARTIFACT`, `NINFER_API_TIER_DIR`, `NINFER_API_DISK_MIB`,
-`NINFER_API_ACCESS_DIR`. `serve.sh` admits four sessions at a time (`--max-concurrency 4`); extra
+`NINFER_API_ACCESS_DIR`. `serve.sh` admits two sessions at a time (`--max-concurrency 2`); extra
 requests queue.
 
 ## Dashboard

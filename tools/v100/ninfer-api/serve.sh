@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NInfer API service: four concurrent sessions sharing a 400K-token KV pool, backed by the pinned
+# NInfer API service: two concurrent sessions sharing a 440K-token KV pool, backed by the pinned
 # host tier and the local NVMe tier.
 #
 # The artifact is `qwen3.8-27b/gguf-blocks` (GSQ-RCO IQ3_S v3). It is the same Qwen3.8-27B model as
@@ -8,10 +8,18 @@
 # profile had 5.0. Measured on this host (docs/performance.md): prefill is 55-65% faster, decode
 # 10-15% slower, and the NVFP4 shape could not host lane 2 at 200K at all.
 #
-# `--max-context 190000` is the per-sequence ceiling and `--kv-capacity 400000` the shared pool:
-# admission charges `prompt + declared max_tokens` per request, so four ~18K-prompt agent sessions
-# (Claude Code declares 32 000) run together, or two requests at the full 190K. Each lane costs 2
-# GDN state slots (146.8 MiB) plus its share of the MTP graph allowance (82 MiB) per device.
+# `--max-context 240000` is the per-sequence ceiling and `--kv-capacity 440000` the shared pool, which
+# is what the smaller weights leave room for: the pool costs 1.096 MiB per 64 tokens per device, so
+# 440 000 tokens (6875 pages) is 7.36 GiB against 1.80 GiB of fixed C=2 state -- about 0.3 GiB of
+# slack per device. Two requests cannot both sit at the full 240K (that needs 7500 pages); one 240K
+# plus a second up to ~205K fits.
+#
+# Two lanes is a measured choice, not a conservative one. With four rows a decode round cost 89.6 ms
+# and committed 10.8 tokens (120 tok/s) against 27 ms and 2.7 tokens at one row: the GGUF/dp4a route
+# on this card does not overlap weight streaming with the per-position compute that MTP's 1+3 verify
+# pays for, so batching four rows pays that compute four times for the same weight reads. Two rows
+# keeps the streaming term amortized without it, which is why the leftover memory goes into the pool
+# instead of into more lanes.
 #
 # Switching the artifact invalidates the NVMe tier: its records are keyed by token digest and an
 # execution tag that does not name the weights, so a record written under one quantization would be
@@ -64,9 +72,9 @@ mkdir -p "${tier_dir}"
 exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 --host "${host}" --port "${port}" \
     --model-id qwen3.8-27b-nvfp4 \
-    --max-context 190000 --kv-capacity 400000 --kv-dtype int8 --prefill-chunk 1024 \
+    --max-context 240000 --kv-capacity 440000 --kv-dtype int8 --prefill-chunk 1024 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
-    --max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 3600000 \
+    --max-concurrency 2 --max-pending-requests 16 --pending-timeout-ms 3600000 \
     --host-kv-mib 2048 --disk-kv-path "${tier_dir}" --disk-kv-mib "${disk_mib}" \
     --kv-cache-ttl-seconds 14400 --log-stats-interval-ms 60000 \
     "${access_args[@]}" \
