@@ -8,6 +8,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -202,31 +203,74 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
     }
 }
 
+// Claude Code declares its billing metadata as the first `system` text block:
+//
+//   x-anthropic-billing-header: cc_version=2.1.153.454; cc_entrypoint=cli; cch=f0228;
+//
+// The Messages API consumes that declaration; it is not model input. It must not be rendered,
+// because `cch` identifies the request and therefore changes between two requests whose remaining
+// content is byte-identical: prepending it moves the prompt frontier by a few tokens and defeats
+// prefix reuse for exactly the prompts that should hit. One user-visible measurement: after the
+// client switched to 2.1.153, 93 of 94 requests to this deployment continued an earlier request
+// body verbatim and every one of them reported `full_reset`.
+bool declares_billing_header(std::string_view text) {
+    constexpr std::string_view kPrefix = "x-anthropic-billing-header:";
+    // Leading whitespace does not change what the declaration says.
+    const std::size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string_view::npos || text.compare(begin, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    // The declaration is a single line. A block that continues past it carries model-visible text
+    // this filter must not swallow, so it is rendered unchanged.
+    const std::size_t newline = text.find('\n', begin);
+    if (newline == std::string_view::npos) { return true; }
+    return text.find_first_not_of(" \t\r\n", newline) == std::string_view::npos;
+}
+
 // Flatten only the content blocks within one system value. Callers preserve the
-// containing turn and its position in the conversation.
-std::string flatten_system_value(const Json& value, const char* param) {
+// containing turn and its position in the conversation. A billing-header declaration is dropped
+// here, so both consumers of a system value -- the top-level field and a system-role message --
+// render the same prompt input.
+//
+// `std::nullopt` reports that the value carried nothing but declarations: it declares no model
+// input, so the caller adds no turn for it. A system value that is empty the ordinary way still
+// yields the empty string and keeps its own, pre-existing turn.
+std::optional<std::string> flatten_system_value(const Json& value, const char* param) {
+    bool dropped_declaration = false;
     std::string text;
     if (value.is_string()) {
-        text = value.get<std::string>();
+        const std::string piece = value.get<std::string>();
+        if (declares_billing_header(piece)) {
+            dropped_declaration = true;
+        } else {
+            append_text(text, piece);
+        }
     } else if (value.is_array()) {
         for (const Json& block : value) {
             if (require_block_type(block, param) != "text") {
                 bad_request("only text system blocks are supported", param);
             }
-            append_text(text, require_string_field(block, "text", "system text block"));
+            const std::string piece = require_string_field(block, "text", "system text block");
+            if (declares_billing_header(piece)) {
+                dropped_declaration = true;
+                continue;
+            }
+            append_text(text, piece);
         }
     } else {
         bad_request("system content must be a string or an array of text blocks", param);
     }
+    if (dropped_declaration && text.empty()) { return std::nullopt; }
     return text;
 }
 
 void parse_system(const Json& body, GenerationRequest& out) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
+    const std::optional<std::string> text = flatten_system_value(body.at("system"), "system");
+    if (!text.has_value()) { return; }
     ChatTurn turn;
     turn.role = ChatRole::System;
-    turn.content.push_back(
-        ContentPart{ContentKind::Text, flatten_system_value(body.at("system"), "system"), "text"});
+    turn.content.push_back(ContentPart{ContentKind::Text, *text, "text"});
     out.messages.push_back(std::move(turn));
 }
 
@@ -400,10 +444,11 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         const ChatRole role = roles[i];
         const Json& content = item.at("content");
         if (role == ChatRole::System) {
+            const std::optional<std::string> text = flatten_system_value(content, "messages");
+            if (!text.has_value()) { continue; }
             ChatTurn turn;
             turn.role = ChatRole::System;
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, flatten_system_value(content, "messages"), "text"});
+            turn.content.push_back(ContentPart{ContentKind::Text, *text, "text"});
             out.messages.push_back(std::move(turn));
             continue;
         }

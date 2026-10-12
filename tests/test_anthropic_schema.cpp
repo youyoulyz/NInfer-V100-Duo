@@ -748,6 +748,99 @@ int test_count_tokens_and_error() {
     return failures;
 }
 
+// claude-cli 2.1.153.x declares its billing metadata as the first `system` text block:
+//
+//   x-anthropic-billing-header: cc_version=2.1.153.454; cc_entrypoint=cli; cch=f0228;
+//
+// `cch` identifies the request, so it differs between two requests whose remaining content is
+// byte-identical. Rendering it puts a per-request token at the frontier of the prompt: after the
+// client switched to 2.1.153, 93 of 94 requests in the running deployment continued an earlier
+// body verbatim and every one of them reported `full_reset`. The declaration is API metadata
+// rather than model input, so it is dropped -- and only when the whole block is the declaration.
+int test_billing_header_declaration() {
+    int failures = 0;
+    const auto header = [](const std::string& cch) {
+        return "x-anthropic-billing-header: cc_version=2.1.153.454; cc_entrypoint=cli; cch=" + cch +
+               ";";
+    };
+    const Json user = Json{{"role", "user"}, {"content", "hello"}};
+
+    const Json body = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system", Json::array({Json{{"type", "text"}, {"text", header("f0228")}},
+                                Json{{"type", "text"}, {"text", "You are Claude Code."}}})},
+        {"messages", Json::array({user})}};
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    failures += check(req.messages.size() == 2, "declaration block adds no turn");
+    failures += check(req.messages[0].role == ninfer::ChatRole::System, "system turn kept");
+    failures += check(req.messages[0].content.size() == 1, "system kept one part");
+    failures += check(req.messages[0].content[0].text == "You are Claude Code.",
+                      "system text is the declaration's successor, unwrapped");
+
+    // The regression this protects: the two requests differ only in the declaration, so both must
+    // render the same prompt input -- which is what prefix reuse compares.
+    Json other                             = body;
+    other["system"][0]["text"]             = header("08be0");
+    const GenerationRequest other_req      = parse_messages_request(other, default_limits());
+    const ninfer::PromptInput prompt       = translate(req);
+    const ninfer::PromptInput other_prompt = translate(other_req);
+    failures += check(prompt.messages.size() == other_prompt.messages.size(),
+                      "a different cch keeps the prompt shape");
+    failures += check(joined_text(prompt.messages[0]) == joined_text(other_prompt.messages[0]),
+                      "a different cch renders an identical system prompt");
+
+    const Json only = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system", Json::array({Json{{"type", "text"}, {"text", header("f0228")}}})},
+        {"messages", Json::array({user})}};
+    const GenerationRequest only_req = parse_messages_request(only, default_limits());
+    failures += check(only_req.messages.size() == 1, "declaration-only system adds no turn");
+    failures += check(only_req.messages[0].role == ninfer::ChatRole::User, "user turn is first");
+
+    // A block that continues past the declaration carries model-visible text and is rendered.
+    const std::string extended_text = header("f0228") + "\nExplain the build.";
+    const Json extended             = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system", Json::array({Json{{"type", "text"}, {"text", extended_text}}})},
+        {"messages", Json::array({user})}};
+    const GenerationRequest extended_req = parse_messages_request(extended, default_limits());
+    failures += check(extended_req.messages.size() == 2, "multi-line block keeps its turn");
+    failures += check(extended_req.messages[0].content[0].text == extended_text,
+                      "multi-line block is rendered verbatim");
+
+    // A string-valued system field carrying the declaration alone behaves the same way.
+    const Json string_body = {{"model", "m"},
+                              {"max_tokens", 16},
+                              {"system", header("f0228")},
+                              {"messages", Json::array({user})}};
+    const GenerationRequest string_req = parse_messages_request(string_body, default_limits());
+    failures += check(string_req.messages.size() == 1,
+                      "declaration-only system string adds no turn");
+
+    // An empty system value keeps its pre-existing empty turn.
+    const Json empty_body = {{"model", "m"},
+                             {"max_tokens", 16},
+                             {"system", ""},
+                             {"messages", Json::array({user})}};
+    const GenerationRequest empty_req = parse_messages_request(empty_body, default_limits());
+    failures += check(empty_req.messages.size() == 2, "empty system value keeps its turn");
+    failures += check(empty_req.messages[0].content[0].text.empty(), "empty system text preserved");
+
+    // A dynamic system-role message carrying only the declaration is dropped the same way.
+    const Json dynamic = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"messages",
+         Json::array({user, Json{{"role", "system"}, {"content", header("f0228")}},
+                      Json{{"role", "assistant"}, {"content", "hi"}}})}};
+    const GenerationRequest dynamic_req = parse_messages_request(dynamic, default_limits());
+    failures += check(dynamic_req.messages.size() == 2, "declaration-only dynamic system dropped");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -766,6 +859,7 @@ int main() {
     failures += test_response_serialization();
     failures += test_streaming_events();
     failures += test_count_tokens_and_error();
+    failures += test_billing_header_declaration();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
