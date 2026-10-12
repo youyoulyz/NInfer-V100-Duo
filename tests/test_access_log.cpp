@@ -164,6 +164,33 @@ int main() {
         }
     }
 
+    // A captured body is the bytes that crossed the wire, so it can end inside a UTF-8 character:
+    // a client that gives up mid-frame leaves the teed SSE text cut after the first bytes of a
+    // multi-byte sequence. Storing that must not throw -- on 2026-10-12 an uncaught
+    // `json.exception.type_error.316` from this path killed the server on every mid-stream
+    // disconnect, which at a five-minute client timeout meant a crash every few minutes.
+    {
+        const std::filesystem::path directory = root / "partial-utf8";
+        AccessLog log(directory.string(), 1ULL << 20, 1ULL << 20, "serve-test");
+        const std::string truncated_frame = std::string("data: {\"text\":\"") + "\xE4\xBD";
+        log.write_access(facts_for("/v1/messages", true), R"({"stream":true})", truncated_frame);
+        log.write_access(facts_for("/v1/messages", false), std::string("\xE4\xBD"),
+                         R"({"ok":true})");
+
+        const std::vector<std::string> lines = read_lines(directory / "access.jsonl");
+        failures += check(lines.size() == 2, "a truncated UTF-8 capture did not write both lines");
+        if (lines.size() == 2) {
+            const Json streamed = Json::parse(lines[0]);
+            failures += check(streamed.at("http").at("streamed") == true,
+                              "a truncated stream lost its streamed flag");
+            failures += check(streamed.at("response_body").is_string(),
+                              "a truncated stream lost its response body");
+            const Json plain = Json::parse(lines[1]);
+            failures += check(plain.at("response_body").at("ok") == true,
+                              "a truncated request body displaced the response body");
+        }
+    }
+
     // Rotation keeps one bounded active file and moves the rest aside under numbered names.
     {
         const std::filesystem::path directory = root / "rotated";

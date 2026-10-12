@@ -130,7 +130,13 @@ void AccessLog::write_access(const HttpAccessFacts& facts, std::string_view requ
                       {"request_body_truncated", request_truncated},
                       {"response_body", std::move(response)},
                       {"response_body_truncated", response_truncated}};
-    append_locked(record.dump());
+    // A body is captured as the bytes that crossed the wire, so it can end inside a UTF-8
+    // character: a client that gives up mid-frame leaves the teed SSE text cut after the first
+    // bytes of a multi-byte sequence. JSON demands valid UTF-8, and the default dump throws
+    // `type_error.316` on anything else -- which killed the server on every mid-stream disconnect
+    // until this replaced the offending bytes. The log is a record of someone else's bytes, so
+    // U+FFFD is the honest rendering of a sequence the wire never finished.
+    append_locked(record.dump(-1, ' ', false, Json::error_handler_t::replace));
 }
 
 void AccessLog::append_locked(std::string_view record) {
