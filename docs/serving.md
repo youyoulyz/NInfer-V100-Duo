@@ -150,7 +150,7 @@ is how reuse was realized, so a resumed session shows `cache` at the prompt fron
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | Engine liveness: `{"status":"ok"}` while requests are served, HTTP 503 `{"status":"unavailable","reason":"engine_failed"}` once the Engine has latched and refuses every request |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -793,10 +793,17 @@ There is no admission ETA or unbounded overflow queue.
 
 Admission itself charges each request its prompt plus its declared output against the shared pool,
 and a request whose pages the pool cannot promise is refused with HTTP 503 and code
-`kv_capacity_unavailable` -- one request loses, the Engine keeps serving. The pool's accounting
-counts the pages an owner already returned while a lane still maps them (`state="parked"` in
-`ninfer_kv_page_groups`), so `capacity = free + mapped + parked` holds at every boundary and a plan
-is never admitted for pages the free list does not have.
+`kv_capacity_unavailable` -- one request loses, the Engine keeps serving. That covers every way the
+promise can fail, including the reservation itself: a plan whose entitlement the pool cannot hand
+out, or a lane the scheduler cannot admit at all, is the same retryable refusal. It is never an
+Engine failure, so a client that retries after other conversations release their prefixes can
+succeed without a restart.
+
+The pool's accounting is the authority. It counts the pages an owner already returned while a lane
+still maps them (`state="parked"` in `ninfer_kv_page_groups`), so `capacity = free + mapped +
+parked` holds at every boundary and a plan is never admitted for pages the free list does not have.
+`ninfer_engine_failed` in `/metrics` is `0` while the Engine serves and `1` only once it has latched
+-- the difference between a pool that is full and a process that needs restarting.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

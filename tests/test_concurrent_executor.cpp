@@ -206,7 +206,15 @@ public:
         return base;
     }
 
+    // A lane the Program refuses to admit: the pools hold pages the plan cannot have, so no lane
+    // carries the request at all.
+    void deny_admissions(bool denied) noexcept { deny_admissions_ = denied; }
+    // The next prefill finds the pool unable to promise the lane its pages, which is a capacity
+    // condition and not a device failure.
+    void shortfall_next_prefill() noexcept { prefill_shortfall_ = true; }
+
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const ScriptedPlan&) const noexcept {
+        if (deny_admissions_) { return false; }
         return lane < max_concurrency_ && lanes_[lane].lifecycle == Lifecycle::Empty;
     }
 
@@ -230,10 +238,21 @@ public:
     [[nodiscard]] ninfer::SharedPrefixStats shared_prefix_stats() const { return {}; }
     [[nodiscard]] ninfer::KvRuntimeStats kv_runtime_stats() const noexcept { return {}; }
     std::uint32_t expire_kv_cache() noexcept { return 0; }
+    // The scripted Program owns no disk tier: the executor's hourly maintenance asks both questions
+    // and this one answers "nothing to give back".
+    bool reclaim_disk_space() noexcept { return false; }
     std::uint32_t drop_shared_payloads(std::uint32_t) noexcept { return 0; }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
                                              ScriptedPlan&& plan, rt::TransientRegion) {
+        if (prefill_shortfall_) {
+            // Before any state moves: the reservation the admission needs is the first thing the
+            // real Program does, and a pool that cannot hand it out leaves the lane exactly as it
+            // was.
+            prefill_shortfall_ = false;
+            throw ninfer::PagedKVUnavailable(
+                "scripted pool cannot promise the lane's pages: 0 free of 4");
+        }
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
         Lane& state     = lanes_[lane];
         state.script    = std::move(queued_.front());
@@ -376,6 +395,8 @@ private:
     std::deque<GenerationScript> queued_;
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
+    bool deny_admissions_          = false;
+    bool prefill_shortfall_        = false;
 };
 
 struct ScriptedPackage {
@@ -415,6 +436,9 @@ struct Outcome {
     bool ok = false;
     std::string content;
     std::string error;
+    // How the Engine classified the failure: the difference between "one request loses" and "the
+    // Engine is gone" is this kind, not the message.
+    std::optional<ninfer::RequestErrorKind> kind;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::None;
 };
 
@@ -439,6 +463,9 @@ Outcome await(Executor::Submission submission) {
         outcome.ok            = true;
         outcome.content       = result.content;
         outcome.finish_reason = result.finish_reason;
+    } catch (const ninfer::RequestError& error) {
+        outcome.kind  = error.kind();
+        outcome.error = error.what();
     } catch (const std::exception& error) { outcome.error = error.what(); }
     return outcome;
 }
@@ -700,6 +727,60 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+// The capacity half of the same boundary. A pool that cannot hand out what a plan promised is an
+// accounting condition -- pages a retained conversation is holding, a borrower still mapping a
+// prefix -- so it has to fail ONE request with the retryable capacity code and leave the Engine
+// serving. On 2026-10-13 an admission-time shortfall arrived as `std::bad_alloc` instead, reached
+// this same engine-scope handler, and latched the whole Engine: every later request -- including the
+// ones that had nothing to do with it -- answered 503 "inference engine is unavailable" until the
+// process was restarted.
+void test_capacity_shortfall_does_not_latch(const q36::Frontend& frontend,
+                                            const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(2),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->shortfall_next_prefill();
+    instance.program->push_script(GenerationScript{.tokens = {0}});
+    Executor executor(instance, executor_options(2), device);
+
+    const Outcome refused = run_request(executor, frontend, 1);
+    expect(!refused.ok, "a reservation the pool cannot back was admitted");
+    expect(refused.kind == ninfer::RequestErrorKind::CapacityUnavailable,
+           "a capacity shortfall was not classified as one");
+    expect(executor.runtime_stats().engine_failed == false,
+           "a capacity shortfall latched the Engine");
+
+    // The lane was torn down and that one request lost; the Engine did not.
+    const Outcome served = run_request(executor, frontend, 1);
+    expect(served.ok, "the Engine stopped serving after a capacity shortfall");
+    expect(!executor.runtime_stats().engine_failed,
+           "the Engine was latched by a capacity shortfall");
+}
+
+// And when no lane can carry the request at all -- every pool page is promised to a lane that is not
+// a request -- the Engine refuses that one request instead of declaring its own state broken.
+void test_no_admissible_lane_refuses_one_request(const q36::Frontend& frontend,
+                                                 const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(2),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->push_script(GenerationScript{.tokens = {0}});
+    Executor executor(instance, executor_options(2), device);
+    instance.program->deny_admissions(true);
+
+    const Outcome refused = run_request(executor, frontend, 1);
+    expect(!refused.ok, "a request entered a lane the Program refused to admit");
+    expect(refused.kind == ninfer::RequestErrorKind::CapacityUnavailable,
+           "an un-admittable request was not classified as a capacity condition");
+    expect(executor.runtime_stats().engine_failed == false, "an idle Engine latched");
+
+    instance.program->deny_admissions(false);
+    const Outcome served = run_request(executor, frontend, 1);
+    expect(served.ok, "the Engine stopped serving after one refused admission");
+}
+
 } // namespace
 
 int main() {
@@ -717,5 +798,7 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_engine_scope_failure_still_fails_all(frontend, device);
+    test_capacity_shortfall_does_not_latch(frontend, device);
+    test_no_admissible_lane_refuses_one_request(frontend, device);
     return failures == 0 ? 0 : 1;
 }

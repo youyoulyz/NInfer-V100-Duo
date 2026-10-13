@@ -426,6 +426,26 @@ int main() {
     failures += check(metrics.find("ninfer_info{model=\"serve-test-model\"} 1\n") !=
                           std::string::npos,
                       "prometheus exposition omits the model identity");
+
+    // A latched Engine still accepts connections and refuses every request, so a probe that only
+    // asks whether the process is up reports a healthy outage. The status has to follow the Engine,
+    // and the same state has to be visible to a scraper.
+    failures += check(engine_health(metrics_stats).status == 200 &&
+                          Json::parse(engine_health(metrics_stats).body).at("status") == "ok",
+                      "a serving Engine did not report healthy");
+    failures += check(metrics.find("ninfer_engine_failed 0\n") != std::string::npos,
+                      "prometheus exposition omits the serving state");
+    ninfer::RuntimeStats latched = metrics_stats;
+    latched.engine_failed        = true;
+    const HealthReport down      = engine_health(latched);
+    const Json down_body         = Json::parse(down.body);
+    failures += check(down.status == 503 && down_body.at("status") == "unavailable" &&
+                          down_body.at("reason") == "engine_failed",
+                      "a latched Engine did not report unavailable");
+    failures += check(
+        format_prometheus_metrics(latched, "serve-test-model").find("ninfer_engine_failed 1\n") !=
+            std::string::npos,
+        "prometheus exposition omits the latched state");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
 

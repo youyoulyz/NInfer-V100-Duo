@@ -4,13 +4,30 @@
 
 #include <algorithm>
 #include <limits>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace ninfer {
 namespace {
+
+// One account of a shortfall, so every refusal names the same quantities: `wanted` says which
+// entitlement could not be backed, and the counts are the ledger that refused it.
+std::string entitlement_shortfall(const PagedKVPool& pool, const std::string& wanted) {
+    return wanted + ": " + std::to_string(pool.free_pages()) + " free, " +
+           std::to_string(pool.mapped_pages()) + " mapped, " +
+           std::to_string(pool.entitled_pages()) + " entitled and " +
+           std::to_string(pool.parked_pages()) + " parked in a " +
+           std::to_string(pool.page_group_count()) + "-page pool";
+}
+
+std::string cannot_promise(std::uint32_t pages) {
+    return "paged KV cannot promise " + std::to_string(pages) + " pages";
+}
+
+std::string cannot_carry(std::uint32_t pages) {
+    return "paged KV cannot carry the entitlement to " + std::to_string(pages) + " pages";
+}
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value == 0 ||
@@ -152,26 +169,67 @@ std::uint32_t PagedKVPool::free_pages() const noexcept {
 
 std::uint32_t PagedKVPool::parked_pages() const noexcept { return parked_pages_; }
 
-// What the pool cannot hand out: the pages owners may still map, plus the pages parked for a
-// borrower whose owner already returned them. Counting a parked page as capacity is what let a plan
-// be admitted for pages the free list did not have.
-std::uint32_t PagedKVPool::unavailable_pages() const noexcept {
-    return entitled_pages_ + parked_pages_;
+namespace {
+
+// The one capacity formula. `old_pages` is the entitlement the lane already holds and keeps (zero
+// when it holds none), `released` are the allocations the admission gives back first, and
+// `reclaim_holds` credits the pages parked for a borrower whose owner has already returned them --
+// pages a caller that will drop those holds, by giving up a borrowed payload or evicting the lane
+// that maps them, is entitled to count.
+bool carry_entitlement(const PagedKVPool& pool, std::uint32_t old_pages,
+                       std::span<const PagedKVAllocation* const> released, std::uint32_t new_pages,
+                       bool reclaim_holds) noexcept {
+    if (old_pages > pool.entitled_pages() || new_pages > pool.logical_page_capacity()) {
+        return false;
+    }
+    std::uint32_t committed = pool.entitled_pages() - old_pages;
+    if (!reclaim_holds) { committed += pool.parked_pages(); }
+    for (const PagedKVAllocation* allocation : released) {
+        if (allocation == nullptr) { continue; }
+        committed -= std::min(committed, pool.reclaimable_pages(*allocation));
+    }
+    return committed < pool.page_group_count() && new_pages <= pool.page_group_count() - committed;
 }
 
+} // namespace
+
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {
-    return page_entitlement != 0 && page_entitlement <= logical_page_capacity() &&
-           page_entitlement <= page_group_count() - unavailable_pages();
+    // A fresh promise also has to ask for something: a zero-page entitlement is not a reservation.
+    return page_entitlement != 0 && carry_entitlement(*this, 0, {}, page_entitlement, false);
 }
 
 bool PagedKVPool::can_replace_entitlement(std::uint32_t old_pages,
                                           std::uint32_t new_pages) const noexcept {
-    return old_pages <= entitled_pages_ && new_pages <= logical_page_capacity() &&
-           new_pages <= page_group_count() - (unavailable_pages() - old_pages);
+    return carry_entitlement(*this, old_pages, {}, new_pages, false);
+}
+
+bool PagedKVPool::can_carry_entitlement(std::uint32_t old_pages,
+                                        std::span<const PagedKVAllocation* const> released,
+                                        std::uint32_t new_pages) const noexcept {
+    return carry_entitlement(*this, old_pages, released, new_pages, false);
+}
+
+bool PagedKVPool::can_carry_entitlement_reclaiming_holds(
+    std::uint32_t old_pages, std::span<const PagedKVAllocation* const> released,
+    std::uint32_t new_pages) const noexcept {
+    return carry_entitlement(*this, old_pages, released, new_pages, true);
+}
+
+std::uint32_t PagedKVPool::reclaimable_pages(const PagedKVAllocation& allocation) const noexcept {
+    if (!allocation.valid() || allocation.pool_ != this || allocation.borrowed_) { return 0; }
+    std::uint32_t reclaimable = allocation.page_entitlement_ - allocation.owned_page_count();
+    const std::span<const std::int32_t> owned =
+        std::span<const std::int32_t>(allocation.page_ids_).subspan(allocation.owned_begin_);
+    for (const std::int32_t page : owned) {
+        if (borrow_counts_[static_cast<std::size_t>(page)] == 0) { ++reclaimable; }
+    }
+    return reclaimable;
 }
 
 PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
-    if (!can_reserve(page_entitlement)) { throw std::bad_alloc(); }
+    if (!can_reserve(page_entitlement)) {
+        throw PagedKVUnavailable(entitlement_shortfall(*this, cannot_promise(page_entitlement)));
+    }
     PagedKVAllocation allocation(*this, page_entitlement);
     add_entitlement(page_entitlement);
     return allocation;
@@ -482,7 +540,9 @@ void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
     if (!valid() || pages < owned_page_count()) {
         throw std::invalid_argument("Paged KV entitlement is smaller than the owned pages");
     }
-    if (!pool_->can_replace_entitlement(page_entitlement_, pages)) { throw std::bad_alloc(); }
+    if (!pool_->can_replace_entitlement(page_entitlement_, pages)) {
+        throw PagedKVUnavailable(entitlement_shortfall(*pool_, cannot_carry(pages)));
+    }
     page_ids_.reserve(pages);
     pool_->replace_entitlement(page_entitlement_, pages);
     page_entitlement_ = pages;
@@ -590,7 +650,8 @@ reserve_paged_kv_bundle(std::span<const PagedKVReservation> reservations) {
     validate_distinct_pools(reservations);
     for (const PagedKVReservation& reservation : reservations) {
         if (!reservation.pool->can_reserve(reservation.page_entitlement)) {
-            throw std::bad_alloc();
+            throw PagedKVUnavailable(entitlement_shortfall(
+                *reservation.pool, cannot_promise(reservation.page_entitlement)));
         }
     }
 
@@ -626,7 +687,8 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
         }
         if (!change.allocation->pool_->can_replace_entitlement(change.allocation->page_entitlement_,
                                                                change.page_entitlement)) {
-            throw std::bad_alloc();
+            throw PagedKVUnavailable(entitlement_shortfall(*change.allocation->pool_,
+                                                          cannot_carry(change.page_entitlement)));
         }
     }
     // Complete every potentially throwing host allocation before changing any pool accounting.

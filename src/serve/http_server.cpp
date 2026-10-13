@@ -311,8 +311,13 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    // Liveness for the operator (and any orchestrator probe): the answer follows the Engine, so a
+    // latched worker -- which still accepts connections but refuses every request -- reports 503
+    // instead of a healthy-looking outage.
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        const HealthReport health = engine_health(service_->runtime_stats());
+        res.status                = health.status;
+        res.set_content(health.body, "application/json");
     });
     // Prometheus text exposition of the engine's runtime and memory surface: throughput, MTP
     // acceptance, the paged-KV distribution and the shared prefix index. Deliberately a plain

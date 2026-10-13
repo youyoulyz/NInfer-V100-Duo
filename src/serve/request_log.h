@@ -106,6 +106,15 @@ std::string format_throughput(const ThroughputReport& report);
 [[nodiscard]] std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
                                                     std::string_view model_id);
 
+// The liveness answer behind `GET /health`. A latched Engine still accepts connections and refuses
+// every request, so a probe that only asks "is the process up?" reports a healthy outage: the status
+// has to follow the Engine's own state.
+struct HealthReport {
+    int status  = 200;
+    std::string body;
+};
+[[nodiscard]] HealthReport engine_health(const ninfer::RuntimeStats& stats);
+
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,

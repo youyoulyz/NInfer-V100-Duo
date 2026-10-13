@@ -95,9 +95,12 @@ struct PagedKVPoolLayout {
 class PagedKVAllocation;
 struct PagedKVResize;
 
-// Raised when the pool cannot hand out what an entitlement promised. It is an accounting or
-// retention condition -- a parked borrow, a lane that has not given its pages back -- never a broken
-// device, so a caller may refuse one request and keep serving.
+// Raised when the pool cannot hand out what an entitlement promised -- at reservation time
+// (`reserve`, `set_page_entitlement`, the bundle calls) or when the promise is materialized
+// (`take_pages`). It is an accounting or retention condition -- a parked borrow, a lane that has
+// not given its pages back -- never a broken device, so a caller may refuse one request and keep
+// serving. Every shortfall of this kind is this type: a capacity condition must not reach a handler
+// that can only treat it as a broken execution unit.
 class PagedKVUnavailable final : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -132,6 +135,29 @@ public:
     // Program asks this before admitting, so the arithmetic lives here and only here.
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
+    // Pages a release of `allocation` actually returns to the free set: the entitlement it never
+    // mapped, plus the owned pages no borrower and no index hold keeps. A page a sibling or the
+    // shared store still maps is parked for it rather than freed, and a borrowed allocation owns
+    // nothing to return.
+    [[nodiscard]] std::uint32_t
+    reclaimable_pages(const PagedKVAllocation& allocation) const noexcept;
+    // Whether the pool could promise `new_pages` to a lane that gives up `released` first, and
+    // replaces an entitlement of `old_pages` while it does. This is the arithmetic behind an
+    // admission that resets its lane (its own bundle in `released`, `old_pages` zero) or that evicts
+    // retained lanes for the room. The credit for a release is `reclaimable_pages`, never the
+    // entitlement the allocation nominally holds, so a page that is not coming back cannot be
+    // promised twice.
+    [[nodiscard]] bool
+    can_carry_entitlement(std::uint32_t old_pages,
+                          std::span<const PagedKVAllocation* const> released,
+                          std::uint32_t new_pages) const noexcept;
+    // The same question for an admission that will also give up the pages the pool is holding for a
+    // borrower that has already returned them -- what dropping a shared payload, or evicting the
+    // lane that maps a held page, recovers. It is the optimistic bound a reclaim pass may plan
+    // against; the exact question above is the one an admission must finally satisfy.
+    [[nodiscard]] bool can_carry_entitlement_reclaiming_holds(
+        std::uint32_t old_pages, std::span<const PagedKVAllocation* const> released,
+        std::uint32_t new_pages) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     // Zeros only the named physical page groups across every storage plane.
@@ -184,8 +210,6 @@ private:
     // when the last borrow drops, so a retained page group cannot be recycled under a live row.
     std::vector<std::uint32_t> pending_returns_;
     std::vector<bool> row_in_use_;
-    // Capacity an entitlement may not claim: mapped-or-promised pages plus the parked returns.
-    [[nodiscard]] std::uint32_t unavailable_pages() const noexcept;
 
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;

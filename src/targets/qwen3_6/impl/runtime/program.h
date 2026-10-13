@@ -595,6 +595,15 @@ public:
     }
 
 private:
+    // The capacity question behind both admission predicates: whether `lane` can carry `plan`'s
+    // entitlement out of pages the pool will really have. The direct question credits only what the
+    // admission itself releases -- this lane's bundle, when the plan cannot continue what the lane
+    // holds -- while `evict_retained` selects the pass that would also drop shared payloads and
+    // evict retained lanes for the room, so that question credits what those reclaims bring back.
+    // Asked of both ranks: rank 1 reserves the same pages in the same order, and a rank that cannot
+    // carry the entitlement would refuse the bundle after rank 0 had already committed to it.
+    [[nodiscard]] bool admits_lane_capacity(std::uint32_t lane, const RequestPlan& plan,
+                                            bool evict_retained) const noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

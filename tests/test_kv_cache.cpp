@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <new>
 #include <span>
@@ -38,6 +39,21 @@ int fail(const char* message) {
 
 bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
+}
+
+// A capacity shortfall has to arrive as the type a caller can classify -- `PagedKVUnavailable` --
+// and never as a broken-allocation failure, which is what a handler can only treat as fatal.
+int expect_shortfall(const std::function<void()>& body, const char* label) {
+    try {
+        body();
+    } catch (const ninfer::PagedKVUnavailable&) {
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << label << ": expected PagedKVUnavailable, got: " << error.what() << '\n';
+        return 1;
+    }
+    std::cerr << label << ": the shortfall was not reported at all\n";
+    return 1;
 }
 
 int expect_size(std::size_t actual, std::size_t expected, const char* label) {
@@ -318,7 +334,7 @@ int main() {
         (void)unused;
         ++failures;
         std::cerr << "Impossible multi-pool reservation succeeded\n";
-    } catch (const std::bad_alloc&) {}
+    } catch (const ninfer::PagedKVUnavailable&) {}
     failures += expect_size(main_pool.entitled_pages(), 0, "failed bundle main entitlement");
     failures += expect_size(backend_pool.entitled_pages(), 0, "failed bundle backend entitlement");
 
@@ -337,7 +353,7 @@ int main() {
         ninfer::resize_paged_kv_bundle(impossible_resize);
         ++failures;
         std::cerr << "Impossible multi-pool resize succeeded\n";
-    } catch (const std::bad_alloc&) {}
+    } catch (const ninfer::PagedKVUnavailable&) {}
     failures += expect_size(bundle[0].mapped_page_count(), 2, "failed resize main mapping");
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
@@ -483,6 +499,13 @@ int main() {
             ++failures;
             std::cerr << "Parked pages were exposed to a fresh entitlement\n";
         }
+        // The exact question above refuses; the bound an admission that will drop the holds plans
+        // against is allowed to count them -- that is what makes the eviction pass worth running, and
+        // the pass then drives on the exact question, so the credit can never admit by itself.
+        if (!parked_pool.can_carry_entitlement_reclaiming_holds(0, {}, 4)) {
+            ++failures;
+            std::cerr << "The reclaiming bound did not credit the parked pages\n";
+        }
         borrower.release();
         failures += expect_size(parked_pool.parked_pages(), 0, "the last borrow returns the pages");
         failures += expect_size(parked_pool.free_pages(), 8, "the park drains to the free list");
@@ -490,6 +513,66 @@ int main() {
             ++failures;
             std::cerr << "Returned borrows did not return reservable capacity\n";
         }
+    }
+
+    // A reservation the pool cannot back is a capacity answer, not a broken allocation: it has its
+    // own type, and it leaves the ledger exactly as it found it. On 2026-10-13 this path threw
+    // `std::bad_alloc` instead, which reached the executor's engine-scope handler, latched the whole
+    // Engine, and answered every later request with 503 until the process was restarted.
+    {
+        auto shortfall_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::BF16, 16, 1}});
+        ninfer::DeviceArena shortfall_arena(shortfall_plan.bytes);
+        ninfer::PagedKVPool pool({shortfall_arena.base(), shortfall_arena.capacity()},
+                                 shortfall_plan.layout);
+        auto held = pool.reserve(6);
+        held.materialize_pages(6);
+        held.bind_row(0);
+        failures += expect_shortfall([&] { (void)pool.reserve(3); }, "a fresh reservation");
+        failures +=
+            expect_shortfall([&] { held.set_page_entitlement(9); }, "an entitlement resize");
+        failures += expect_size(pool.entitled_pages(), 6, "a refused reservation keeps the ledger");
+        failures += expect_size(pool.free_pages(), 2, "a refused reservation frees nothing");
+        failures +=
+            expect_size(held.page_entitlement(), 6, "a refused resize keeps the entitlement");
+        held.release();
+        failures += expect_size(pool.free_pages(), 8, "the pool returns to whole");
+    }
+
+    // What a release returns is what the pool may credit for it. A page a sibling still maps comes
+    // back parked rather than free, so crediting the entitlement would promise pages the free list
+    // never sees -- the divergence that let an admission be chosen, and then fail, on the way in.
+    {
+        auto lend_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::BF16, 16, 1}});
+        ninfer::DeviceArena lend_arena(lend_plan.bytes);
+        ninfer::PagedKVPool pool({lend_arena.base(), lend_arena.capacity()}, lend_plan.layout);
+        auto owner = pool.reserve(6);
+        owner.materialize_pages(6);
+        owner.bind_row(0);
+        const std::vector<std::int32_t> lent(owner.page_ids().begin(),
+                                             owner.page_ids().begin() + 4);
+        auto borrower = pool.adopt_shared(lent);
+        borrower.bind_row(1);
+
+        failures +=
+            expect_size(pool.reclaimable_pages(owner), 2, "only the un-borrowed pages come back");
+        const ninfer::PagedKVAllocation* released[]{&owner};
+        // The pool has two spare pages and the release is worth two more: crediting the entitlement
+        // (six) instead of what comes back would promise four pages the free list never sees.
+        if (pool.can_carry_entitlement(0, {}, 3) || !pool.can_carry_entitlement(0, released, 4) ||
+            pool.can_carry_entitlement(0, released, 5)) {
+            ++failures;
+            std::cerr << "can_carry_entitlement credited the entitlement instead of the release\n";
+        }
+        owner.release();
+        failures += expect_size(pool.parked_pages(), 4, "the borrowed prefix is parked");
+        // Reality has to match the credit: four pages are now reservable -- the two the pool already
+        // had plus the two the release returned -- and the fifth is still not there.
+        if (!pool.can_reserve(4) || pool.can_reserve(5)) {
+            ++failures;
+            std::cerr << "the release returned a different number of pages than was credited\n";
+        }
+        borrower.release();
+        failures += expect_size(pool.free_pages(), 8, "the last borrow returns every page");
     }
 
     prefix_owner.release();

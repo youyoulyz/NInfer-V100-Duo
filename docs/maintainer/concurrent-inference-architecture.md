@@ -122,6 +122,18 @@ Backfill 只改变 waiting request 的 admission order。它不取得 active req
 资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
 backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 
+### 2.10 Capacity shortfall 只拒绝 request，不 latch Engine
+
+KV capacity 不足是 request-scope 条件，不是 execution-unit 故障。entitlement 预留或 materialize 无法兑现
+时 pool 抛 `PagedKVUnavailable`：scheduler 拆掉该 lane，用
+`RequestErrorKind::CapacityUnavailable`（HTTP 503 `kv_capacity_unavailable`）拒绝这一个 request，
+其余 requests 和 Engine 继续服务。没有 lane 能承载该 request 时同样是这一次拒绝，而不是把
+resource shortfall 当成 broken invariant。
+
+Pool 自身的 ledger 是唯一权威：`capacity = free + mapped + parked`，owner 已归还但 borrower 仍 mapping
+的 page 记为 `parked`，不计入可承诺容量。Admission predicate 只 crediting 一次 release 真正归还的页
+（`reclaimable_pages`），所以 predicate 通过而 reservation 失败不会让整个 Engine 变成永久 503。
+
 ---
 
 ## 3. Overall architecture

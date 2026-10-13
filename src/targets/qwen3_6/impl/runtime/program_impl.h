@@ -621,22 +621,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         request.lifecycle == Lifecycle::Pending) {
         return false;
     }
-    const SequenceState& sequence = sequences[lane];
-    // The pool owns the arithmetic: an entitlement may claim everything that is neither promised to
-    // an owner nor parked for a borrower of one.
-    const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return pool.can_replace_entitlement(old_pages, new_pages);
-    };
-    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
-        return false;
-    }
-    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+    return admits_lane_capacity(lane, plan, /*evict_retained=*/false);
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
@@ -652,44 +637,81 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
         request.lifecycle == Lifecycle::Pending) {
         return false;
     }
+    return admits_lane_capacity(lane, plan, /*evict_retained=*/true);
+}
 
-    std::uint32_t reclaimable_text    = 0;
-    std::uint32_t reclaimable_backend = 0;
-    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
-        if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
-        reclaimable_text += sequences[other].kv->text.page_entitlement();
-        if (sequences[other].kv->backend) {
-            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+bool ProgramImplCore::admits_lane_capacity(std::uint32_t lane, const RequestPlan& plan,
+                                           bool evict_retained) const noexcept {
+    if (plan.impl_ == nullptr) { return false; }
+    const RequestPlanImpl& requested = *plan.impl_;
+    // The lane's own bundle is given up first exactly when the plan cannot continue what the lane
+    // holds: a full reset, or a record the lane does not carry. Every other path keeps that bundle
+    // and resizes it, so its release must not be credited a second time.
+    const bool resets_lane =
+        requested.reuse == ReusePath::FullReset || requested.disk_restore_frontier != 0;
+    // The allocations an admission hands back before it reserves: this lane's bundle when the plan
+    // resets it, plus, for the eviction pass, every retained lane's bundle. A bundle holds one
+    // allocation per pool AND per rank, and a pool credits only the allocations that belong to it,
+    // so one list answers for all four pools.
+    std::array<const PagedKVAllocation*, 4 * kMaximumConcurrency> released{};
+    std::size_t count = 0;
+    const auto credit_bundle = [&](const SequenceKVBundle& bundle) {
+        for (const PagedKVAllocation* allocation :
+             std::initializer_list<const PagedKVAllocation*>{
+                 &bundle.text, bundle.backend ? &*bundle.backend : nullptr,
+                 bundle.text_peer ? &*bundle.text_peer : nullptr,
+                 bundle.backend_peer ? &*bundle.backend_peer : nullptr}) {
+            if (allocation == nullptr || count == released.size()) { return; }
+            released[count++] = allocation;
+        }
+    };
+    const SequenceState& sequence = sequences[lane];
+    if (resets_lane && sequence.kv) { credit_bundle(*sequence.kv); }
+    if (evict_retained) {
+        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+            if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
+            credit_bundle(*sequences[other].kv);
         }
     }
-
-    // The same arithmetic with the retained lanes this pass would evict credited back -- including
-    // the pages they own, never the ones already parked for a borrower.
-    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
-        if (old_pages > pool.entitled_pages() ||
-            reclaimable_pages > pool.entitled_pages() - old_pages ||
-            new_pages > pool.logical_page_capacity()) {
-            return false;
-        }
-        const std::uint32_t committed =
-            pool.entitled_pages() - old_pages - reclaimable_pages + pool.parked_pages();
-        return new_pages <= pool.page_group_count() - committed;
+    const std::span<const PagedKVAllocation* const> releases(released.data(), count);
+    // The direct question credits only the releases above; the eviction pass also gets the pages a
+    // dropped shared payload returns, because that is what its own reclaim pass hands back first.
+    const auto fits = [&](const PagedKVPool& pool, std::uint32_t old_pages,
+                          std::uint32_t new_pages) {
+        return evict_retained
+                   ? pool.can_carry_entitlement_reclaiming_holds(old_pages, releases, new_pages)
+                   : pool.can_carry_entitlement(old_pages, releases, new_pages);
     };
-
-    const SequenceState& sequence = sequences[lane];
-    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.impl_->text_kv_page_entitlement)) {
+    const bool keeps_bundle = !resets_lane && sequence.kv.has_value();
+    const std::uint32_t old_text =
+        keeps_bundle ? sequence.kv->text.page_entitlement() : std::uint32_t{0};
+    if (!fits(decoder->text_kv.pool(), old_text, requested.text_kv_page_entitlement)) {
         return false;
     }
-
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, reclaimable_backend,
-                       plan.impl_->backend_kv_page_entitlement);
+    if (backend == nullptr) { return requested.backend_kv_page_entitlement == 0; }
+    const std::uint32_t old_backend = keeps_bundle && sequence.kv->backend
+                                          ? sequence.kv->backend->page_entitlement()
+                                          : std::uint32_t{0};
+    if (!fits(backend->pool(), old_backend, requested.backend_kv_page_entitlement)) {
+        return false;
+    }
+    // Rank 1 reserves the same pages in the same order, so its own pools have to answer yes too: a
+    // rank that cannot carry the entitlement refuses the bundle after rank 0 committed to it.
+    if (!peer.has_value()) { return true; }
+    const std::uint32_t old_text_peer =
+        keeps_bundle && sequence.kv->text_peer ? sequence.kv->text_peer->page_entitlement()
+                                               : std::uint32_t{0};
+    if (!fits(peer->decoder->text_kv.pool(), old_text_peer,
+              requested.text_kv_page_entitlement)) {
+        return false;
+    }
+    const qwen3_6::PagedKVCache* peer_backend = peer->decoder->mtp_cache();
+    if (peer_backend == nullptr) { return requested.backend_kv_page_entitlement == 0; }
+    const std::uint32_t old_backend_peer =
+        keeps_bundle && sequence.kv->backend_peer ? sequence.kv->backend_peer->page_entitlement()
+                                                  : std::uint32_t{0};
+    return fits(peer_backend->pool(), old_backend_peer, requested.backend_kv_page_entitlement);
 }
 
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {

@@ -1036,6 +1036,10 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    // Set once the worker latched: the Engine failed every in-flight and queued request and refuses
+    // all later ones with `service_unavailable` until the process is restarted. Operators read it
+    // through `/health` and `ninfer_engine_failed`, which is what tells an outage from a busy pool.
+    bool engine_failed = false;
     RuntimeHostWorkStats host_work;
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;

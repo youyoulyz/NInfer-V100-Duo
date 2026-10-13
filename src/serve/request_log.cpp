@@ -743,6 +743,16 @@ void JsonlRequestLog::append(std::string record) {
     }
 }
 
+HealthReport engine_health(const ninfer::RuntimeStats& stats) {
+    if (!stats.engine_failed) {
+        return HealthReport{.status = 200, .body = Json{{"status", "ok"}}.dump()};
+    }
+    // The worker latched, every in-flight and queued request failed, and no later submission will be
+    // admitted: the process answers, the Engine does not.
+    const Json body{{"status", "unavailable"}, {"reason", "engine_failed"}};
+    return HealthReport{.status = 503, .body = body.dump()};
+}
+
 std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
                                       std::string_view model_id) {
     const ninfer::KvRuntimeStats& kv = stats.kv;
@@ -769,6 +779,10 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << "ninfer_requests{state=\"prefilling\"} " << stats.prefilling_requests << '\n'
         << "ninfer_requests{state=\"decode_ready\"} " << stats.decode_ready_requests << '\n'
         << "ninfer_requests{state=\"waiting\"} " << stats.waiting_requests << '\n';
+    // A latched Engine refuses every request with `service_unavailable` until it is restarted, so a
+    // dashboard has to be able to tell that from a pool that is merely full.
+    metric(out, "ninfer_engine_failed", "1 when the Engine has latched and refuses every request.",
+           "gauge", stats.engine_failed ? 1U : 0U);
 
     metric(out, "ninfer_speculative_rounds_total", "Speculative rounds the server has run.",
            "counter", stats.speculative_rounds);

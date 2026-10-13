@@ -254,6 +254,10 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            // Published here, next to the request counts: `fail_all` latches `failed_` and then
+            // publishes, so the operator surface -- /health, /metrics -- sees the same state every
+            // later submission is refused against.
+            snapshot.engine_failed = failed_;
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
         snapshot.shared_prefix       = instance_.program->shared_prefix_stats();
@@ -965,7 +969,14 @@ private:
                 invalidate_lane_plans(victim);
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+                // The pass gave back every shared payload and every retained lane it could and the
+                // plan still does not fit: that is capacity, not a broken invariant. Refuse this one
+                // request -- retryably, since other conversations releasing their prefixes can make
+                // the same admission fit -- and keep serving.
+                return remove_pending_error(
+                    request, std::make_exception_ptr(RequestError(
+                                 RequestErrorKind::CapacityUnavailable,
+                                 "retained lanes cannot free this request's KV reservation")));
             }
         }
 
@@ -1095,7 +1106,20 @@ private:
 
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
-                throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
+                // No lane can carry this request while nothing is running: every page the pools
+                // cannot hand out is promised to a lane that is not a request -- a retained
+                // conversation, or a page group the shared index holds. The license above says the
+                // request fits a pool of this size; the pool's own ledger is what decides whether it
+                // fits right now, and being short there is the same capacity condition as any other
+                // refusal. This request loses -- `kv_capacity_unavailable`, which a retry after
+                // other conversations release their prefixes may well satisfy -- and the Engine
+                // keeps serving.
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::CapacityUnavailable,
+                              "no lane can carry this request's KV reservation")));
+                control_progress = true;
+                continue;
             }
             if (!protection_) {
                 protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
