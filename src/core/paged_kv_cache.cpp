@@ -216,11 +216,20 @@ bool PagedKVPool::can_carry_entitlement_reclaiming_holds(
 }
 
 std::uint32_t PagedKVPool::reclaimable_pages(const PagedKVAllocation& allocation) const noexcept {
-    if (!allocation.valid() || allocation.pool_ != this || allocation.borrowed_) { return 0; }
+    if (!allocation.valid() || allocation.pool_ != this) { return 0; }
+    const std::span<const std::int32_t> mapped = allocation.page_ids();
     std::uint32_t reclaimable = allocation.page_entitlement_ - allocation.owned_page_count();
-    const std::span<const std::int32_t> owned =
-        std::span<const std::int32_t>(allocation.page_ids_).subspan(allocation.owned_begin_);
-    for (const std::int32_t page : owned) {
+    // The leading pages of an adopted mapping belong to another allocation. Releasing this one
+    // drops its borrow on each of them, and a page whose last borrow goes while its owner has
+    // already returned it is exactly what `pending_returns_` keeps out of the free set: that page
+    // comes back to the pool, so the credit is capacity this release really hands over. A page
+    // another borrower still maps stays parked and is not counted.
+    for (const std::int32_t page : mapped.first(allocation.owned_begin_)) {
+        const std::size_t index = static_cast<std::size_t>(page);
+        if (borrow_counts_[index] == 1 && pending_returns_[index] != 0) { ++reclaimable; }
+    }
+    // An owned page comes back free only when no borrower and no index hold keeps it.
+    for (const std::int32_t page : mapped.subspan(allocation.owned_begin_)) {
         if (borrow_counts_[static_cast<std::size_t>(page)] == 0) { ++reclaimable; }
     }
     return reclaimable;

@@ -136,9 +136,10 @@ public:
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
     // Pages a release of `allocation` actually returns to the free set: the entitlement it never
-    // mapped, plus the owned pages no borrower and no index hold keeps. A page a sibling or the
-    // shared store still maps is parked for it rather than freed, and a borrowed allocation owns
-    // nothing to return.
+    // mapped, the owned pages no borrower and no index hold keeps, and the parked pages whose last
+    // hold is this allocation's own borrow on an adopted prefix -- dropping the mapping releases
+    // them. A page its owner still holds, or one another borrower still maps, stays out of the free
+    // set and is not credited.
     [[nodiscard]] std::uint32_t
     reclaimable_pages(const PagedKVAllocation& allocation) const noexcept;
     // Whether the pool could promise `new_pages` to a lane that gives up `released` first, and
