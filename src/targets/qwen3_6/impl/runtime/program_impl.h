@@ -1408,6 +1408,7 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
     out.main_free_page_groups     = main.free_pages();
     out.main_mapped_page_groups   = main.mapped_pages();
     out.main_parked_page_groups   = main.parked_pages();
+    out.main_borrowed_page_groups = main.borrowed_pages();
     if (const qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
         const PagedKVPool& pool = backend->pool();
         out.backend_capacity_page_groups = pool.page_group_count();
@@ -1415,6 +1416,7 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
         out.backend_free_page_groups     = pool.free_pages();
         out.backend_mapped_page_groups   = pool.mapped_pages();
         out.backend_parked_page_groups   = pool.parked_pages();
+        out.backend_borrowed_page_groups = pool.borrowed_pages();
     }
     // Two state slots (the live continuation and the rollback seam) per lane, occupied by every lane
     // that still holds a chain: live, retained or parked.
@@ -1423,6 +1425,18 @@ KvRuntimeStats ProgramImplCore::kv_runtime_stats() const noexcept {
         if (sequences[lane].kv.has_value() || sequences[lane].retained) {
             out.state_occupied_slots += 2U;
         }
+    }
+    // Per lane: whether it is holding a prefix for reuse, and how much of what it maps it owns. The
+    // leading pages of a bundle are the adopted ones, so this is where a `parked` page group's
+    // borrower shows up.
+    out.lane_capacity = max_concurrency;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const SequenceState& sequence = sequences[lane];
+        KvLaneRuntimeStats& entry     = out.lanes[lane];
+        entry.retained                = sequence.retained;
+        if (!sequence.kv.has_value()) { continue; }
+        entry.owned_page_groups   = sequence.kv->text.owned_page_count();
+        entry.adopted_page_groups = sequence.kv->text.mapped_page_count() - entry.owned_page_groups;
     }
     if (lane_store_ != nullptr) {
         out.host_kv_capacity_bytes = lane_store_->kv_capacity_bytes();

@@ -956,6 +956,15 @@ struct RuntimeHostWorkStats {
 // What a scrape of `GET /metrics` needs about the KV pools, the tiers and the state slots. It is
 // published with the runtime stats (never behind the execution lock), so scraping cannot stall a
 // running request.
+// What one lane maps of the paged KV. Adopted pages belong to another allocation and are mapped
+// read-only: releasing this lane is what hands them back to `parked`, so a capacity refusal needs
+// them next to the pool's own counts to say which lane is holding another holder's pages.
+struct KvLaneRuntimeStats {
+    bool          retained            = false;
+    std::uint32_t adopted_page_groups = 0;
+    std::uint32_t owned_page_groups   = 0;
+};
+
 struct KvRuntimeStats {
     std::uint32_t main_capacity_page_groups    = 0;
     std::uint32_t main_entitled_page_groups    = 0;
@@ -965,11 +974,18 @@ struct KvRuntimeStats {
     // capacity shortfall is exactly that gap appearing.
     std::uint32_t main_mapped_page_groups      = 0;
     std::uint32_t main_parked_page_groups      = 0;
+    // Page groups with an outstanding borrow: the counterpart of `parked`, since a borrow is what
+    // keeps an owner's returned page out of the free list.
+    std::uint32_t main_borrowed_page_groups    = 0;
     std::uint32_t backend_capacity_page_groups = 0;
     std::uint32_t backend_entitled_page_groups = 0;
     std::uint32_t backend_free_page_groups     = 0;
     std::uint32_t backend_mapped_page_groups   = 0;
     std::uint32_t backend_parked_page_groups   = 0;
+    std::uint32_t backend_borrowed_page_groups = 0;
+    // Lanes to read in `lanes`; the array is sized for the product's concurrency ceiling.
+    std::uint32_t lane_capacity                = 0;
+    std::array<KvLaneRuntimeStats, kMaximumConcurrency> lanes{};
     std::uint32_t state_capacity_slots         = 0;
     std::uint32_t state_occupied_slots         = 0;
     std::size_t host_kv_capacity_bytes         = 0;

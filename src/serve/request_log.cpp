@@ -844,6 +844,31 @@ std::string format_prometheus_metrics(const ninfer::RuntimeStats& stats,
         << kv.backend_mapped_page_groups << '\n'
         << "ninfer_kv_page_groups{pool=\"backend\",state=\"parked\"} "
         << kv.backend_parked_page_groups << '\n';
+    out << "# HELP ninfer_kv_borrow_page_groups Paged KV page groups with an outstanding borrow, the "
+           "counterpart of the parked state.\n"
+           "# TYPE ninfer_kv_borrow_page_groups gauge\n"
+        << "ninfer_kv_borrow_page_groups{pool=\"main\"} " << kv.main_borrowed_page_groups << '\n'
+        << "ninfer_kv_borrow_page_groups{pool=\"backend\"} " << kv.backend_borrowed_page_groups
+        << '\n';
+    out << "# HELP ninfer_lane_retained Lanes holding a prefix for reuse with no request on them.\n"
+           "# TYPE ninfer_lane_retained gauge\n";
+    for (std::uint32_t lane = 0; lane < kv.lane_capacity; ++lane) {
+        out << "ninfer_lane_retained{lane=\"" << lane << "\"} " << (kv.lanes[lane].retained ? 1 : 0)
+            << '\n';
+    }
+    out << "# HELP ninfer_lane_adopted_page_groups Page groups a lane maps read-only from another "
+           "holder; releasing the lane hands them back to `parked`.\n"
+           "# TYPE ninfer_lane_adopted_page_groups gauge\n";
+    for (std::uint32_t lane = 0; lane < kv.lane_capacity; ++lane) {
+        out << "ninfer_lane_adopted_page_groups{lane=\"" << lane
+            << "\"} " << kv.lanes[lane].adopted_page_groups << '\n';
+    }
+    out << "# HELP ninfer_lane_owned_page_groups Page groups a lane materialized from the pool.\n"
+           "# TYPE ninfer_lane_owned_page_groups gauge\n";
+    for (std::uint32_t lane = 0; lane < kv.lane_capacity; ++lane) {
+        out << "ninfer_lane_owned_page_groups{lane=\"" << lane
+            << "\"} " << kv.lanes[lane].owned_page_groups << '\n';
+    }
 
     metric(out, "ninfer_kv_pool_payload_bytes", "Persistent KV payload this device holds, whole pool.",
            "gauge", kv.kv_payload_bytes);
