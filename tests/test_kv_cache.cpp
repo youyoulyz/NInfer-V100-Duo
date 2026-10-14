@@ -390,10 +390,23 @@ int main() {
 
     retained.release();
     failures += expect_size(shared_pool.free_pages(), 6, "borrowed pages stay out of the free set");
+    failures += expect_size(shared_pool.parked_pages(), 2, "the retained prefix is parked");
+    failures += expect_size(shared_pool.reclaimable_pages(borrower_a), 0,
+                            "a page two borrowers map is not credited");
     failures += expect_device_page_ids(borrower_a.block_table(), {0, 1},
                                        "borrower A survives the owner's release");
     borrower_a.release();
     failures += expect_size(shared_pool.free_pages(), 6, "pages wait for the last borrower");
+    // A mapping that owns no page still hands back what its own borrow was holding: the parked
+    // page rejoins the free set with the borrow, so the last borrower's release is credited it.
+    failures += expect_size(shared_pool.reclaimable_pages(borrower_b), 2,
+                            "the last borrower is credited the parked pages");
+    const ninfer::PagedKVAllocation* last_borrower[]{&borrower_b};
+    if (!shared_pool.can_carry_entitlement(0, last_borrower, 8) ||
+        shared_pool.can_carry_entitlement(0, last_borrower, 9)) {
+        ++failures;
+        std::cerr << "a pure borrow's release was credited a different number of pages\n";
+    }
     failures += expect_device_page_ids(borrower_b.block_table(), {0, 1}, "borrower B row is intact");
     borrower_b.release();
     failures += expect_size(shared_pool.free_pages(), 8, "pages return after the last release");
@@ -506,6 +519,19 @@ int main() {
             ++failures;
             std::cerr << "The reclaiming bound did not credit the parked pages\n";
         }
+        // The other half of the same entry: the parked pages are held for the BORROWER, and an
+        // admission that resets a lane holding that mapping gives them back. On 2026-10-14 a pool
+        // whose 1869 parked pages were held exactly this way credited only the un-borrowed part of
+        // the reset bundle, so its admission gate stopped at `free + un-borrowed entitlement` and
+        // refused every request the reset itself would have made room for.
+        failures += expect_size(parked_pool.reclaimable_pages(borrower), 8,
+                                "an adopting release credits its adopted pages");
+        const ninfer::PagedKVAllocation* reset[]{&borrower};
+        if (!parked_pool.can_carry_entitlement(0, reset, 8) ||
+            parked_pool.can_carry_entitlement(0, reset, 9)) {
+            ++failures;
+            std::cerr << "an adopting release was credited a different number of pages\n";
+        }
         borrower.release();
         failures += expect_size(parked_pool.parked_pages(), 0, "the last borrow returns the pages");
         failures += expect_size(parked_pool.free_pages(), 8, "the park drains to the free list");
@@ -577,6 +603,18 @@ int main() {
 
     prefix_owner.release();
     failures += expect_size(hybrid_pool.free_pages(), 5, "the adopted prefix stays mapped");
+    // An adopted prefix plus an owned suffix is one bundle: resetting it returns both halves, the
+    // parked adopted pages and the owned pages no hold keeps, which is the shape the live refusal
+    // had. Three spare pages plus this release is eight, and the ninth is still not there.
+    failures += expect_size(hybrid_pool.parked_pages(), 2, "the adopted prefix is parked");
+    failures += expect_size(hybrid_pool.reclaimable_pages(hybrid), 6,
+                            "an adopted prefix and its owned suffix both come back");
+    const ninfer::PagedKVAllocation* hybrid_reset[]{&hybrid};
+    if (!hybrid_pool.can_carry_entitlement(0, hybrid_reset, 8) ||
+        hybrid_pool.can_carry_entitlement(0, hybrid_reset, 9)) {
+        ++failures;
+        std::cerr << "an adopted-prefix bundle was credited a different number of pages\n";
+    }
     hybrid.release();
     failures += expect_size(hybrid_pool.free_pages(), 8, "hybrid release frees prefix and suffix");
     failures += expect_size(hybrid_pool.borrowed_pages(), 0, "hybrid dropped its borrows");
