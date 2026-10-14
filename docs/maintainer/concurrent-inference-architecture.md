@@ -133,6 +133,10 @@ resource shortfall 当成 broken invariant。
 Pool 自身的 ledger 是唯一权威：`capacity = free + mapped + parked`，owner 已归还但 borrower 仍 mapping
 的 page 记为 `parked`，不计入可承诺容量。Admission predicate 只 crediting 一次 release 真正归还的页
 （`reclaimable_pages`），所以 predicate 通过而 reservation 失败不会让整个 Engine 变成永久 503。
+`reclaimable_pages` 也覆盖 adopted mapping 的另一半：一条 lane 只读 map 着别的 allocation 的
+前缀时，释放它会撤回自己那份 borrow，把 owner 已归还、正停在 `pending_returns_` 里的页交回
+free list。resetting 这条 lane 的 admission（或淘汰它的 pass）因此可以把这些页计入可承诺容量；
+漏掉这一半，gate 就会停在 `free + 未借出部分的 entitlement`，拒绝一个 reset 就能腾出空间的请求。
 
 ---
 
