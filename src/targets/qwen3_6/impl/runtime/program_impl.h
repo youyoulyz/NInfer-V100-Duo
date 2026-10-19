@@ -627,11 +627,6 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
-    // An adopting plan maps pages a retained sibling still owns, and the reclaimable capacity this
-    // pass offers is computed from exactly those entitlements. Making room for it by evicting
-    // retained lanes could take the lender's bytes with them, so it is only ever admitted where it
-    // already fits (`can_admit_lane`); where it does not, the request waits as it does today.
-    if (plan.impl_->adopt_lane.has_value()) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -645,10 +640,13 @@ bool ProgramImplCore::admits_lane_capacity(std::uint32_t lane, const RequestPlan
     if (plan.impl_ == nullptr) { return false; }
     const RequestPlanImpl& requested = *plan.impl_;
     // The lane's own bundle is given up first exactly when the plan cannot continue what the lane
-    // holds: a full reset, or a record the lane does not carry. Every other path keeps that bundle
-    // and resizes it, so its release must not be credited a second time.
+    // holds: a full reset, a record the lane does not carry, or a prefix it continues from a sibling
+    // or the shared index. Every other path keeps that bundle and resizes it, so its release must
+    // not be credited a second time.
+    const std::optional<std::uint32_t> donor = requested.adopt_lane;
+    const bool adopts = donor.has_value() || requested.adopt_node.has_value();
     const bool resets_lane =
-        requested.reuse == ReusePath::FullReset || requested.disk_restore_frontier != 0;
+        requested.reuse == ReusePath::FullReset || requested.disk_restore_frontier != 0 || adopts;
     // The allocations an admission hands back before it reserves: this lane's bundle when the plan
     // resets it, plus, for the eviction pass, every retained lane's bundle. A bundle holds one
     // allocation per pool AND per rank, and a pool credits only the allocations that belong to it,
@@ -669,7 +667,12 @@ bool ProgramImplCore::admits_lane_capacity(std::uint32_t lane, const RequestPlan
     if (resets_lane && sequence.kv) { credit_bundle(*sequence.kv); }
     if (evict_retained) {
         for (std::uint32_t other = 0; other < max_concurrency; ++other) {
-            if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
+            // The donor is the source of the prefix this plan maps. Evicting it would destroy the
+            // reuse being admitted for, so its bundle is not part of the reclaim this pass offers.
+            if (other == lane || (donor && other == *donor) || !sequences[other].retained ||
+                !sequences[other].kv) {
+                continue;
+            }
             credit_bundle(*sequences[other].kv);
         }
     }

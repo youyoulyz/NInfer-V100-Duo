@@ -436,14 +436,19 @@ int main() {
     failures += expect_size(hybrid.owned_page_count(), 2, "hybrid owned suffix pages");
     failures += expect_page_ids(hybrid.page_ids(), {0, 1, 2, 3}, "hybrid mapping order");
     failures += expect_device_page_ids(hybrid.block_table(), {0, 1, 2, 3}, "hybrid block table");
-    try {
-        hybrid.trim_pages(1);
-        ++failures;
-        std::cerr << "An adopted prefix was trimmed\n";
-    } catch (const std::logic_error&) {}
+    hybrid.trim_pages(1);
+    failures += expect_size(hybrid.owned_page_count(), 0,
+                            "hybrid after trimming into its adopted prefix");
+    failures += expect_size(hybrid_pool.borrowed_pages(), 1,
+                            "hybrid retained adopted borrow after trim");
+    failures += expect_size(hybrid_pool.free_pages(), 6,
+                            "hybrid free pages after trimming adopted suffix");
+    hybrid.materialize_pages(4);
+    failures += expect_size(hybrid.owned_page_count(), 3,
+                            "hybrid owned pages after rematerializing suffix");
     hybrid.trim_pages(3);
-    failures += expect_size(hybrid.owned_page_count(), 1, "hybrid after trimming its suffix");
-    failures += expect_size(hybrid_pool.free_pages(), 5, "free pages with the hybrid mapped");
+    failures += expect_size(hybrid.owned_page_count(), 2, "hybrid after trimming its suffix");
+    failures += expect_size(hybrid_pool.free_pages(), 4, "free pages with the hybrid mapped");
 
     // The owner's prefix is longer than the borrower's own entitlement: a resize may name a
     // mapping that outruns the pages this allocation owns, as long as the owned region fits.
@@ -463,17 +468,17 @@ int main() {
     failures += expect_size(wide_borrower.mapped_page_count(), 5, "wide borrower mapping");
     failures += expect_device_page_ids(wide_borrower.block_table(), {0, 1, 2, 3, 4},
                                        "wide borrower block table");
-    try {
-        wide_borrower.trim_pages(3);
-        ++failures;
-        std::cerr << "A wide adopted prefix was trimmed\n";
-    } catch (const std::logic_error&) {}
+    wide_borrower.trim_pages(3);
+    failures += expect_size(wide_borrower.owned_page_count(), 0,
+                            "wide borrower after trimming adopted suffix");
+    failures += expect_size(wide_pool.borrowed_pages(), 3,
+                            "wide borrower retained adopted borrows after trim");
     const ninfer::PagedKVResize wide_claim[] = {
-        {.allocation = &wide_borrower, .mapped_pages = 5, .page_entitlement = 1}};
+        {.allocation = &wide_borrower, .mapped_pages = 3, .page_entitlement = 1}};
     ninfer::resize_paged_kv_bundle(wide_claim);
     failures += expect_size(wide_borrower.page_entitlement(), 1, "wide borrower entitlement");
-    failures += expect_size(wide_borrower.mapped_page_count(), 5, "wide borrower resize");
-    failures += expect_size(wide_pool.borrowed_pages(), 4, "wide borrower borrows");
+    failures += expect_size(wide_borrower.mapped_page_count(), 3, "wide borrower resize");
+    failures += expect_size(wide_pool.borrowed_pages(), 3, "wide borrower borrows");
     wide_borrower.release();
     failures += expect_size(wide_pool.borrowed_pages(), 0, "wide borrower dropped its borrows");
     wide_owner.release();
@@ -604,10 +609,9 @@ int main() {
     prefix_owner.release();
     failures += expect_size(hybrid_pool.free_pages(), 5, "the adopted prefix stays mapped");
     // An adopted prefix plus an owned suffix is one bundle: resetting it returns both halves, the
-    // parked adopted pages and the owned pages no hold keeps, which is the shape the live refusal
-    // had. Three spare pages plus this release is eight, and the ninth is still not there.
-    failures += expect_size(hybrid_pool.parked_pages(), 2, "the adopted prefix is parked");
-    failures += expect_size(hybrid_pool.reclaimable_pages(hybrid), 6,
+    // parked adopted page and the owned pages no hold keeps.
+    failures += expect_size(hybrid_pool.parked_pages(), 1, "the adopted prefix is parked");
+    failures += expect_size(hybrid_pool.reclaimable_pages(hybrid), 5,
                             "an adopted prefix and its owned suffix both come back");
     const ninfer::PagedKVAllocation* hybrid_reset[]{&hybrid};
     if (!hybrid_pool.can_carry_entitlement(0, hybrid_reset, 8) ||

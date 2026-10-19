@@ -151,6 +151,9 @@ public:
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base);
+    [[nodiscard]] RequestPlan<Variant>
+    plan_request_cold_for_lane(std::uint32_t lane, const PreparedPrompt& prompt,
+                               const RequestBasePlan<Variant>& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool

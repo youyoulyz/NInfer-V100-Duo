@@ -589,4 +589,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     return RequestPlan(std::move(plan));
 }
 
+RequestPlan ProgramImplCore::plan_request_cold_for_lane(std::uint32_t lane,
+                                                        const PreparedPromptData& prompt,
+                                                        const RequestBasePlan& base) {
+    if (base.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
+    auto cold = std::make_unique<RequestBasePlanImpl>(*base.impl_);
+    cold->allow_prefix_reuse    = false;
+    cold->disk_restore_frontier = 0;
+    return plan_request_for_lane(lane, prompt, RequestBasePlan(std::move(cold)));
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

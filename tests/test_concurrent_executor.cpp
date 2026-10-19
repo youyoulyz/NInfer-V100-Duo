@@ -206,6 +206,12 @@ public:
         return base;
     }
 
+    [[nodiscard]] ScriptedPlan plan_request_cold_for_lane(std::uint32_t lane,
+                                                          const q36::PreparedPrompt& prompt,
+                                                          const ScriptedPlan& base) const {
+        return plan_request_for_lane(lane, prompt, base);
+    }
+
     // A lane the Program refuses to admit: the pools hold pages the plan cannot have, so no lane
     // carries the request at all.
     void deny_admissions(bool denied) noexcept { deny_admissions_ = denied; }

@@ -136,6 +136,12 @@ RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
 }
 
 template <>
+RequestPlan<Variant> Program<Variant>::plan_request_cold_for_lane(
+    std::uint32_t lane, const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base) {
+    return impl_->plan_request_cold_for_lane(lane, PreparedPromptAccess::view(prompt), base);
+}
+
+template <>
 bool Program<Variant>::can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane(lane, plan);

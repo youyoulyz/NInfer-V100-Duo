@@ -953,22 +953,44 @@ private:
             // lane numbers instead would take whatever sits lowest, which is exactly the behaviour
             // that dropped the longest prefix while seven lanes sat idle. The lane this plan already
             // depends on is never a victim -- that would destroy the reuse being admitted for.
-            const std::optional<std::uint32_t> donor =
-                instance_.program->plan_adopted_lane(*request->lane_plans[lane]);
-            for (const std::uint32_t victim :
-                 instance_.program->retained_lane_eviction_order()) {
-                if (instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) { break; }
-                // A lane-free shared payload is an opportunistic copy of a prefix: its page groups
-                // are held out of the pools, and giving one up is cheaper than eating a conversation
-                // the process is still holding. Only when none is left does a retained lane go.
-                if (instance_.program->drop_shared_payloads(1) != 0) { continue; }
-                if (victim == lane || (donor && victim == *donor) || slots_[victim] != nullptr) {
-                    continue;
+            const auto reclaim_for_lane = [&](std::optional<std::uint32_t> donor) {
+                for (const std::uint32_t victim :
+                     instance_.program->retained_lane_eviction_order()) {
+                    if (instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                        break;
+                    }
+                    // A lane-free shared payload is an opportunistic copy of a prefix: its page
+                    // groups are held out of the pools, and giving one up is cheaper than eating a
+                    // conversation the process is still holding. Only when none is left does a
+                    // retained lane go.
+                    if (instance_.program->drop_shared_payloads(1) != 0) { continue; }
+                    if (victim == lane || (donor && victim == *donor) || slots_[victim] != nullptr) {
+                        continue;
+                    }
+                    instance_.program->evict_retained_lane(victim);
+                    invalidate_lane_plans(victim);
                 }
-                instance_.program->evict_retained_lane(victim);
-                invalidate_lane_plans(victim);
+                return instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
+            };
+            std::optional<std::uint32_t> donor =
+                instance_.program->plan_adopted_lane(*request->lane_plans[lane]);
+            bool fits = reclaim_for_lane(donor);
+            if (!fits && active_admission_set().size == 0 &&
+                request->lane_plans[lane]->summary().reusable_prompt_tokens != 0) {
+                // The reusable plan cannot fit even after every non-donor lane has given way. A
+                // cold plan can release the donor too: the request loses its prefix reuse but is
+                // served instead of being refused while the pool is idle.
+                try {
+                    request->lane_plans[lane].emplace(instance_.program->plan_request_cold_for_lane(
+                        lane, request->prompt, *request->base_plan));
+                    request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+                } catch (...) {
+                    return remove_pending_error(request, std::current_exception());
+                }
+                donor.reset();
+                fits = reclaim_for_lane(donor);
             }
-            if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+            if (!fits) {
                 // The pass gave back every shared payload and every retained lane it could and the
                 // plan still does not fit: that is capacity, not a broken invariant. Refuse this one
                 // request -- retryably, since other conversations releasing their prefixes can make
@@ -1106,14 +1128,40 @@ private:
 
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
-                // No lane can carry this request while nothing is running: every page the pools
-                // cannot hand out is promised to a lane that is not a request -- a retained
-                // conversation, or a page group the shared index holds. The license above says the
-                // request fits a pool of this size; the pool's own ledger is what decides whether it
-                // fits right now, and being short there is the same capacity condition as any other
-                // refusal. This request loses -- `kv_capacity_unavailable`, which a retry after
-                // other conversations release their prefixes may well satisfy -- and the Engine
-                // keeps serving.
+                // Nothing is running, so no active request can be the answer. If every reusable
+                // plan was refused, price this request once more without prefix reuse: a cold plan
+                // may release the retained lane that holds the prefix, which the reusable plan could
+                // not do without destroying its own source. The base plan above already proved the
+                // cold footprint fits the pool; reclaim decides whether it fits right now.
+                std::optional<LaneChoice> cold_lane;
+                try {
+                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                        if (slots_[lane] != nullptr) { continue; }
+                        head->lane_plans[lane].emplace(instance_.program->plan_request_cold_for_lane(
+                            lane, head->prompt, *head->base_plan));
+                        head->lane_plan_versions[lane] = lane_plan_versions_[lane];
+                        const bool direct = instance_.program->can_admit_lane(
+                            lane, *head->lane_plans[lane]);
+                        const bool evict = !direct &&
+                                           instance_.program->can_admit_lane_after_retained_eviction(
+                                               lane, *head->lane_plans[lane]);
+                        if (direct || evict) {
+                            cold_lane = LaneChoice{.lane = lane, .evict_retained = evict};
+                            break;
+                        }
+                    }
+                } catch (...) {
+                    (void)remove_pending_error(head, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                if (cold_lane) {
+                    return admit_planned_request(head, *cold_lane, BackfillClass::None, 0);
+                }
+                // Even a cold plan cannot fit while nothing is running. Every page the pools cannot
+                // hand out is promised to a lane that is not a request -- a retained conversation,
+                // or a page group the shared index holds. Refuse this one retryably; the Engine keeps
+                // serving.
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::CapacityUnavailable,

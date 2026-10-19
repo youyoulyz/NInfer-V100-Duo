@@ -679,7 +679,9 @@ ordinary target progress，不构成 backend capability 降级，也不能据此
 完整、可继续的 bundle 一起 retain，要么释放整个 bundle。
 
 Admission 被 retained occupancy 阻塞时，Prefix Cache 选择并释放完整 retained entries，再重新执行
-atomic admission。KV Store 不自行选择 eviction victim。
+atomic admission。KV Store 不自行选择 eviction victim。reusable plan 依赖的 donor lane 不能被选作
+victim；若没有 active request 且释放其他 retained entries 后仍放不下，Engine 会按 cold plan 重新
+计价并允许释放 donor，以一次 re-prefill 换取请求被服务，而不是在空闲池上返回容量错误。
 
 ---
 

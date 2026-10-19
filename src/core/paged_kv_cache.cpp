@@ -585,15 +585,29 @@ void PagedKVAllocation::materialize_tokens(std::uint32_t tokens, cudaStream_t st
 
 void PagedKVAllocation::trim_pages(std::uint32_t pages) {
     if (!valid()) { throw std::logic_error("Cannot trim an empty Paged KV allocation"); }
-    if (static_cast<std::size_t>(pages) < owned_begin_) {
-        throw std::logic_error("Cannot trim an adopted Paged KV prefix");
+    if (borrowed_ && owned_begin_ == page_ids_.size()) {
+        throw std::logic_error("A borrowed Paged KV mapping cannot be trimmed");
     }
     if (pages > mapped_page_count()) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
     }
     if (pages == mapped_page_count()) { return; }
-    pool_->return_pages(std::span<const std::int32_t>(
-        page_ids_.data() + pages, static_cast<std::size_t>(mapped_page_count() - pages)));
+
+    // An adopted prefix is read-only, so trimming its suffix is safe: release the borrows instead
+    // of returning those pages as if this allocation owned them. The remaining mapping may then
+    // consist entirely of adopted pages, or retain an owned suffix after the adopted prefix.
+    const std::size_t old_count   = page_ids_.size();
+    const std::size_t owned_start = std::min(owned_begin_, old_count);
+    if (pages < owned_start) {
+        pool_->release_borrowed_pages(std::span<const std::int32_t>(
+            page_ids_.data() + pages, owned_start - pages));
+        owned_begin_ = pages;
+    }
+    const std::size_t return_begin = pages < owned_start ? owned_start : pages;
+    if (return_begin < old_count) {
+        pool_->return_pages(std::span<const std::int32_t>(
+            page_ids_.data() + return_begin, old_count - return_begin));
+    }
     page_ids_.resize(pages);
 }
 

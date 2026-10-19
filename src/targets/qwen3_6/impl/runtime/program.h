@@ -356,6 +356,12 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
+    // The same request priced without any prefix reuse. Admission falls back to this when a
+    // reusable plan cannot fit even after the lanes that do not hold its prefix are released: the
+    // cold plan may then release the prefix holder itself instead of refusing the request.
+    [[nodiscard]] RequestPlan plan_request_cold_for_lane(std::uint32_t lane,
+                                                         const PreparedPromptData& prompt,
+                                                         const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,

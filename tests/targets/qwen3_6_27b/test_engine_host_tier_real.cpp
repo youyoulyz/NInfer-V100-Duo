@@ -31,6 +31,7 @@ namespace {
 
 constexpr std::uint32_t kCapacity = 4096;
 constexpr std::uint32_t kOutput   = 8;
+constexpr std::uint32_t kAdmissionPressureOutput = 640;
 // Prompts sized against a 64-page pool (4096 tokens / 64): two of them must fit together and the
 // third must not be admissible while they are both resident.
 constexpr int kResidentLines = 119;
@@ -185,6 +186,36 @@ Run run_sequence(ninfer::Engine& engine, std::uint32_t tokens_alpha, bool evict_
     return run;
 }
 
+// Two retained lanes can hold every page the next request needs for its declared output budget.
+// The request shares one lane's prefix, so its reusable plan depends on that donor and cannot evict
+// it; before the admission fix this state was refused even though the Engine was idle. Admission
+// must fall back to a cold plan that releases one lane instead, losing reuse rather than returning
+// a capacity error while nothing is running.
+void run_retained_admission_pressure(ninfer::Engine& engine, std::uint32_t prompt_tokens) {
+    require(prompt_tokens + kAdmissionPressureOutput <= kCapacity,
+            "the pressured request exceeds the context ceiling");
+    require(2 * prompt_tokens + kAdmissionPressureOutput > kCapacity,
+            "the test prompts do not leave the pressured request short of KV capacity");
+
+    auto alpha = engine.submit(engine.prepare(long_prompt("alpha", kResidentLines)),
+                               request_options(true));
+    require(alpha.wait().generated_token_ids.size() == kOutput, "pressure alpha output count");
+    auto bravo = engine.submit(engine.prepare(long_prompt("bravo", kResidentLines)),
+                               request_options(true));
+    require(bravo.wait().generated_token_ids.size() == kOutput, "pressure bravo output count");
+
+    const auto pressured = engine.generate(engine.prepare(long_prompt("alpha", kResidentLines)),
+                                           request_options(true, kAdmissionPressureOutput));
+    require(pressured.generated_token_ids.size() == kAdmissionPressureOutput,
+            "a retained-lane reclamation did not admit the pressured request");
+    require(!engine.runtime_stats().engine_failed,
+            "retained-lane reclamation latched the Engine");
+    std::cout << "retained admission: reuse="
+              << static_cast<int>(pressured.prefix_reuse_path)
+              << " reused=" << pressured.reused_prompt_tokens << " output="
+              << pressured.generated_token_ids.size() << " tokens\n";
+}
+
 } // namespace
 
 int main() {
@@ -215,37 +246,46 @@ int main() {
         }
 
         const std::size_t rss_before = process_rss_bytes();
-        ninfer::Engine engine(engine_options(artifact, /*tier=*/true));
-        const ninfer::MemorySummary startup = engine.memory_summary();
-        require(startup.host_tier_capacity_bytes > 0, "tier did not allocate host capacity");
-        require(startup.host_tier_parked_bytes == 0, "tier parked something with no eviction yet");
+        Run tier;
+        {
+            ninfer::Engine engine(engine_options(artifact, /*tier=*/true));
+            const ninfer::MemorySummary startup = engine.memory_summary();
+            require(startup.host_tier_capacity_bytes > 0, "tier did not allocate host capacity");
+            require(startup.host_tier_parked_bytes == 0,
+                    "tier parked something with no eviction yet");
 
-        const Run tier = run_sequence(engine, tokens_alpha, /*evict_between=*/true);
-        require(tier.evicted, "the evicting request did not park a retained lane into host RAM");
-        // A lane image is its KV on both ranks PLUS both ranks' GDN linear-attention state. The KV
-        // half is only ~64 MiB at this prefix length, so a >200 MiB image is direct evidence that
-        // the linear state travelled with it.
-        require(tier.parked_after_eviction > 200ULL * 1024ULL * 1024ULL,
-                "the parked image is too small to contain the GDN linear-attention state");
-        std::cout << "after eviction: parked=" << tier.parked_after_eviction << " bytes, rss="
-                  << (process_rss_bytes() - rss_before) << " bytes over baseline\n";
-        require(process_rss_bytes() > rss_before, "host RSS did not grow across the park");
-        require(tier.resumed.prefix_reuse_path == control.resumed.prefix_reuse_path,
-                "restored resume path differs from the live resume path");
-        require(tier.resumed.reused_prompt_tokens == control.resumed.reused_prompt_tokens,
-                "restored frontier differs from the live frontier");
-        if (tier.resumed.generated_token_ids != control.resumed.generated_token_ids) {
-            throw std::runtime_error(
-                "restored continuation diverged from the live continuation:\n  live=" +
-                tokens_of(control.resumed.generated_token_ids) +
-                "\n  parked=" + tokens_of(tier.resumed.generated_token_ids));
+            tier = run_sequence(engine, tokens_alpha, /*evict_between=*/true);
+            require(tier.evicted,
+                    "the evicting request did not park a retained lane into host RAM");
+            // A lane image is its KV on both ranks PLUS both ranks' GDN linear-attention state. The
+            // KV half is only ~64 MiB at this prefix length, so a >200 MiB image is direct evidence
+            // that the linear state travelled with it.
+            require(tier.parked_after_eviction > 200ULL * 1024ULL * 1024ULL,
+                    "the parked image is too small to contain the GDN linear-attention state");
+            std::cout << "after eviction: parked=" << tier.parked_after_eviction << " bytes, rss="
+                      << (process_rss_bytes() - rss_before) << " bytes over baseline\n";
+            require(process_rss_bytes() > rss_before, "host RSS did not grow across the park");
+            require(tier.resumed.prefix_reuse_path == control.resumed.prefix_reuse_path,
+                    "restored resume path differs from the live resume path");
+            require(tier.resumed.reused_prompt_tokens == control.resumed.reused_prompt_tokens,
+                    "restored frontier differs from the live frontier");
+            if (tier.resumed.generated_token_ids != control.resumed.generated_token_ids) {
+                throw std::runtime_error(
+                    "restored continuation diverged from the live continuation:\n  live=" +
+                    tokens_of(control.resumed.generated_token_ids) +
+                    "\n  parked=" + tokens_of(tier.resumed.generated_token_ids));
+            }
+            require(tier.parked_after_resume > 0,
+                    "the first restore consumed every parked image; a lane went missing");
+            require(tier.parked_after_round_trip == tier.parked_after_eviction,
+                    "a park/restore cycle did not return the lane image to the host arena");
+            std::cout << "round trips: first=" << tier.parked_after_resume
+                      << " final=" << tier.parked_after_round_trip << " bytes\n";
         }
-        require(tier.parked_after_resume > 0,
-                "the first restore consumed every parked image; a lane went missing");
-        require(tier.parked_after_round_trip == tier.parked_after_eviction,
-                "a park/restore cycle did not return the lane image to the host arena");
-        std::cout << "round trips: first=" << tier.parked_after_resume
-                  << " final=" << tier.parked_after_round_trip << " bytes\n";
+        {
+            ninfer::Engine pressure_engine(engine_options(artifact, /*tier=*/true));
+            run_retained_admission_pressure(pressure_engine, tokens_alpha);
+        }
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
